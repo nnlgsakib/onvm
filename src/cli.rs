@@ -1,0 +1,299 @@
+use crate::node::{Node, NodeConfig};
+use crate::rpc::start_rpc;
+use anyhow::{Context, Result};
+use base64::{engine::general_purpose, Engine as _};
+use clap::{Parser, Subcommand};
+use libp2p::Multiaddr;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::signal;
+use tracing_subscriber::EnvFilter;
+
+fn normalize_rpc_endpoint(raw: &str) -> String {
+    if raw.starts_with(':') {
+        return format!("http://127.0.0.1{}", raw);
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        raw.to_string()
+    } else {
+        format!("http://{}", raw)
+    }
+}
+
+#[derive(Parser)]
+#[command(author, version, about = "ONVM CLI powered by RPC")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    /// Initialize a data directory with node keys
+    Init {
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+    },
+    /// Run a full ONVM node (network + consensus + RPC)
+    RunNode {
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        #[arg(long, default_value = "/ip4/0.0.0.0/tcp/37000")]
+        listen: String,
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long, default_value_t = 1)]
+        min_peers: usize,
+        #[arg(long, default_value = "full", value_parser = ["full", "metadata"], help = "Blob sync mode: full data replication or metadata-only")]
+        blob_sync_mode: String,
+    },
+    /// Upload a blob to a running node
+    UploadBlob {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        mime: Option<String>,
+    },
+    /// Deploy a WASM program
+    Deploy {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        file: PathBuf,
+        #[arg(long)]
+        entrypoint: String,
+        #[arg(long, num_args = 0..)]
+        blob_refs: Vec<String>,
+        #[arg(
+            long,
+            help = "Base64 salt for unique ProgramId; defaults to random",
+            alias = "salt-base64"
+        )]
+        salt: Option<String>,
+    },
+    /// Execute a program
+    Execute {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        program_id: String,
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Print raw JSON response instead of base64-decoded stdout"
+        )]
+        json: bool,
+    },
+    /// Fetch a blob
+    GetBlob {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Inspect a program
+    ProgramInfo {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        id: String,
+    },
+}
+
+pub async fn run() -> Result<()> {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,libp2p_mdns=off"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Init { data_dir } => {
+            tokio::fs::create_dir_all(&data_dir).await?;
+            let keys =
+                crate::crypto::keys::NodeKeys::load_or_generate(data_dir.join("identity")).await?;
+            let cfg_path = data_dir.join("config.toml");
+            if !cfg_path.exists() {
+                crate::config::OnvmConfig::write_to(&cfg_path)?;
+            }
+            println!(
+                "Initialized identity at {}. Node ID: {}",
+                data_dir.join("identity").display(),
+                keys.node_id
+            );
+        }
+        Commands::RunNode {
+            data_dir,
+            listen,
+            rpc,
+            min_peers,
+            blob_sync_mode,
+        } => {
+            let listen_addr: Multiaddr = listen
+                .parse()
+                .with_context(|| format!("invalid listen multiaddr {listen}"))?;
+            let rpc_endpoint = normalize_rpc_endpoint(&rpc);
+            let rpc_addr: SocketAddr = rpc_endpoint
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .parse()?;
+            let identity = Arc::new(
+                crate::crypto::keys::NodeKeys::load_or_generate(data_dir.join("identity")).await?,
+            );
+            let blob_mode = if blob_sync_mode == "metadata" {
+                crate::consensus::BlobSyncMode::MetadataOnly
+            } else {
+                crate::consensus::BlobSyncMode::FullData
+            };
+            let node = Arc::new(
+                Node::start(NodeConfig {
+                    data_dir: data_dir.clone(),
+                    listen_addr,
+                    rpc_bind: rpc_addr,
+                    min_peers,
+                    blob_sync_mode: blob_mode,
+                    identity: (*identity).clone(),
+                })
+                .await?,
+            );
+            let rpc_server = start_rpc(node.clone(), rpc_addr).await?;
+            println!(
+                "Node started. Data dir: {}. RPC: {}.",
+                data_dir.display(),
+                rpc_server.bound
+            );
+            signal::ctrl_c().await?;
+        }
+        Commands::UploadBlob { rpc, file, mime } => {
+            let data = std::fs::read(&file)?;
+            let body = serde_json::json!({
+                "data_base64": general_purpose::STANDARD.encode(&data),
+                "mime": mime,
+            });
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .post(format!("{endpoint}/blobs"))
+                .json(&body)
+                .send()
+                .await?;
+            if res.status().is_success() {
+                println!("{}", res.text().await?);
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+        }
+        Commands::Deploy {
+            rpc,
+            file,
+            entrypoint,
+            blob_refs,
+            salt,
+        } => {
+            let data = std::fs::read(&file)?;
+            let body = serde_json::json!({
+                "wasm_base64": general_purpose::STANDARD.encode(&data),
+                "entrypoint": entrypoint,
+                "blob_refs": blob_refs,
+                "salt_base64": salt.or_else(|| {
+                    let rand = uuid::Uuid::new_v4();
+                    Some(general_purpose::STANDARD.encode(rand.as_bytes()))
+                }),
+            });
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .post(format!("{endpoint}/programs"))
+                .json(&body)
+                .send()
+                .await?;
+            if res.status().is_success() {
+                println!("{}", res.text().await?);
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+        }
+        Commands::Execute {
+            rpc,
+            program_id,
+            input,
+            json,
+        } => {
+            let data = if let Some(path) = input {
+                std::fs::read(path)?
+            } else {
+                Vec::new()
+            };
+            let body = serde_json::json!({
+                "program_id": program_id,
+                "input_base64": general_purpose::STANDARD.encode(&data),
+            });
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .post(format!("{endpoint}/execute"))
+                .json(&body)
+                .send()
+                .await?;
+            let status = res.status();
+            let text = res.text().await?;
+            if !status.is_success() {
+                return Err(anyhow::anyhow!(text));
+            }
+            if json {
+                let v: serde_json::Value = serde_json::from_str(&text)?;
+                let ret_b64 = v
+                    .get("return_base64")
+                    .and_then(|s| s.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing return_base64 in response"))?;
+                let decoded = general_purpose::STANDARD.decode(ret_b64)?;
+                let decoded_str = String::from_utf8_lossy(&decoded).into_owned();
+                let fuel = v.get("fuel").cloned().unwrap_or(serde_json::json!(null));
+                let out = serde_json::json!({
+                    "return": decoded_str,
+                    "fuel": fuel,
+                });
+                println!("{}", serde_json::to_string(&out)?);
+            } else {
+                let v: serde_json::Value = serde_json::from_str(&text)?;
+                let ret = v
+                    .get("return_base64")
+                    .and_then(|s| s.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("missing return_base64 in response"))?;
+                let decoded = general_purpose::STANDARD.decode(ret)?;
+                println!("{}", String::from_utf8_lossy(&decoded));
+            }
+        }
+        Commands::GetBlob { rpc, id, out } => {
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client.get(format!("{endpoint}/blobs/{id}")).send().await?;
+            if res.status().is_success() {
+                let data = res.bytes().await?;
+                std::fs::write(&out, data)?;
+                println!("blob saved to {}", out.display());
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+        }
+        Commands::ProgramInfo { rpc, id } => {
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .get(format!("{endpoint}/programs/{id}"))
+                .send()
+                .await?;
+            if res.status().is_success() {
+                println!("{}", res.text().await?);
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+        }
+    }
+    Ok(())
+}

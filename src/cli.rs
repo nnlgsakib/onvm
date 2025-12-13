@@ -3,11 +3,16 @@ use crate::rpc::start_rpc;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Parser, Subcommand};
+use futures::{StreamExt, TryStreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use libp2p::Multiaddr;
+use reqwest::Body;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::signal;
+use tokio_util::io::ReaderStream;
 use tracing_subscriber::EnvFilter;
 
 fn normalize_rpc_endpoint(raw: &str) -> String {
@@ -170,18 +175,29 @@ pub async fn run() -> Result<()> {
             signal::ctrl_c().await?;
         }
         Commands::UploadBlob { rpc, file, mime } => {
-            let data = std::fs::read(&file)?;
-            let body = serde_json::json!({
-                "data_base64": general_purpose::STANDARD.encode(&data),
-                "mime": mime,
+            let metadata = tokio::fs::metadata(&file).await?;
+            let total = metadata.len();
+            let pb = ProgressBar::new(total);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})",
+                )
+                .unwrap(),
+            );
+            let f = tokio::fs::File::open(&file).await?;
+            let pb_clone = pb.clone();
+            let stream = ReaderStream::new(f).inspect_ok(move |chunk| {
+                pb_clone.inc(chunk.len() as u64);
             });
+            let body = Body::wrap_stream(stream);
             let client = reqwest::Client::new();
             let endpoint = normalize_rpc_endpoint(&rpc);
-            let res = client
-                .post(format!("{endpoint}/blobs"))
-                .json(&body)
-                .send()
-                .await?;
+            let mut req = client.post(format!("{endpoint}/blobs")).body(body);
+            if let Some(m) = mime.clone() {
+                req = req.header("x-mime", m);
+            }
+            let res = req.send().await?;
+            pb.finish_and_clear();
             if res.status().is_success() {
                 println!("{}", res.text().await?);
             } else {
@@ -273,13 +289,36 @@ pub async fn run() -> Result<()> {
             let client = reqwest::Client::new();
             let endpoint = normalize_rpc_endpoint(&rpc);
             let res = client.get(format!("{endpoint}/blobs/{id}")).send().await?;
-            if res.status().is_success() {
-                let data = res.bytes().await?;
-                std::fs::write(&out, data)?;
-                println!("blob saved to {}", out.display());
-            } else {
+            if !res.status().is_success() {
                 return Err(anyhow::anyhow!(res.text().await?));
             }
+            let total = res.content_length().unwrap_or(0);
+            let pb = if total > 0 {
+                let pb = ProgressBar::new(total);
+                pb.set_style(
+                    ProgressStyle::with_template(
+                        "[{elapsed_precise}] {bar:40.green/blue} {bytes}/{total_bytes} ({eta})",
+                    )
+                    .unwrap(),
+                );
+                Some(pb)
+            } else {
+                None
+            };
+            let mut file = tokio::fs::File::create(&out).await?;
+            let mut stream = res.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                file.write_all(&chunk).await?;
+                if let Some(pb) = pb.as_ref() {
+                    pb.inc(chunk.len() as u64);
+                }
+            }
+            file.flush().await?;
+            if let Some(pb) = pb {
+                pb.finish_and_clear();
+            }
+            println!("blob saved to {}", out.display());
         }
         Commands::ProgramInfo { rpc, id } => {
             let client = reqwest::Client::new();

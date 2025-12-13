@@ -1,5 +1,5 @@
 mod blob_store;
 mod state_store;
 
-pub use blob_store::{BlobStore, reconstruct_chunk};
+pub use blob_store::{reconstruct_chunk, BlobStore};
 pub use state_store::StateStore;

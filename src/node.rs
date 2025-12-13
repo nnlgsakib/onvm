@@ -1,6 +1,6 @@
 use crate::consensus::{BlobSyncMode, DagConfig, DagEngine};
 use crate::crypto::keys::NodeKeys;
-use crate::execution::{ ExecutionEngine, ExecutionScheduler, ProgramStore};
+use crate::execution::{ExecutionEngine, ExecutionScheduler, ProgramStore};
 use crate::network::{NetworkConfig, NetworkHandle, NetworkService, NetworkStreams};
 use crate::storage::BlobStore;
 use crate::syncer::SyncMan;
@@ -46,7 +46,10 @@ impl Node {
         let identity = Arc::new(config.identity);
         let blob_store = Arc::new(BlobStore::new(db.clone(), blob_path)?);
         let program_store = Arc::new(ProgramStore::new(db.clone(), program_path)?);
-        let state_store = Arc::new(crate::storage::StateStore::new(db.clone(), "contract_state")?);
+        let state_store = Arc::new(crate::storage::StateStore::new(
+            db.clone(),
+            "contract_state",
+        )?);
         let exec = Arc::new(ExecutionEngine::new(
             blob_store.clone(),
             state_store.clone(),
@@ -100,6 +103,9 @@ impl Node {
                 blob_sync_mode: config.blob_sync_mode.clone(),
             },
         )?);
+        if matches!(config.blob_sync_mode, BlobSyncMode::FullData) {
+            consensus.start_fetch_workers(5).await;
+        }
 
         let consensus_task = {
             let c = consensus.clone();

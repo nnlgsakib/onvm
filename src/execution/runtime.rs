@@ -259,7 +259,10 @@ fn attach_state_host_functions(linker: &mut Linker<ExecutionContext>) -> Result<
                 _ => return -1,
             };
             let mut key_buf = vec![0u8; key_len as usize];
-            if memory.read(&caller, key_ptr as usize, &mut key_buf).is_err() {
+            if memory
+                .read(&caller, key_ptr as usize, &mut key_buf)
+                .is_err()
+            {
                 return -2;
             }
             let mut val_buf = vec![0u8; val_len as usize];
@@ -269,10 +272,7 @@ fn attach_state_host_functions(linker: &mut Linker<ExecutionContext>) -> Result<
             {
                 return -3;
             }
-            caller
-                .data_mut()
-                .pending_writes
-                .insert(key_buf, val_buf);
+            caller.data_mut().pending_writes.insert(key_buf, val_buf);
             0
         },
     )?;
@@ -292,16 +292,14 @@ fn attach_state_host_functions(linker: &mut Linker<ExecutionContext>) -> Result<
                 _ => return -1,
             };
             let mut key_buf = vec![0u8; key_len as usize];
-            if memory.read(&caller, key_ptr as usize, &mut key_buf).is_err() {
+            if memory
+                .read(&caller, key_ptr as usize, &mut key_buf)
+                .is_err()
+            {
                 return -2;
             }
             // prefer pending writes overlay
-            if let Some(v) = caller
-                .data()
-                .pending_writes
-                .get(&key_buf)
-                .cloned()
-            {
+            if let Some(v) = caller.data().pending_writes.get(&key_buf).cloned() {
                 let len = v.len() as i32;
                 if len > out_cap {
                     return -len;
@@ -321,10 +319,7 @@ fn attach_state_host_functions(linker: &mut Linker<ExecutionContext>) -> Result<
             if len > out_cap {
                 return -len;
             }
-            if memory
-                .write(&mut caller, out_ptr as usize, &val)
-                .is_err()
-            {
+            if memory.write(&mut caller, out_ptr as usize, &val).is_err() {
                 return -4;
             }
             len
@@ -354,19 +349,22 @@ fn attach_state_host_functions(linker: &mut Linker<ExecutionContext>) -> Result<
                     Err(_) => return -2,
                 }
             } else {
-                let mut current = caller.data().state_store.root_scoped(&ns).unwrap_or([0u8; 32]);
+                let mut current = caller
+                    .data()
+                    .state_store
+                    .root_scoped(&ns)
+                    .unwrap_or([0u8; 32]);
                 // simplistic: fold hashes of pending writes into root
                 for (k, v) in pairs {
                     current = crate::crypto::hashing::hash_bytes(
-                        [current.as_slice(), k.as_slice(), v.as_slice()].concat().as_slice(),
+                        [current.as_slice(), k.as_slice(), v.as_slice()]
+                            .concat()
+                            .as_slice(),
                     );
                 }
                 current
             };
-            if memory
-                .write(&mut caller, out_ptr as usize, &root)
-                .is_err()
-            {
+            if memory.write(&mut caller, out_ptr as usize, &root).is_err() {
                 return -3;
             }
             0

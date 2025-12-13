@@ -8,6 +8,8 @@ use sled::Db;
 const FASTCDC_MIN: usize = 64 * 1024; // 64 KiB
 const FASTCDC_AVG: usize = 256 * 1024; // 256 KiB target
 const FASTCDC_MAX: usize = 512 * 1024; // 512 KiB cap to fit transfer limits
+const STATIC_CHUNK_SIZE: usize = 1 * 1024 * 1024; // 1 MiB
+const STATIC_THRESHOLD: usize = 100 * 1024 * 1024; // 100 MiB
 const DATA_SHARDS: usize = 8;
 const PARITY_SHARDS: usize = 4;
 
@@ -30,7 +32,7 @@ impl BlobStore {
         if data.is_empty() {
             return Err(anyhow!("cannot store empty blob"));
         }
-        let (chunks, chunk_sizes) = chunk_bytes_fastcdc(data);
+        let (chunks, chunk_sizes) = chunk_bytes(data);
         let chunk_hashes: Vec<[u8; 32]> = chunks.iter().map(|c| hash_bytes(c)).collect();
         let merkle_root = merkle_root(&chunk_hashes);
 
@@ -83,8 +85,11 @@ impl BlobStore {
         if root != meta.merkle_root {
             return Err(anyhow!("merkle root mismatch"));
         }
-        let shards_per_chunk =
-            encode_chunks(&chunks, meta.data_shards as usize, meta.parity_shards as usize)?;
+        let shards_per_chunk = encode_chunks(
+            &chunks,
+            meta.data_shards as usize,
+            meta.parity_shards as usize,
+        )?;
         self.persist(meta, &shards_per_chunk)
     }
 
@@ -191,14 +196,8 @@ impl BlobStore {
         Ok(())
     }
 
-    pub fn try_load_chunk(
-        &self,
-        meta: &BlobMetadata,
-        chunk_idx: usize,
-    ) -> Option<Vec<u8>> {
-        let shards = self
-            .load_shards(&meta.id, chunk_idx as u32)
-            .ok()?;
+    pub fn try_load_chunk(&self, meta: &BlobMetadata, chunk_idx: usize) -> Option<Vec<u8>> {
+        let shards = self.load_shards(&meta.id, chunk_idx as u32).ok()?;
         reconstruct_chunk(
             shards,
             meta.data_shards as usize,
@@ -237,13 +236,29 @@ impl BlobStore {
             out.push((shard_idx, v.to_vec()));
         }
         if out.is_empty() {
-            return Err(anyhow!("no shards found for chunk {chunk_idx} of blob {id}"));
+            return Err(anyhow!(
+                "no shards found for chunk {chunk_idx} of blob {id}"
+            ));
         }
         Ok(out)
     }
 }
 
-fn chunk_bytes_fastcdc(data: &[u8]) -> (Vec<Vec<u8>>, Vec<usize>) {
+fn chunk_bytes(data: &[u8]) -> (Vec<Vec<u8>>, Vec<usize>) {
+    if data.len() <= STATIC_THRESHOLD {
+        let mut chunks = Vec::new();
+        let mut sizes = Vec::new();
+        let mut offset = 0;
+        while offset < data.len() {
+            let end = std::cmp::min(offset + STATIC_CHUNK_SIZE, data.len());
+            let slice = data[offset..end].to_vec();
+            sizes.push(slice.len());
+            chunks.push(slice);
+            offset = end;
+        }
+        return (chunks, sizes);
+    }
+
     let mut chunks = Vec::new();
     let mut sizes = Vec::new();
     let detector = FastCDC::new(

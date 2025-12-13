@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod execution;
 pub mod network;
 pub mod node;
+pub mod qeue_manager;
 pub mod rpc;
 pub mod storage;
 pub mod syncer;

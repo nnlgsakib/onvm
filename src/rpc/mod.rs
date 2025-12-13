@@ -2,6 +2,7 @@ use crate::node::Node;
 use crate::types::{BlobId, ProgramId};
 use anyhow::Result;
 use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose, Engine as _};
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-// Permit large blob uploads (base64 encoded); adjust if hosting constraints change.
+// Permit large blob uploads; adjust if hosting constraints change.
 const MAX_UPLOAD_SIZE_BYTES: usize = 1 * 1024 * 1024 * 1024; // 1 GiB
 
 pub struct RpcServer {
@@ -23,12 +24,6 @@ pub struct RpcServer {
 #[derive(Clone)]
 pub struct RpcContext {
     pub node: Arc<Node>,
-}
-
-#[derive(Deserialize)]
-struct UploadBlobRequest {
-    data_base64: String,
-    mime: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -101,16 +96,24 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
 
 async fn upload_blob(
     State(ctx): State<RpcContext>,
-    Json(req): Json<UploadBlobRequest>,
-) -> Result<Json<UploadBlobResponse>, (axum::http::StatusCode, String)> {
-    let data = match general_purpose::STANDARD.decode(req.data_base64) {
-        Ok(d) => d,
-        Err(e) => return Err((axum::http::StatusCode::BAD_REQUEST, e.to_string())),
-    };
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<UploadBlobResponse>, (StatusCode, String)> {
+    let mime = headers
+        .get("x-mime")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        });
+    let data = body.to_vec();
     let meta = ctx
         .node
         .blob_store
-        .put(&data, req.mime, ctx.node.identity.node_id.clone())
+        .put(&data, mime, ctx.node.identity.node_id.clone())
         .map_err(internal_err)?;
     ctx.node
         .consensus

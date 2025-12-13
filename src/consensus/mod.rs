@@ -4,12 +4,14 @@ use crate::execution::{ExecutionOutcome, ExecutionScheduler, ProgramStore};
 use crate::network::{
     BlobAdvertisement, BlobBroadcast, BlobInventoryEntry, BlobRequest, BloomFilter,
     ExecutionBroadcast, NetworkEvent, NetworkHandle, NetworkMessage, ProgramBroadcast,
-    ProgramSyncRequest, ProviderKind, TransferRequest, TransferResponse, SyncSnapshot, SyncDelta,
+    ProgramSyncRequest, ProviderKind, SyncDelta, SyncSnapshot, TransferRequest, TransferResponse,
 };
-use crate::storage::{reconstruct_chunk, BlobStore};
+use crate::qeue_manager::AsyncQueue;
 use crate::storage::StateStore;
+use crate::storage::{reconstruct_chunk, BlobStore};
 use crate::types::{BlobId, BlobMetadata, ComputeOp, NodeId, ProgramId, ProgramMetadata};
 use anyhow::{anyhow, Context, Result};
+use libp2p::request_response::ResponseChannel;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use sled::Db;
@@ -17,7 +19,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Duration, Instant};
-use libp2p::request_response::ResponseChannel;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Operation {
@@ -73,6 +74,7 @@ pub struct DagEngine {
     config: DagConfig,
     sync_state: Arc<RwLock<SyncState>>,
     pending_blob_fetches: Arc<RwLock<HashSet<BlobId>>>,
+    fetch_queue: Arc<RwLock<Option<AsyncQueue<BlobId>>>>,
 }
 
 impl DagEngine {
@@ -100,7 +102,31 @@ impl DagEngine {
             config,
             sync_state: Arc::new(RwLock::new(SyncState::default())),
             pending_blob_fetches: Arc::new(RwLock::new(HashSet::new())),
+            fetch_queue: Arc::new(RwLock::new(None)),
         })
+    }
+
+    pub async fn start_fetch_workers(self: &Arc<Self>, concurrency: usize) {
+        if concurrency == 0 {
+            return;
+        }
+        let me = Arc::clone(self);
+        let queue = AsyncQueue::new(concurrency, move |blob_id: BlobId| {
+            let me = Arc::clone(&me);
+            async move {
+                if let Err(e) = me.fetch_blob(&blob_id).await {
+                    tracing::warn!("prefetch blob {} failed: {e:?}", hex::encode(blob_id.0));
+                }
+            }
+        });
+        let mut guard = self.fetch_queue.write().await;
+        *guard = Some(queue);
+    }
+
+    async fn enqueue_prefetch(&self, id: BlobId) {
+        if let Some(q) = self.fetch_queue.read().await.as_ref() {
+            q.enqueue(id);
+        }
     }
 
     pub async fn run(self: Arc<Self>, mut events: mpsc::UnboundedReceiver<NetworkEvent>) {
@@ -260,10 +286,13 @@ impl DagEngine {
                 dag_id: node.id.0,
                 op: compute.clone(),
             }));
-        self.push_execution_to_peers(None, ExecutionBroadcast {
-            dag_id: node.id.0,
-            op: compute,
-        })
+        self.push_execution_to_peers(
+            None,
+            ExecutionBroadcast {
+                dag_id: node.id.0,
+                op: compute,
+            },
+        )
         .await;
         Ok(outcome)
     }
@@ -276,19 +305,19 @@ impl DagEngine {
         self.blob_index
             .record(&meta, meta.publisher.clone(), true)?;
         self.network.provide(&meta.id.0);
-        let _ = self.network.publisher.send(NetworkMessage::Blob(bcast.clone()));
+        let _ = self
+            .network
+            .publisher
+            .send(NetworkMessage::Blob(bcast.clone()));
         self.handle_blob_broadcast(&self.network.peer_id, bcast.clone())
             .await?;
-        self.push_blob_to_peers(Some(self.network.peer_id), bcast).await;
+        self.push_blob_to_peers(Some(self.network.peer_id), bcast)
+            .await;
         Ok(())
     }
 
     /// Used by local RPC paths to ingest and disseminate freshly deployed programs.
-    pub async fn ingest_local_program(
-        &self,
-        meta: ProgramMetadata,
-        wasm: Vec<u8>,
-    ) -> Result<()> {
+    pub async fn ingest_local_program(&self, meta: ProgramMetadata, wasm: Vec<u8>) -> Result<()> {
         let bcast = ProgramBroadcast {
             meta: meta.clone(),
             wasm: wasm.clone(),
@@ -317,11 +346,7 @@ impl DagEngine {
         Ok(node)
     }
 
-    async fn handle_program_broadcast(
-        &self,
-        peer: &PeerId,
-        bcast: ProgramBroadcast,
-    ) -> Result<()> {
+    async fn handle_program_broadcast(&self, peer: &PeerId, bcast: ProgramBroadcast) -> Result<()> {
         let already_present = self.program_store.metadata(&bcast.meta.id)?.is_some();
         if let Some(existing) = self.program_store.metadata(&bcast.meta.id)? {
             if existing.deploy_salt != bcast.meta.deploy_salt {
@@ -345,7 +370,8 @@ impl DagEngine {
         let _ = self.record_operation(op, parents)?;
         self.refresh_sync_state().await?;
         if !already_present {
-            self.push_program_to_peers(Some(peer.clone()), bcast.clone()).await;
+            self.push_program_to_peers(Some(peer.clone()), bcast.clone())
+                .await;
         }
         {
             let mut st = self.sync_state.write().await;
@@ -354,7 +380,11 @@ impl DagEngine {
         Ok(())
     }
 
-    async fn handle_program_metadata(&self, from: &PeerId, metas: Vec<ProgramMetadata>) -> Result<()> {
+    async fn handle_program_metadata(
+        &self,
+        from: &PeerId,
+        metas: Vec<ProgramMetadata>,
+    ) -> Result<()> {
         for meta in metas {
             if self.program_store.metadata(&meta.id)?.is_some() {
                 continue;
@@ -410,6 +440,9 @@ impl DagEngine {
         // Only provide if we actually have shard data locally.
         if had_blob {
             self.network.provide(&bcast.meta.id.0);
+        } else if matches!(self.config.blob_sync_mode, BlobSyncMode::FullData) {
+            // Schedule prefetch in full sync mode.
+            self.enqueue_prefetch(bcast.meta.id.clone()).await;
         }
         let op = Operation::PublishBlob(bcast.meta.clone());
         let _ = self.record_operation(op, Vec::new())?;
@@ -438,27 +471,27 @@ impl DagEngine {
                 if let Some(meta) = self.blob_store.metadata(&id)? {
                     let has_data = self.identity.node_id == meta.publisher
                         || self.blob_store.load_shards(&id, 0).is_ok();
-                    let _ = self
-                        .network
-                        .publisher
-                        .send(NetworkMessage::BlobMeta(BlobAdvertisement {
-                            meta,
-                            has_data,
-                            locations: vec![self.identity.node_id.to_string()],
-                        }));
+                    let _ =
+                        self.network
+                            .publisher
+                            .send(NetworkMessage::BlobMeta(BlobAdvertisement {
+                                meta,
+                                has_data,
+                                locations: vec![self.identity.node_id.to_string()],
+                            }));
                 }
                 continue;
             }
             // Data path now uses chunk transfer; respond with advertisement only.
             if let Some(meta) = self.blob_store.metadata(&id)? {
-                let _ =
-                    self.network
-                        .publisher
-                        .send(NetworkMessage::BlobMeta(BlobAdvertisement {
-                            meta,
-                            has_data: true,
-                            locations: vec![self.identity.node_id.to_string()],
-                        }));
+                let _ = self
+                    .network
+                    .publisher
+                    .send(NetworkMessage::BlobMeta(BlobAdvertisement {
+                        meta,
+                        has_data: true,
+                        locations: vec![self.identity.node_id.to_string()],
+                    }));
             }
         }
         Ok(())
@@ -501,7 +534,8 @@ impl DagEngine {
             publisher: self.identity.node_id.clone(),
         })?;
         self.refresh_sync_state().await?;
-        self.push_execution_to_peers(Some(peer.clone()), bcast.clone()).await;
+        self.push_execution_to_peers(Some(peer.clone()), bcast.clone())
+            .await;
         {
             let mut st = self.sync_state.write().await;
             st.pending_exec_ids.remove(&bcast.dag_id);
@@ -580,12 +614,14 @@ impl DagEngine {
             loop {
                 if let Some(chunk) = self.blob_store.try_load_chunk(&meta, idx) {
                     assembled.extend_from_slice(&chunk);
-                    tracing::info!(
-                        "blob {} fetched chunk {}/{}",
-                        hex::encode(id.0),
-                        idx + 1,
-                        total_chunks
-                    );
+                    if Self::should_log_chunk(idx + 1, total_chunks) {
+                        tracing::info!(
+                            "blob {} fetched chunk {}/{}",
+                            hex::encode(id.0),
+                            idx + 1,
+                            total_chunks
+                        );
+                    }
                     break;
                 }
                 if Instant::now() >= deadline {
@@ -607,6 +643,10 @@ impl DagEngine {
         Ok(assembled)
     }
 
+    fn should_log_chunk(idx: usize, total: usize) -> bool {
+        idx == 1 || idx == total || idx % 10 == 0
+    }
+
     async fn handle_execution_request(&self, ids: Vec<[u8; 32]>) -> Result<()> {
         for raw in ids {
             let mut arr = [0u8; 32];
@@ -623,7 +663,11 @@ impl DagEngine {
         Ok(())
     }
 
-    async fn handle_inventory(&self, from: &PeerId, inv: crate::network::DagInventory) -> Result<()> {
+    async fn handle_inventory(
+        &self,
+        from: &PeerId,
+        inv: crate::network::DagInventory,
+    ) -> Result<()> {
         let mut missing_programs = Vec::new();
         for raw in &inv.programs {
             let mut id_bytes = [0u8; 32];
@@ -779,27 +823,26 @@ impl DagEngine {
                 TransferResponse::Blob(resp)
             }
             TransferRequest::BlobChunk { id, chunk_idx } => {
-                let resp = match self.blob_store.metadata(&id) {
-                    Ok(Some(meta)) => match self
-                        .blob_store
-                        .load_shards(&id, chunk_idx)
-                        .and_then(|shards| {
-                            reconstruct_chunk(
-                                shards.clone(),
-                                meta.data_shards as usize,
-                                meta.parity_shards as usize,
-                                *meta
-                                    .chunk_sizes
-                                    .get(chunk_idx as usize)
-                                    .unwrap_or(&0) as usize,
-                            )
-                            .map(|_| shards)
-                        }) {
-                        Ok(shards) => Some(shards),
-                        Err(_) => None,
-                    },
-                    _ => None,
-                };
+                let resp =
+                    match self.blob_store.metadata(&id) {
+                        Ok(Some(meta)) => match self
+                            .blob_store
+                            .load_shards(&id, chunk_idx)
+                            .and_then(|shards| {
+                                reconstruct_chunk(
+                                    shards.clone(),
+                                    meta.data_shards as usize,
+                                    meta.parity_shards as usize,
+                                    *meta.chunk_sizes.get(chunk_idx as usize).unwrap_or(&0)
+                                        as usize,
+                                )
+                                .map(|_| shards)
+                            }) {
+                            Ok(shards) => Some(shards),
+                            Err(_) => None,
+                        },
+                        _ => None,
+                    };
                 TransferResponse::BlobChunk {
                     id,
                     chunk_idx,
@@ -855,11 +898,7 @@ impl DagEngine {
         Ok(())
     }
 
-    async fn handle_transfer_response(
-        &self,
-        peer: &PeerId,
-        resp: TransferResponse,
-    ) -> Result<()> {
+    async fn handle_transfer_response(&self, peer: &PeerId, resp: TransferResponse) -> Result<()> {
         match resp {
             TransferResponse::Program(Some(bcast)) => {
                 self.handle_program_broadcast(peer, bcast.clone()).await?;
@@ -882,14 +921,22 @@ impl DagEngine {
                             .store_chunk(&meta, chunk_idx as usize, &shards)
                         {
                             Ok(_) => {
-                                self.blob_index
-                                    .record(&meta, self.identity.node_id.clone(), true)?;
-                                tracing::info!(
-                                    "received chunk {}/{} for blob {}",
-                                    chunk_idx + 1,
+                                self.blob_index.record(
+                                    &meta,
+                                    self.identity.node_id.clone(),
+                                    true,
+                                )?;
+                                if Self::should_log_chunk(
+                                    chunk_idx as usize + 1,
                                     meta.chunk_sizes.len(),
-                                    hex::encode(id.0)
-                                );
+                                ) {
+                                    tracing::info!(
+                                        "received chunk {}/{} for blob {}",
+                                        chunk_idx + 1,
+                                        meta.chunk_sizes.len(),
+                                        hex::encode(id.0)
+                                    );
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -976,8 +1023,13 @@ impl DagEngine {
     async fn push_all_programs_to_peer(&self, peer: PeerId) -> Result<()> {
         for meta in self.program_store.list()? {
             if let Ok(wasm) = self.program_store.load(&meta.id) {
-                self.network
-                    .request_transfer(peer, TransferRequest::PushProgram(ProgramBroadcast { meta: meta.clone(), wasm }));
+                self.network.request_transfer(
+                    peer,
+                    TransferRequest::PushProgram(ProgramBroadcast {
+                        meta: meta.clone(),
+                        wasm,
+                    }),
+                );
             }
         }
         Ok(())
@@ -990,7 +1042,10 @@ impl DagEngine {
                     dag_id: entry.id.0,
                     op: op.clone(),
                 };
-                let _ = self.network.publisher.send(NetworkMessage::Execution(bcast.clone()));
+                let _ = self
+                    .network
+                    .publisher
+                    .send(NetworkMessage::Execution(bcast.clone()));
                 // also direct push to the peer via transfer to reduce reliance on gossip
                 self.network
                     .request_transfer(peer, TransferRequest::PushExecution(bcast));
@@ -1032,15 +1087,17 @@ impl DagEngine {
             .map(|m| m.id)
             .collect::<Vec<_>>();
         let executions = self.dag_store.execution_ids()?;
-        self.network
-            .request_transfer(peer, TransferRequest::Sync(SyncSnapshot { programs, executions }));
+        self.network.request_transfer(
+            peer,
+            TransferRequest::Sync(SyncSnapshot {
+                programs,
+                executions,
+            }),
+        );
         Ok(())
     }
 
-    fn diff_snapshot(
-        &self,
-        snapshot: &SyncSnapshot,
-    ) -> Result<(Vec<ProgramId>, Vec<[u8; 32]>)> {
+    fn diff_snapshot(&self, snapshot: &SyncSnapshot) -> Result<(Vec<ProgramId>, Vec<[u8; 32]>)> {
         let mut missing_programs = Vec::new();
         for pid in &snapshot.programs {
             if self.program_store.metadata(pid)?.is_none() {

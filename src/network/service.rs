@@ -44,10 +44,7 @@ pub enum NetworkMessage {
 pub enum TransferRequest {
     Program(ProgramId),
     Blob(BlobId),
-    BlobChunk {
-        id: BlobId,
-        chunk_idx: u32,
-    },
+    BlobChunk { id: BlobId, chunk_idx: u32 },
     Execution([u8; 32]),
     PushProgram(ProgramBroadcast),
     PushBlob(BlobBroadcast),
@@ -143,11 +140,7 @@ pub enum NetworkEvent {
     PeerConnected(PeerId),
     PeerDisconnected(PeerId),
     Listening(Multiaddr),
-    TransferRequest(
-        PeerId,
-        TransferRequest,
-        ResponseChannel<TransferResponse>,
-    ),
+    TransferRequest(PeerId, TransferRequest, ResponseChannel<TransferResponse>),
     TransferResponse(PeerId, TransferResponse),
     ProvidersFound {
         key: Vec<u8>,

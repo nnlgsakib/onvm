@@ -4,7 +4,7 @@ use crate::execution::{ExecutionOutcome, ExecutionScheduler, ProgramStore};
 use crate::network::{
     BlobAdvertisement, BlobBroadcast, BlobInventoryEntry, BlobRequest, BloomFilter,
     ExecutionBroadcast, NetworkEvent, NetworkHandle, NetworkMessage, ProgramBroadcast,
-    ProgramSyncRequest, ProviderKind, TransferRequest, TransferResponse,
+    ProgramSyncRequest, ProviderKind, TransferRequest, TransferResponse, SyncSnapshot, SyncDelta,
 };
 use crate::storage::BlobStore;
 use crate::storage::StateStore;
@@ -112,6 +112,7 @@ impl DagEngine {
                 }
                 _ = sync_timer.tick() => {
                     let _ = self.broadcast_inventory(false).await;
+                    let _ = self.retry_missing().await;
                 }
             }
         }
@@ -179,6 +180,12 @@ impl DagEngine {
                 let _ = self.broadcast_inventory(true).await;
                 let _ = self.request_inventory().await;
                 let _ = self.request_program_sync().await;
+                // proactively push known programs to the newly connected peer
+                let _ = self.push_all_programs_to_peer(peer).await;
+                let _ = self.push_all_executions_to_peer(peer).await;
+                let _ = self.push_program_meta_to_peer(peer).await;
+                let _ = self.request_missing_executions(peer).await;
+                let _ = self.send_sync_snapshot(peer).await;
             }
             NetworkEvent::PeerDisconnected(peer) => {
                 self.peers.write().await.remove(&peer);
@@ -332,7 +339,11 @@ impl DagEngine {
         let _ = self.record_operation(op, parents)?;
         self.refresh_sync_state().await?;
         if !already_present {
-            self.push_program_to_peers(Some(peer.clone()), bcast).await;
+            self.push_program_to_peers(Some(peer.clone()), bcast.clone()).await;
+        }
+        {
+            let mut st = self.sync_state.write().await;
+            st.pending_program_ids.remove(&bcast.meta.id);
         }
         Ok(())
     }
@@ -478,7 +489,11 @@ impl DagEngine {
             publisher: self.identity.node_id.clone(),
         })?;
         self.refresh_sync_state().await?;
-        self.push_execution_to_peers(Some(peer.clone()), bcast).await;
+        self.push_execution_to_peers(Some(peer.clone()), bcast.clone()).await;
+        {
+            let mut st = self.sync_state.write().await;
+            st.pending_exec_ids.remove(&bcast.dag_id);
+        }
         Ok(())
     }
 
@@ -530,6 +545,12 @@ impl DagEngine {
         }
 
         if !missing_programs.is_empty() {
+            {
+                let mut state = self.sync_state.write().await;
+                for pid in &missing_programs {
+                    state.pending_program_ids.insert(pid.clone());
+                }
+            }
             for pid in missing_programs {
                 self.network
                     .request_transfer(*from, TransferRequest::Program(pid.clone()));
@@ -602,6 +623,12 @@ impl DagEngine {
         }
 
         if !missing_execs.is_empty() {
+            {
+                let mut state = self.sync_state.write().await;
+                for did in &missing_execs {
+                    state.pending_exec_ids.insert(*did);
+                }
+            }
             let _ = self
                 .network
                 .publisher
@@ -671,6 +698,23 @@ impl DagEngine {
                 self.handle_execution_broadcast(peer, bcast.clone()).await?;
                 TransferResponse::Execution(None)
             }
+            TransferRequest::Sync(snapshot) => {
+                let (missing_programs, missing_execs) = self.diff_snapshot(&snapshot)?;
+                // also proactively request missing items
+                for pid in &missing_programs {
+                    self.network
+                        .request_transfer(*peer, TransferRequest::Program(pid.clone()));
+                    self.network.find_providers(&pid.0, ProviderKind::Program);
+                }
+                for did in &missing_execs {
+                    self.network
+                        .request_transfer(*peer, TransferRequest::Execution(*did));
+                }
+                TransferResponse::Sync(SyncDelta {
+                    missing_programs,
+                    missing_executions: missing_execs,
+                })
+            }
         };
         self.network.respond_transfer(channel, response);
         Ok(())
@@ -683,15 +727,48 @@ impl DagEngine {
     ) -> Result<()> {
         match resp {
             TransferResponse::Program(Some(bcast)) => {
-                self.handle_program_broadcast(peer, bcast).await?;
+                self.handle_program_broadcast(peer, bcast.clone()).await?;
+                let mut state = self.sync_state.write().await;
+                state.pending_program_ids.remove(&bcast.meta.id);
+                self.refresh_sync_state().await?;
             }
             TransferResponse::Blob(Some(bcast)) => {
                 self.handle_blob_broadcast(peer, bcast).await?;
             }
             TransferResponse::Execution(Some(bcast)) => {
-                self.handle_execution_broadcast(peer, bcast).await?;
+                self.handle_execution_broadcast(peer, bcast.clone()).await?;
+                let mut state = self.sync_state.write().await;
+                state.pending_exec_ids.remove(&bcast.dag_id);
+                self.refresh_sync_state().await?;
+            }
+            TransferResponse::Sync(delta) => {
+                {
+                    let mut state = self.sync_state.write().await;
+                    for pid in &delta.missing_programs {
+                        state.pending_program_ids.insert(pid.clone());
+                    }
+                    for did in &delta.missing_executions {
+                        state.pending_exec_ids.insert(*did);
+                    }
+                }
+                // If delta is empty, we might already be in sync; refresh state.
+                if delta.missing_programs.is_empty() && delta.missing_executions.is_empty() {
+                    self.refresh_sync_state().await?;
+                }
+                for pid in delta.missing_programs {
+                    self.network
+                        .request_transfer(*peer, TransferRequest::Program(pid.clone()));
+                    self.network.find_providers(&pid.0, ProviderKind::Program);
+                }
+                for did in delta.missing_executions {
+                    self.network
+                        .request_transfer(*peer, TransferRequest::Execution(did));
+                }
             }
             _ => {}
+        }
+        if self.is_fully_synced().await {
+            tracing::info!("sync complete: programs/blobs/executions fully present");
         }
         Ok(())
     }
@@ -727,6 +804,116 @@ impl DagEngine {
             self.network
                 .request_transfer(peer, TransferRequest::PushExecution(bcast.clone()));
         }
+    }
+
+    async fn push_all_programs_to_peer(&self, peer: PeerId) -> Result<()> {
+        for meta in self.program_store.list()? {
+            if let Ok(wasm) = self.program_store.load(&meta.id) {
+                self.network
+                    .request_transfer(peer, TransferRequest::PushProgram(ProgramBroadcast { meta: meta.clone(), wasm }));
+            }
+        }
+        Ok(())
+    }
+
+    async fn push_all_executions_to_peer(&self, peer: PeerId) -> Result<()> {
+        for entry in self.dag_store.all_compute_ops()? {
+            if let Operation::Compute(op) = entry.op.clone() {
+                let bcast = ExecutionBroadcast {
+                    dag_id: entry.id.0,
+                    op: op.clone(),
+                };
+                let _ = self.network.publisher.send(NetworkMessage::Execution(bcast.clone()));
+                // also direct push to the peer via transfer to reduce reliance on gossip
+                self.network
+                    .request_transfer(peer, TransferRequest::PushExecution(bcast));
+            }
+        }
+        Ok(())
+    }
+
+    async fn push_program_meta_to_peer(&self, _peer: PeerId) -> Result<()> {
+        let metas = self.program_store.list()?;
+        if metas.is_empty() {
+            return Ok(());
+        }
+        // send via gossip path so all connected peers get it
+        let _ = self
+            .network
+            .publisher
+            .send(NetworkMessage::ProgramMeta(metas));
+        Ok(())
+    }
+
+    async fn request_missing_executions(&self, _peer: PeerId) -> Result<()> {
+        let ids = self.dag_store.execution_ids()?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let _ = self
+            .network
+            .publisher
+            .send(NetworkMessage::ExecutionRequest(ids));
+        Ok(())
+    }
+
+    async fn send_sync_snapshot(&self, peer: PeerId) -> Result<()> {
+        let programs = self
+            .program_store
+            .list()?
+            .into_iter()
+            .map(|m| m.id)
+            .collect::<Vec<_>>();
+        let executions = self.dag_store.execution_ids()?;
+        self.network
+            .request_transfer(peer, TransferRequest::Sync(SyncSnapshot { programs, executions }));
+        Ok(())
+    }
+
+    fn diff_snapshot(
+        &self,
+        snapshot: &SyncSnapshot,
+    ) -> Result<(Vec<ProgramId>, Vec<[u8; 32]>)> {
+        let mut missing_programs = Vec::new();
+        for pid in &snapshot.programs {
+            if self.program_store.metadata(pid)?.is_none() {
+                missing_programs.push(pid.clone());
+            }
+        }
+        let mut missing_execs = Vec::new();
+        for did in &snapshot.executions {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(did);
+            let did = DagId(arr);
+            if !self.dag_store.contains(&did)? {
+                missing_execs.push(did.0);
+            }
+        }
+        Ok((missing_programs, missing_execs))
+    }
+
+    async fn retry_missing(&self) -> Result<()> {
+        let peers = self.peers.read().await.clone();
+        if peers.is_empty() {
+            return Ok(());
+        }
+        let peer = *peers.iter().next().unwrap();
+        let (programs, execs) = {
+            let state = self.sync_state.read().await;
+            (
+                state.pending_program_ids.clone(),
+                state.pending_exec_ids.clone(),
+            )
+        };
+        for pid in programs {
+            self.network
+                .request_transfer(peer, TransferRequest::Program(pid));
+        }
+        for did in execs {
+            self.network
+                .request_transfer(peer, TransferRequest::Execution(did));
+        }
+        Ok(())
     }
 
     async fn broadcast_inventory(&self, force: bool) -> Result<()> {
@@ -783,6 +970,8 @@ impl DagEngine {
             && state.missing_programs == 0
             && state.missing_blobs == 0
             && state.missing_execs == 0
+            && state.pending_program_ids.is_empty()
+            && state.pending_exec_ids.is_empty()
     }
 
     pub async fn refresh_sync_state(&self) -> Result<()> {
@@ -924,6 +1113,19 @@ impl DagStore {
         }
         Ok(out)
     }
+
+    fn all_compute_ops(&self) -> Result<Vec<DagNode>> {
+        let mut out = Vec::new();
+        for entry in self.tree.iter() {
+            let (_, v) = entry?;
+            let (node, _): (DagNode, _) =
+                bincode::serde::decode_from_slice(&v, bincode::config::standard())?;
+            if matches!(node.op, Operation::Compute(_)) {
+                out.push(node);
+            }
+        }
+        Ok(out)
+    }
 }
 
 struct BlobIndex {
@@ -1029,6 +1231,8 @@ struct SyncState {
     missing_programs: usize,
     missing_blobs: usize,
     missing_execs: usize,
+    pending_program_ids: HashSet<ProgramId>,
+    pending_exec_ids: HashSet<[u8; 32]>,
     last_seen: bool,
 }
 

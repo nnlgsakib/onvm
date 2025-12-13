@@ -48,6 +48,7 @@ pub enum TransferRequest {
     PushProgram(ProgramBroadcast),
     PushBlob(BlobBroadcast),
     PushExecution(ExecutionBroadcast),
+    Sync(SyncSnapshot),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +56,20 @@ pub enum TransferResponse {
     Program(Option<ProgramBroadcast>),
     Blob(Option<BlobBroadcast>),
     Execution(Option<ExecutionBroadcast>),
+    Sync(SyncDelta),
+    Ack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncSnapshot {
+    pub programs: Vec<ProgramId>,
+    pub executions: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncDelta {
+    pub missing_programs: Vec<ProgramId>,
+    pub missing_executions: Vec<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,9 +256,11 @@ impl NetworkService {
         let store = MemoryStore::new(peer_id);
         let kademlia = Kademlia::new(peer_id, store);
         let transfer_protocol = StreamProtocol::new("/onvm/transfer/1.0.0");
+        let transfer_config = libp2p::request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(60));
         let transfer = cbor::Behaviour::new(
             std::iter::once((transfer_protocol, ProtocolSupport::Full)),
-            libp2p::request_response::Config::default(),
+            transfer_config,
         );
         let behaviour = Behaviour {
             gossipsub,
@@ -357,11 +374,11 @@ impl NetworkService {
                                         }
                                     }
                                 }
-                                libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
-                                    tracing::warn!("transfer outbound failure to {}: {error:?}", peer);
+                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
+                                    tracing::warn!("transfer outbound failure to {}: {error:?} ({:?})", peer, request_id);
                                 }
-                                libp2p::request_response::Event::InboundFailure { peer, error, .. } => {
-                                    tracing::warn!("transfer inbound failure from {}: {error:?}", peer);
+                                libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
+                                    tracing::warn!("transfer inbound failure from {}: {error:?} ({:?})", peer, request_id);
                                 }
                                 libp2p::request_response::Event::ResponseSent { peer, request_id } => {
                                     tracing::trace!("transfer response sent to {} ({:?})", peer, request_id);

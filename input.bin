@@ -1,1 +1,10 @@
 iurfwefdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+
+
+why it gonnna trransfer the entire blob to gather it should use reedsolomon for erasuing aand   
+  for dynamic chunk generration use FastCDC . each blob chould be chunked and stractured using    
+  merkle there should be a main hash == blob hash and eaach chunk should have its own chunk       
+  hash . when a node reequests a blob which dont have that blob . it should check the chunks from 
+  the network connected with the same blob id . and should fech the data and reconstract the      
+  erasurree forr serving the reeciver . it should show logs in the requestor like tottal feetched 
+  --chunks/--chunks forr the blob : id: i want a torrent like system forr blobs 

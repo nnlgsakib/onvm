@@ -44,6 +44,10 @@ pub enum NetworkMessage {
 pub enum TransferRequest {
     Program(ProgramId),
     Blob(BlobId),
+    BlobChunk {
+        id: BlobId,
+        chunk_idx: u32,
+    },
     Execution([u8; 32]),
     PushProgram(ProgramBroadcast),
     PushBlob(BlobBroadcast),
@@ -55,6 +59,11 @@ pub enum TransferRequest {
 pub enum TransferResponse {
     Program(Option<ProgramBroadcast>),
     Blob(Option<BlobBroadcast>),
+    BlobChunk {
+        id: BlobId,
+        chunk_idx: u32,
+        shards: Option<Vec<(u8, Vec<u8>)>>,
+    },
     Execution(Option<ExecutionBroadcast>),
     Sync(SyncDelta),
     Ack,
@@ -75,7 +84,6 @@ pub struct SyncDelta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobBroadcast {
     pub meta: BlobMetadata,
-    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,7 +265,8 @@ impl NetworkService {
         let kademlia = Kademlia::new(peer_id, store);
         let transfer_protocol = StreamProtocol::new("/onvm/transfer/1.0.0");
         let transfer_config = libp2p::request_response::Config::default()
-            .with_request_timeout(Duration::from_secs(60));
+            .with_request_timeout(Duration::from_secs(60))
+            .with_max_concurrent_streams(256);
         let transfer = cbor::Behaviour::new(
             std::iter::once((transfer_protocol, ProtocolSupport::Full)),
             transfer_config,

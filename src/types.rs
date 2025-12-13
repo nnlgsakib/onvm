@@ -46,10 +46,11 @@ pub struct BlobMetadata {
     pub publisher: NodeId,
     pub size: u64,
     pub mime: Option<String>,
-    pub chunk_size: u32,
-    pub chunk_count: u32,
-    pub chunk_hashes: Vec<[u8; 32]>,
-    pub merkle_root: [u8; 32],
+    pub chunk_sizes: Vec<u32>,     // variable chunk sizes (FastCDC)
+    pub chunk_hashes: Vec<[u8; 32]>, // hash per chunk
+    pub merkle_root: [u8; 32],     // merkle over chunk hashes
+    pub data_shards: u8,           // data shards per chunk
+    pub parity_shards: u8,         // parity shards per chunk
 }
 
 impl ProgramId {

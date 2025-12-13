@@ -15,6 +15,7 @@ futures = "0.3"
 hex = "0.4"
 bincode = { version = "2.0", features = ["serde"] }
 base64 = "0.22"
+fastcdc = "3.2"
 libp2p = { version = "0.53", default-features = false, features = [
     "tcp",
     "dns",
@@ -43,6 +44,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 toml = "0.8"
+reed-solomon-erasure = "6"
 
 wasmtime = { version = "16", features = [
     "async",

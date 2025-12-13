@@ -6,7 +6,7 @@ use crate::network::{
     ExecutionBroadcast, NetworkEvent, NetworkHandle, NetworkMessage, ProgramBroadcast,
     ProgramSyncRequest, ProviderKind, TransferRequest, TransferResponse, SyncSnapshot, SyncDelta,
 };
-use crate::storage::BlobStore;
+use crate::storage::{reconstruct_chunk, BlobStore};
 use crate::storage::StateStore;
 use crate::types::{BlobId, BlobMetadata, ComputeOp, NodeId, ProgramId, ProgramMetadata};
 use anyhow::{anyhow, Context, Result};
@@ -16,7 +16,7 @@ use sled::Db;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, Duration, Instant};
 use libp2p::request_response::ResponseChannel;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +72,7 @@ pub struct DagEngine {
     peers: Arc<RwLock<HashSet<PeerId>>>,
     config: DagConfig,
     sync_state: Arc<RwLock<SyncState>>,
+    pending_blob_fetches: Arc<RwLock<HashSet<BlobId>>>,
 }
 
 impl DagEngine {
@@ -98,6 +99,7 @@ impl DagEngine {
             peers: Arc::new(RwLock::new(HashSet::new())),
             config,
             sync_state: Arc::new(RwLock::new(SyncState::default())),
+            pending_blob_fetches: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
@@ -228,12 +230,14 @@ impl DagEngine {
             .publisher
             .send(NetworkMessage::Blob(crate::network::BlobBroadcast {
                 meta: output_meta.clone(),
-                data: outcome.return_data.clone(),
             }));
-        self.push_blob_to_peers(None, crate::network::BlobBroadcast {
-            meta: output_meta.clone(),
-            data: outcome.return_data.clone(),
-        }).await;
+        self.push_blob_to_peers(
+            None,
+            crate::network::BlobBroadcast {
+                meta: output_meta.clone(),
+            },
+        )
+        .await;
 
         let compute = ComputeOp {
             program_id: program.clone(),
@@ -266,10 +270,12 @@ impl DagEngine {
 
     /// Used by local RPC paths to ingest and disseminate freshly created blobs.
     pub async fn ingest_local_blob(&self, meta: BlobMetadata, data: Vec<u8>) -> Result<()> {
-        let bcast = crate::network::BlobBroadcast {
-            meta: meta.clone(),
-            data: data.clone(),
-        };
+        let bcast = crate::network::BlobBroadcast { meta: meta.clone() };
+        // Store locally (replicate into store) before advertising.
+        self.blob_store.replicate(&meta, &data)?;
+        self.blob_index
+            .record(&meta, meta.publisher.clone(), true)?;
+        self.network.provide(&meta.id.0);
         let _ = self.network.publisher.send(NetworkMessage::Blob(bcast.clone()));
         self.handle_blob_broadcast(&self.network.peer_id, bcast.clone())
             .await?;
@@ -394,19 +400,16 @@ impl DagEngine {
         bcast: crate::network::BlobBroadcast,
     ) -> Result<()> {
         let had_blob = self.blob_store.metadata(&bcast.meta.id)?.is_some();
-        match self.config.blob_sync_mode {
-            BlobSyncMode::FullData => {
-                self.blob_store
-                    .replicate(&bcast.meta, &bcast.data)
-                    .context("blob replicate")?;
-                self.blob_index
-                    .record(&bcast.meta, bcast.meta.publisher.clone(), true)?;
-                self.network.provide(&bcast.meta.id.0);
-            }
-            BlobSyncMode::MetadataOnly => {
-                self.blob_index
-                    .record(&bcast.meta, bcast.meta.publisher.clone(), false)?;
-            }
+        // Always persist metadata; data fetched on demand via chunk requests.
+        self.blob_store.store_metadata(&bcast.meta)?;
+        // Record that the publisher has data; record local presence if we already have shards.
+        self.blob_index
+            .record(&bcast.meta, bcast.meta.publisher.clone(), true)?;
+        self.blob_index
+            .record(&bcast.meta, self.identity.node_id.clone(), had_blob)?;
+        // Only provide if we actually have shard data locally.
+        if had_blob {
+            self.network.provide(&bcast.meta.id.0);
         }
         let op = Operation::PublishBlob(bcast.meta.clone());
         let _ = self.record_operation(op, Vec::new())?;
@@ -420,6 +423,8 @@ impl DagEngine {
     async fn handle_blob_advertisement(&self, _peer: &PeerId, ad: BlobAdvertisement) -> Result<()> {
         self.blob_index
             .record(&ad.meta, ad.meta.publisher.clone(), ad.has_data)?;
+        // Keep metadata so we can request data later.
+        self.blob_store.store_metadata(&ad.meta).ok();
         self.refresh_sync_state().await?;
         Ok(())
     }
@@ -431,23 +436,29 @@ impl DagEngine {
             let id = BlobId(id_bytes);
             if !req.want_data {
                 if let Some(meta) = self.blob_store.metadata(&id)? {
-                    let _ =
-                        self.network
-                            .publisher
-                            .send(NetworkMessage::BlobMeta(BlobAdvertisement {
-                                meta,
-                                has_data: self.blob_store.get(&id).is_ok(),
-                                locations: vec![self.identity.node_id.to_string()],
-                            }));
+                    let has_data = self.identity.node_id == meta.publisher
+                        || self.blob_store.load_shards(&id, 0).is_ok();
+                    let _ = self
+                        .network
+                        .publisher
+                        .send(NetworkMessage::BlobMeta(BlobAdvertisement {
+                            meta,
+                            has_data,
+                            locations: vec![self.identity.node_id.to_string()],
+                        }));
                 }
                 continue;
             }
-            if let Ok(data) = self.blob_store.get(&id) {
-                if let Some(meta) = self.blob_store.metadata(&id)? {
-                    let _ = self.network.publisher.send(NetworkMessage::Blob(
-                        crate::network::BlobBroadcast { meta, data },
-                    ));
-                }
+            // Data path now uses chunk transfer; respond with advertisement only.
+            if let Some(meta) = self.blob_store.metadata(&id)? {
+                let _ =
+                    self.network
+                        .publisher
+                        .send(NetworkMessage::BlobMeta(BlobAdvertisement {
+                            meta,
+                            has_data: true,
+                            locations: vec![self.identity.node_id.to_string()],
+                        }));
             }
         }
         Ok(())
@@ -478,6 +489,7 @@ impl DagEngine {
         }
         // ensure output blob present or at least indexed
         if self.blob_store.metadata(&bcast.op.output.id)?.is_none() {
+            self.blob_store.store_metadata(&bcast.op.output).ok();
             self.blob_index
                 .record(&bcast.op.output, bcast.op.output.publisher.clone(), false)?;
         }
@@ -495,6 +507,104 @@ impl DagEngine {
             st.pending_exec_ids.remove(&bcast.dag_id);
         }
         Ok(())
+    }
+
+    /// Attempt to fetch a blob from peers, storing it locally if successful.
+    pub async fn fetch_blob(&self, id: &BlobId) -> Result<Vec<u8>> {
+        // Ensure we have metadata; request it if missing.
+        let meta = match self.blob_store.metadata(id)? {
+            Some(m) => m,
+            None => {
+                let _ = self
+                    .network
+                    .publisher
+                    .send(NetworkMessage::BlobRequest(BlobRequest {
+                        ids: vec![id.0],
+                        want_data: false,
+                    }));
+                let peers = self.peers.read().await.clone();
+                for peer in &peers {
+                    self.network
+                        .request_transfer(*peer, TransferRequest::Blob(id.clone()));
+                }
+                self.network.find_providers(&id.0, ProviderKind::Blob);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let meta_wait = loop {
+                    if let Some(m) = self.blob_store.metadata(id)? {
+                        break Some(m);
+                    }
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                };
+                meta_wait.ok_or_else(|| anyhow!("blob metadata missing"))?
+            }
+        };
+
+        if let Ok(existing) = self.blob_store.get(id) {
+            return Ok(existing);
+        }
+        {
+            let mut pending = self.pending_blob_fetches.write().await;
+            pending.insert(id.clone());
+        }
+        // Request data availability hints
+        let _ = self
+            .network
+            .publisher
+            .send(NetworkMessage::BlobRequest(BlobRequest {
+                ids: vec![id.0],
+                want_data: true,
+            }));
+        self.network.find_providers(&id.0, ProviderKind::Blob);
+        let peers = self.peers.read().await.clone();
+
+        let mut assembled = Vec::with_capacity(meta.size as usize);
+        let total_chunks = meta.chunk_sizes.len();
+        for (idx, _) in meta.chunk_sizes.iter().enumerate() {
+            if let Some(chunk) = self.blob_store.try_load_chunk(&meta, idx) {
+                assembled.extend_from_slice(&chunk);
+                continue;
+            }
+            for peer in &peers {
+                self.network.request_transfer(
+                    *peer,
+                    TransferRequest::BlobChunk {
+                        id: id.clone(),
+                        chunk_idx: idx as u32,
+                    },
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Some(chunk) = self.blob_store.try_load_chunk(&meta, idx) {
+                    assembled.extend_from_slice(&chunk);
+                    tracing::info!(
+                        "blob {} fetched chunk {}/{}",
+                        hex::encode(id.0),
+                        idx + 1,
+                        total_chunks
+                    );
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    let mut pending = self.pending_blob_fetches.write().await;
+                    pending.remove(id);
+                    return Err(anyhow!(
+                        "blob chunk fetch timed out for {} chunk {}",
+                        hex::encode(id.0),
+                        idx
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        {
+            let mut pending = self.pending_blob_fetches.write().await;
+            pending.remove(id);
+        }
+        Ok(assembled)
     }
 
     async fn handle_execution_request(&self, ids: Vec<[u8; 32]>) -> Result<()> {
@@ -597,10 +707,11 @@ impl DagEngine {
                     publisher: NodeId::new(&[]),
                     size: 0,
                     mime: None,
-                    chunk_size: 0,
-                    chunk_count: 0,
+                    chunk_sizes: Vec::new(),
                     chunk_hashes: Vec::new(),
                     merkle_root: [0u8; 32],
+                    data_shards: 0,
+                    parity_shards: 0,
                 };
                 let node_id = ad
                     .locations
@@ -662,14 +773,38 @@ impl DagEngine {
             }
             TransferRequest::Blob(bid) => {
                 let resp = match self.blob_store.metadata(&bid) {
-                    Ok(Some(meta)) => self
-                        .blob_store
-                        .get(&bid)
-                        .ok()
-                        .map(|data| BlobBroadcast { meta, data }),
+                    Ok(Some(meta)) => Some(BlobBroadcast { meta }),
                     _ => None,
                 };
                 TransferResponse::Blob(resp)
+            }
+            TransferRequest::BlobChunk { id, chunk_idx } => {
+                let resp = match self.blob_store.metadata(&id) {
+                    Ok(Some(meta)) => match self
+                        .blob_store
+                        .load_shards(&id, chunk_idx)
+                        .and_then(|shards| {
+                            reconstruct_chunk(
+                                shards.clone(),
+                                meta.data_shards as usize,
+                                meta.parity_shards as usize,
+                                *meta
+                                    .chunk_sizes
+                                    .get(chunk_idx as usize)
+                                    .unwrap_or(&0) as usize,
+                            )
+                            .map(|_| shards)
+                        }) {
+                        Ok(shards) => Some(shards),
+                        Err(_) => None,
+                    },
+                    _ => None,
+                };
+                TransferResponse::BlobChunk {
+                    id,
+                    chunk_idx,
+                    shards: resp,
+                }
             }
             TransferRequest::Execution(did) => {
                 let mut id = [0u8; 32];
@@ -734,6 +869,38 @@ impl DagEngine {
             }
             TransferResponse::Blob(Some(bcast)) => {
                 self.handle_blob_broadcast(peer, bcast).await?;
+            }
+            TransferResponse::BlobChunk {
+                id,
+                chunk_idx,
+                shards,
+            } => {
+                if let Some(shards) = shards {
+                    if let Some(meta) = self.blob_store.metadata(&id)? {
+                        match self
+                            .blob_store
+                            .store_chunk(&meta, chunk_idx as usize, &shards)
+                        {
+                            Ok(_) => {
+                                self.blob_index
+                                    .record(&meta, self.identity.node_id.clone(), true)?;
+                                tracing::info!(
+                                    "received chunk {}/{} for blob {}",
+                                    chunk_idx + 1,
+                                    meta.chunk_sizes.len(),
+                                    hex::encode(id.0)
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "failed to store chunk {} for blob {}: {e:?}",
+                                    chunk_idx,
+                                    hex::encode(id.0)
+                                );
+                            }
+                        }
+                    }
+                }
             }
             TransferResponse::Execution(Some(bcast)) => {
                 self.handle_execution_broadcast(peer, bcast.clone()).await?;

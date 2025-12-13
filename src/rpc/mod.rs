@@ -1,7 +1,7 @@
 use crate::node::Node;
 use crate::types::{BlobId, ProgramId};
 use anyhow::Result;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose, Engine as _};
@@ -10,6 +10,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::info;
+
+// Permit large blob uploads (base64 encoded); adjust if hosting constraints change.
+const MAX_UPLOAD_SIZE_BYTES: usize = 1 * 1024 * 1024 * 1024; // 1 GiB
 
 pub struct RpcServer {
     #[allow(dead_code)]
@@ -68,6 +71,7 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
         .route("/programs", post(deploy_program))
         .route("/programs/:id", get(program_info))
         .route("/execute", post(execute_program))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_SIZE_BYTES))
         .with_state(ctx);
 
     let mut port = addr.port();
@@ -124,10 +128,15 @@ async fn fetch_blob(
     Path(id_hex): Path<String>,
 ) -> Result<Vec<u8>, (axum::http::StatusCode, String)> {
     let id = parse_blob_id(&id_hex).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
-    ctx.node
-        .blob_store
-        .get(&id)
-        .map_err(|e| (axum::http::StatusCode::NOT_FOUND, e.to_string()))
+    match ctx.node.blob_store.get(&id) {
+        Ok(data) => Ok(data),
+        Err(_) => ctx
+            .node
+            .consensus
+            .fetch_blob(&id)
+            .await
+            .map_err(|e| (axum::http::StatusCode::NOT_FOUND, e.to_string())),
+    }
 }
 
 async fn deploy_program(

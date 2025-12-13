@@ -220,7 +220,7 @@ Override by editing `./data/config.toml` after `init`.
 
 ## License
 
-This project is provided as-is for research and educational purposes. See repository for license details.
+Licensed under the Apache License, Version 2.0. See `LICENSE` for details.
 
 ---
 

@@ -1,6 +1,6 @@
 use crate::consensus::{BlobSyncMode, DagConfig, DagEngine};
 use crate::crypto::keys::NodeKeys;
-use crate::execution::{ExecutionEngine, ExecutionScheduler, ProgramStore};
+use crate::execution::{ExecutionEngine, ExecutionPool, ProgramStore};
 use crate::network::{NetworkConfig, NetworkHandle, NetworkService, NetworkStreams};
 use crate::storage::BlobStore;
 use crate::syncer::SyncMan;
@@ -25,9 +25,10 @@ pub struct Node {
     pub blob_store: Arc<BlobStore>,
     pub program_store: Arc<ProgramStore>,
     pub execution: Arc<ExecutionEngine>,
-    pub scheduler: Arc<ExecutionScheduler>,
+    pub scheduler: Arc<ExecutionPool>,
     pub consensus: Arc<DagEngine>,
     pub network: NetworkHandle,
+    pub db: sled::Db,
     #[allow(dead_code)]
     background: JoinHandle<()>,
     #[allow(dead_code)]
@@ -56,7 +57,7 @@ impl Node {
             program_store.clone(),
             crate::execution::ExecutionConfig::default(),
         )?);
-        let scheduler = Arc::new(ExecutionScheduler::new(exec.clone(), None));
+        let scheduler = Arc::new(ExecutionPool::new(exec.clone(), None));
 
         let mut listen_addr = config.listen_addr.clone();
         let streams = loop {
@@ -132,6 +133,7 @@ impl Node {
             scheduler,
             consensus,
             network,
+            db,
             background: consensus_task,
             sync_task,
         })

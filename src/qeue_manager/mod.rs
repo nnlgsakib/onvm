@@ -15,9 +15,7 @@ impl<T: Send + 'static> AsyncQueue<T> {
     {
         let (tx, mut rx) = mpsc::unbounded_channel::<T>();
         let sem = Arc::new(Semaphore::new(concurrency.max(1)));
-        let worker = Arc::new(move |item: T| -> BoxFuture<'static, ()> {
-            Box::pin(worker(item))
-        });
+        let worker = Arc::new(move |item: T| -> BoxFuture<'static, ()> { Box::pin(worker(item)) });
         tokio::spawn({
             let worker = worker.clone();
             let sem = sem.clone();

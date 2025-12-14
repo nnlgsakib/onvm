@@ -4,12 +4,12 @@ use anyhow::Result;
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct ExecutionScheduler {
+pub struct ExecutionPool {
     engine: Arc<ExecutionEngine>,
     parallelism: usize,
 }
 
-impl ExecutionScheduler {
+impl ExecutionPool {
     pub fn new(engine: Arc<ExecutionEngine>, workers: Option<usize>) -> Self {
         let parallelism = workers.unwrap_or_else(|| {
             usize::from(
@@ -25,7 +25,6 @@ impl ExecutionScheduler {
     }
 
     pub async fn execute(&self, program_id: &ProgramId, input: &[u8]) -> Result<ExecutionOutcome> {
-        // Use spawn_blocking to avoid tying up async executors; allows many parallel executions.
         let engine = self.engine.clone();
         let pid = program_id.clone();
         let data = input.to_vec();

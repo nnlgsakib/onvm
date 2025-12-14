@@ -53,6 +53,54 @@ pub enum Commands {
         #[arg(long, default_value = "full", value_parser = ["full", "metadata"], help = "Blob sync mode: full data replication or metadata-only")]
         blob_sync_mode: String,
     },
+    /// Submit a job to a running node
+    SubmitJob {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        program_id: String,
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long, default_value_t = 3)]
+        max_retries: u32,
+    },
+    /// Get job status
+    JobStatus {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Get job logs
+    JobLogs {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Get job output
+    JobOutput {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        job_id: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Cancel a job
+    CancelJob {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        job_id: String,
+    },
+    /// List all jobs
+    ListJobs {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+    },
     /// Upload a blob to a running node
     UploadBlob {
         #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
@@ -228,6 +276,118 @@ pub async fn run() -> Result<()> {
                 .json(&body)
                 .send()
                 .await?;
+            if res.status().is_success() {
+                println!("{}", res.text().await?);
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+        }
+        Commands::SubmitJob {
+            rpc,
+            program_id,
+            input,
+            request_id,
+            max_retries,
+        } => {
+            let input_base64 = if let Some(path) = input {
+                let data = std::fs::read(path)?;
+                Some(general_purpose::STANDARD.encode(&data))
+            } else {
+                None
+            };
+
+            let req_id = request_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+            let body = serde_json::json!({
+                "request_id": req_id,
+                "program_id": program_id,
+                "input_base64": input_base64,
+                "max_retries": max_retries,
+            });
+
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .post(format!("{endpoint}/jobs"))
+                .json(&body)
+                .send()
+                .await?;
+
+            if res.status().is_success() {
+                println!("{}", res.text().await?);
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+        }
+        Commands::JobStatus { rpc, job_id } => {
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .get(format!("{endpoint}/jobs/{job_id}"))
+                .send()
+                .await?;
+
+            if res.status().is_success() {
+                println!("{}", res.text().await?);
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+        }
+        Commands::JobLogs { rpc, job_id } => {
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .get(format!("{endpoint}/jobs/{job_id}/logs"))
+                .send()
+                .await?;
+
+            if res.status().is_success() {
+                println!("{}", res.text().await?);
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+        }
+        Commands::JobOutput { rpc, job_id, out } => {
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .get(format!("{endpoint}/jobs/{job_id}/output"))
+                .send()
+                .await?;
+
+            if !res.status().is_success() {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+
+            let response: serde_json::Value = res.json().await?;
+            let output_base64 = response
+                .get("output_base64")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("missing output_base64 in response"))?;
+
+            let data = general_purpose::STANDARD.decode(output_base64)?;
+            tokio::fs::write(&out, &data).await?;
+            println!("output saved to {}", out.display());
+        }
+        Commands::CancelJob { rpc, job_id } => {
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .post(format!("{endpoint}/jobs/{job_id}/cancel"))
+                .send()
+                .await?;
+
+            if res.status().is_success() {
+                println!("job {job_id} cancelled");
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+        }
+        Commands::ListJobs { rpc } => {
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client.get(format!("{endpoint}/jobs")).send().await?;
+
             if res.status().is_success() {
                 println!("{}", res.text().await?);
             } else {

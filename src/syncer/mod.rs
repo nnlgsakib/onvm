@@ -1,8 +1,12 @@
 use crate::consensus::DagEngine;
+pub mod job_sync;
 pub mod sync;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration, Instant};
+
+pub use job_sync::{JobBroadcast, JobDescriptor, JobStatusDescriptor, JobSyncManager};
+
 pub struct SyncMan {
     dag: Arc<DagEngine>,
 }

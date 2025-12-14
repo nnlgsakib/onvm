@@ -8,7 +8,7 @@ use sled::Db;
 const FASTCDC_MIN: usize = 64 * 1024; // 64 KiB
 const FASTCDC_AVG: usize = 256 * 1024; // 256 KiB target
 const FASTCDC_MAX: usize = 512 * 1024; // 512 KiB cap to fit transfer limits
-const STATIC_CHUNK_SIZE: usize = 1 * 1024 * 1024; // 1 MiB
+const STATIC_CHUNK_SIZE: usize = 1024 * 1024; // 1 MiB
 const STATIC_THRESHOLD: usize = 100 * 1024 * 1024; // 100 MiB
 const DATA_SHARDS: usize = 8;
 const PARITY_SHARDS: usize = 4;
@@ -185,7 +185,7 @@ impl BlobStore {
         )?;
         let chunk_tree = self.db.open_tree("blob_chunk_shards")?;
         for (shard_idx, data) in encoded
-            .get(0)
+            .first()
             .ok_or_else(|| anyhow!("no encoded shards"))?
             .iter()
         {
@@ -302,7 +302,7 @@ fn encode_chunks(
 ) -> Result<Vec<Vec<(u8, Vec<u8>)>>> {
     let mut shards_per_chunk = Vec::new();
     for chunk in chunks {
-        let shard_len = (chunk.len() + data_shards - 1) / data_shards;
+        let shard_len = chunk.len().div_ceil(data_shards);
         let total_shards = data_shards + parity_shards;
         let mut shards: Vec<Vec<u8>> = Vec::with_capacity(total_shards);
         for i in 0..data_shards {
@@ -337,7 +337,7 @@ pub fn reconstruct_chunk(
 ) -> Result<Vec<u8>> {
     let r = ReedSolomon::new(data_shards, parity_shards)?;
     let shard_len = shards
-        .get(0)
+        .first()
         .ok_or_else(|| anyhow!("missing shards"))?
         .1
         .len();
@@ -381,9 +381,9 @@ fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     }
     let mut current = leaves.to_vec();
     while current.len() > 1 {
-        let mut next = Vec::with_capacity((current.len() + 1) / 2);
-        let mut iter = current.chunks(2);
-        while let Some(pair) = iter.next() {
+        let mut next = Vec::with_capacity(current.len().div_ceil(2));
+        let iter = current.chunks(2);
+        for pair in iter {
             let mut buf = Vec::with_capacity(64);
             buf.extend_from_slice(&pair[0]);
             if pair.len() == 2 {

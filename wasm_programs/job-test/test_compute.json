@@ -1,0 +1,5 @@
+{
+  "task": "compute",
+  "iterations": 100,
+  "data": "42"
+}

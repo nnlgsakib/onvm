@@ -65,6 +65,9 @@ impl ExecutionEngine {
         config.static_memory_guard_size(0);
         config.dynamic_memory_guard_size(0);
         config.wasm_backtrace_details(wasmtime::WasmBacktraceDetails::Disable);
+        config.wasm_threads(true);
+        config.wasm_reference_types(true);
+        config.wasm_bulk_memory(true);
         let engine = Engine::new(&config)?;
         Ok(Self {
             engine,
@@ -74,6 +77,24 @@ impl ExecutionEngine {
             max_fuel: cfg.max_fuel,
             module_cache: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    pub fn config(&self) -> ExecutionConfig {
+        ExecutionConfig {
+            max_fuel: self.max_fuel,
+        }
+    }
+
+    pub fn blob_store(&self) -> Arc<BlobStore> {
+        Arc::clone(&self.blob_store)
+    }
+
+    pub fn state_store(&self) -> Arc<StateStore> {
+        Arc::clone(&self.state_store)
+    }
+
+    pub fn program_store(&self) -> Arc<ProgramStore> {
+        Arc::clone(&self.programs)
     }
 
     pub fn execute(&self, program_id: &ProgramId, input: &[u8]) -> Result<ExecutionOutcome> {

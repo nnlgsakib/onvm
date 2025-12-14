@@ -1,6 +1,6 @@
 use crate::crypto::hashing::hash_bytes;
 use crate::crypto::keys::NodeKeys;
-use crate::execution::{ExecutionOutcome, ExecutionScheduler, ProgramStore};
+use crate::execution::{ExecutionOutcome, ExecutionPool, ProgramStore};
 use crate::network::{
     BlobAdvertisement, BlobBroadcast, BlobInventoryEntry, BlobRequest, BloomFilter,
     ExecutionBroadcast, NetworkEvent, NetworkHandle, NetworkMessage, ProgramBroadcast,
@@ -68,7 +68,7 @@ pub struct DagEngine {
     program_store: Arc<ProgramStore>,
     program_index: ProgramIndex,
     dag_store: DagStore,
-    scheduler: Arc<ExecutionScheduler>,
+    scheduler: Arc<ExecutionPool>,
     identity: Arc<NodeKeys>,
     network: NetworkHandle,
     peers: Arc<RwLock<HashSet<PeerId>>>,
@@ -76,6 +76,7 @@ pub struct DagEngine {
     sync_state: Arc<RwLock<SyncState>>,
     pending_blob_fetches: Arc<RwLock<HashSet<BlobId>>>,
     fetch_queue: Arc<RwLock<Option<AsyncQueue<BlobId>>>>,
+    job_sync: Arc<RwLock<Option<Arc<crate::syncer::JobSyncManager>>>>,
 }
 
 impl DagEngine {
@@ -84,7 +85,7 @@ impl DagEngine {
         blob_store: Arc<BlobStore>,
         state_store: Arc<StateStore>,
         program_store: Arc<ProgramStore>,
-        scheduler: Arc<ExecutionScheduler>,
+        scheduler: Arc<ExecutionPool>,
         identity: Arc<NodeKeys>,
         network: NetworkHandle,
         config: DagConfig,
@@ -104,7 +105,12 @@ impl DagEngine {
             sync_state: Arc::new(RwLock::new(SyncState::default())),
             pending_blob_fetches: Arc::new(RwLock::new(HashSet::new())),
             fetch_queue: Arc::new(RwLock::new(None)),
+            job_sync: Arc::new(RwLock::new(None)),
         })
+    }
+
+    pub async fn set_job_sync(&self, job_sync: Arc<crate::syncer::JobSyncManager>) {
+        *self.job_sync.write().await = Some(job_sync);
     }
 
     pub async fn start_fetch_workers(self: &Arc<Self>, concurrency: usize) {
@@ -196,6 +202,14 @@ impl DagEngine {
                 }
                 NetworkMessage::Inventory(inv) => {
                     self.handle_inventory(&peer, inv).await?;
+                }
+                NetworkMessage::Job(job_bcast) => {
+                    let sync_mgr_guard = self.job_sync.read().await;
+                    if let Some(ref sync_mgr) = *sync_mgr_guard {
+                        if let Err(e) = sync_mgr.handle_job_broadcast(job_bcast).await {
+                            tracing::warn!("job broadcast handling error: {e:?}");
+                        }
+                    }
                 }
             },
             NetworkEvent::TransferRequest(peer, req, channel) => {
@@ -371,8 +385,7 @@ impl DagEngine {
         let _ = self.record_operation(op, parents)?;
         self.refresh_sync_state().await?;
         if !already_present {
-            self.push_program_to_peers(Some(peer.clone()), bcast.clone())
-                .await;
+            self.push_program_to_peers(Some(*peer), bcast.clone()).await;
         }
         {
             let mut st = self.sync_state.write().await;
@@ -449,7 +462,7 @@ impl DagEngine {
         let _ = self.record_operation(op, Vec::new())?;
         self.refresh_sync_state().await?;
         if !had_blob {
-            self.push_blob_to_peers(Some(peer.clone()), bcast).await;
+            self.push_blob_to_peers(Some(*peer), bcast).await;
         }
         Ok(())
     }
@@ -535,7 +548,7 @@ impl DagEngine {
             publisher: self.identity.node_id.clone(),
         })?;
         self.refresh_sync_state().await?;
-        self.push_execution_to_peers(Some(peer.clone()), bcast.clone())
+        self.push_execution_to_peers(Some(*peer), bcast.clone())
             .await;
         {
             let mut st = self.sync_state.write().await;
@@ -645,7 +658,7 @@ impl DagEngine {
     }
 
     fn should_log_chunk(idx: usize, total: usize) -> bool {
-        idx == 1 || idx == total || idx % 10 == 0
+        idx == 1 || idx == total || idx.is_multiple_of(10)
     }
 
     async fn handle_execution_request(&self, ids: Vec<[u8; 32]>) -> Result<()> {
@@ -824,26 +837,22 @@ impl DagEngine {
                 TransferResponse::Blob(resp)
             }
             TransferRequest::BlobChunk { id, chunk_idx } => {
-                let resp =
-                    match self.blob_store.metadata(&id) {
-                        Ok(Some(meta)) => match self
-                            .blob_store
-                            .load_shards(&id, chunk_idx)
-                            .and_then(|shards| {
-                                reconstruct_chunk(
-                                    shards.clone(),
-                                    meta.data_shards as usize,
-                                    meta.parity_shards as usize,
-                                    *meta.chunk_sizes.get(chunk_idx as usize).unwrap_or(&0)
-                                        as usize,
-                                )
-                                .map(|_| shards)
-                            }) {
-                            Ok(shards) => Some(shards),
-                            Err(_) => None,
-                        },
-                        _ => None,
-                    };
+                let resp = match self.blob_store.metadata(&id) {
+                    Ok(Some(meta)) => self
+                        .blob_store
+                        .load_shards(&id, chunk_idx)
+                        .and_then(|shards| {
+                            reconstruct_chunk(
+                                shards.clone(),
+                                meta.data_shards as usize,
+                                meta.parity_shards as usize,
+                                *meta.chunk_sizes.get(chunk_idx as usize).unwrap_or(&0) as usize,
+                            )
+                            .map(|_| shards)
+                        })
+                        .ok(),
+                    _ => None,
+                };
                 TransferResponse::BlobChunk {
                     id,
                     chunk_idx,

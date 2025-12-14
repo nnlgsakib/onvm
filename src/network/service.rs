@@ -38,6 +38,7 @@ pub enum NetworkMessage {
     ProgramResponse(ProgramBroadcast),
     BlobRequest(BlobRequest),
     ExecutionRequest(Vec<[u8; 32]>),
+    Job(crate::syncer::JobBroadcast),
 }
 
 /// Direct transfer request/response messages used by request-response protocols.
@@ -386,27 +387,24 @@ impl NetworkService {
                                     }
                                 }
                             },
-                            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(ev)) => match ev {
-                                KademliaEvent::OutboundQueryProgressed { id, result, .. } => {
-                                    if let Some(kind) = pending_queries.get(&id).cloned() {
-                                        match result {
-                                            QueryResult::GetProviders(Ok(libp2p::kad::GetProvidersOk::FoundProviders { key, providers })) => {
-                                                let peers: Vec<_> = providers.into_iter().collect();
-                                                let _ = event_tx.send(NetworkEvent::ProvidersFound {
-                                                    key: key.to_vec(),
-                                                    peers,
-                                                    kind,
-                                                });
-                                            }
-                                            QueryResult::GetProviders(Ok(libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }))
-                                            | QueryResult::GetProviders(Err(_)) => {
-                                                pending_queries.remove(&id);
-                                            }
-                                            _ => {}
+                            SwarmEvent::Behaviour(BehaviourEvent::Kademlia(ev)) => if let KademliaEvent::OutboundQueryProgressed { id, result, .. } = ev {
+                                if let Some(kind) = pending_queries.get(&id).cloned() {
+                                    match result {
+                                        QueryResult::GetProviders(Ok(libp2p::kad::GetProvidersOk::FoundProviders { key, providers })) => {
+                                            let peers: Vec<_> = providers.into_iter().collect();
+                                            let _ = event_tx.send(NetworkEvent::ProvidersFound {
+                                                key: key.to_vec(),
+                                                peers,
+                                                kind,
+                                            });
                                         }
+                                        QueryResult::GetProviders(Ok(libp2p::kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. }))
+                                        | QueryResult::GetProviders(Err(_)) => {
+                                            pending_queries.remove(&id);
+                                        }
+                                        _ => {}
                                     }
                                 }
-                                _ => {}
                             },
                             SwarmEvent::NewListenAddr { address, .. } => {
                                 tracing::info!("listening on {}", address);
@@ -478,7 +476,8 @@ impl NetworkService {
                             | NetworkMessage::ProgramResponse(_)
                             | NetworkMessage::BlobRequest(_)
                             | NetworkMessage::BlobMeta(_)
-                            | NetworkMessage::ExecutionRequest(_) => Topic::new(TOPIC_BLOCKS),
+                            | NetworkMessage::ExecutionRequest(_)
+                            | NetworkMessage::Job(_) => Topic::new(TOPIC_BLOCKS),
                         };
                         let data = match serde_json::to_vec(&msg) {
                             Ok(d) => d,
@@ -527,5 +526,6 @@ fn describe_msg(msg: &NetworkMessage) -> &'static str {
         NetworkMessage::ProgramResponse(_) => "program_response",
         NetworkMessage::BlobRequest(_) => "blob_request",
         NetworkMessage::ExecutionRequest(_) => "execution_request",
+        NetworkMessage::Job(_) => "job",
     }
 }

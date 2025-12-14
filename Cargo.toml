@@ -47,6 +47,7 @@ toml = "0.8"
 reed-solomon-erasure = "6"
 indicatif = "0.17"
 tokio-util = { version = "0.7", features = ["io"] }
+num_cpus = "1.16"
 
 wasmtime = { version = "16", features = [
     "async",

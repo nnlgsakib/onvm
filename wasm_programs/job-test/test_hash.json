@@ -1,0 +1,5 @@
+{
+  "task": "hash",
+  "iterations": 50,
+  "data": "onvm-job-system-test"
+}

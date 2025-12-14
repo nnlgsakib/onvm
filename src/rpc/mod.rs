@@ -1,3 +1,9 @@
+mod health;
+mod jobs;
+
+pub use health::{health_routes, HealthRpcContext};
+pub use jobs::{job_routes, JobRpcContext};
+
 use crate::node::Node;
 use crate::types::{BlobId, ProgramId};
 use anyhow::Result;
@@ -13,7 +19,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 // Permit large blob uploads; adjust if hosting constraints change.
-const MAX_UPLOAD_SIZE_BYTES: usize = 1 * 1024 * 1024 * 1024; // 1 GiB
+const MAX_UPLOAD_SIZE_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 
 pub struct RpcServer {
     #[allow(dead_code)]
@@ -58,7 +64,67 @@ struct ExecuteResponse {
 }
 
 pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
-    let ctx = RpcContext { node };
+    let ctx = RpcContext { node: node.clone() };
+
+    let db = node.db.clone();
+
+    let job_store = Arc::new(crate::execution::JobStore::new(db.clone())?);
+
+    let mut job_executor = crate::execution::JobExecutor::new(
+        node.execution.clone(),
+        job_store.clone(),
+        node.program_store.clone(),
+        node.blob_store.clone(),
+        db.clone(),
+    )?;
+    job_executor.set_consensus(node.consensus.clone());
+
+    let job_ctx = Arc::new(JobRpcContext {
+        scheduler: Arc::new(crate::execution::JobScheduler::new(
+            Arc::new(job_executor),
+            job_store.clone(),
+            10,
+        )),
+        job_store: job_store.clone(),
+        blob_store: node.blob_store.clone(),
+        consensus: node.consensus.clone(),
+    });
+
+    let health_ctx = Arc::new(HealthRpcContext {
+        reporter: Arc::new(crate::execution::HealthReporter::new()),
+        get_queue_depth: Arc::new({
+            let scheduler = job_ctx.scheduler.clone();
+            move || {
+                tokio::runtime::Handle::current().block_on(async { scheduler.queue_depth().await })
+            }
+        }),
+        get_running_count: Arc::new({
+            let scheduler = job_ctx.scheduler.clone();
+            move || {
+                tokio::runtime::Handle::current()
+                    .block_on(async { scheduler.running_count().await })
+            }
+        }),
+        max_concurrent: 10,
+    });
+
+    let scheduler_handle = job_ctx.scheduler.clone();
+    tokio::spawn(async move {
+        scheduler_handle.start().await;
+    });
+
+    let job_sync_manager = Arc::new(crate::syncer::JobSyncManager::new(
+        job_store,
+        node.network.clone(),
+    ));
+
+    node.consensus.set_job_sync(job_sync_manager.clone()).await;
+
+    let job_sync_handle = job_sync_manager.clone();
+    tokio::spawn(async move {
+        job_sync_handle.start().await;
+    });
+
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/blobs", post(upload_blob))
@@ -66,6 +132,8 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
         .route("/programs", post(deploy_program))
         .route("/programs/:id", get(program_info))
         .route("/execute", post(execute_program))
+        .merge(job_routes().with_state(job_ctx))
+        .merge(health_routes().with_state(health_ctx))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_SIZE_BYTES))
         .with_state(ctx);
 

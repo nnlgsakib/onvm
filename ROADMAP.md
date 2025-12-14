@@ -9,9 +9,9 @@ A staged plan to evolve ONVM into a distributed, crypto-powered serverless compu
 - [x] Sample WASM programs under `wasm_programs/`
 
 ## Phase 1: Job & Runtime Base (0–2 milestones)
-- [ ] Define job/function model and manifest (resources, capabilities, I/O schemas), content-addressed blobs, versioning
-- [ ] RPC surface for submit-job, get-status, fetch-output/logs, cancel; idempotent request IDs
-- [ ] WASM sandbox hardening: fuel metering, timeouts, memory/malloc limits, allowed imports; signature verification on modules
+- [x] Define job/function model and manifest (resources, capabilities, I/O schemas), content-addressed blobs, versioning
+- [x] RPC surface for submit-job, get-status, fetch-output/logs, cancel; idempotent request IDs
+- [x] WASM sandbox hardening: fuel metering, timeouts, memory/malloc limits, allowed imports; signature verification on modules
 - [ ] Node health reporting and metrics: liveness/ready endpoints, capacity metrics (CPU/mem/queue), tracing spans
 - [ ] Basic scheduler: pick nodes by capacity/health; include retry/backoff, job TTLs, failure reasons
 - [ ] CLI/SDK ergonomics: package+upload function, submit job, stream status/logs, local-run parity

@@ -1,6 +1,6 @@
 # ONVM – Open Network Virtual Machine
 
-**ONVM** is a peer-to-peer decentralized compute platform that combines a content-addressed storage layer, a verifiable execution runtime powered by WebAssembly, and a gossip-based consensus mechanism to create a minimal, trustless virtual machine for distributed applications.
+**ONVM** is a peer-to-peer decentralized compute platform that combines a content-addressed storage layer, a verifiable execution runtime powered by WebAssembly, a job scheduling system, and a gossip-based consensus mechanism to create a minimal, trustless virtual machine for distributed applications.
 
 ---
 
@@ -10,10 +10,11 @@ ONVM nodes form a self-organizing network where participants:
 - **Store** content-addressed blobs (data, programs) with chunked, merkle-verified integrity
 - **Deploy** WebAssembly programs with versioned, deterministic execution
 - **Execute** computations against isolated per-program state stores
+- **Schedule** asynchronous jobs with retry logic, timeout enforcement, and fuel metering
 - **Replicate** operations through a directed acyclic graph (DAG) consensus protocol
-- **Synchronize** state, programs, and blobs across peers using gossip and Kademlia DHT
+- **Synchronize** state, programs, blobs, and jobs across peers using gossip and Kademlia DHT
 
-Each operation (blob publish, program deploy, execution) is embedded in a DAG node, gossiped to peers, and eventually converges network-wide, ensuring eventual consistency without centralized coordination.
+Each operation (blob publish, program deploy, execution, job completion) is embedded in a DAG node, gossiped to peers, and eventually converges network-wide, ensuring eventual consistency without centralized coordination.
 
 ---
 
@@ -26,9 +27,10 @@ Each operation (blob publish, program deploy, execution) is embedded in a DAG no
 | **`src/node.rs`** | Top-level orchestrator that wires together networking, consensus, execution, and storage |
 | **`src/network/`** | libp2p-based P2P stack (gossipsub, Kademlia, mDNS, request-response) |
 | **`src/consensus/`** | DAG engine for operation ordering, replication, and peer synchronization |
-| **`src/execution/`** | Wasmtime-based runtime with host functions for blob/state access |
+| **`src/execution/`** | Wasmtime-based runtime with host functions, job scheduler, and executor |
 | **`src/storage/`** | BlobStore (chunked + merkle roots) and StateStore (program-scoped KV) |
-| **`src/rpc/`** | Axum-based HTTP API for blob upload, program deployment, and execution |
+| **`src/rpc/`** | Axum-based HTTP API for blob upload, program deployment, execution, and job management |
+| **`src/syncer/`** | Job synchronization manager for cross-node job and blob replication |
 | **`src/crypto/`** | Ed25519 identity keys and Blake3 hashing |
 
 ### Data Flow
@@ -36,7 +38,7 @@ Each operation (blob publish, program deploy, execution) is embedded in a DAG no
 ```
 CLI → RPC → Node → Consensus (DAG) → Network (gossip)
                   ↓
-            ExecutionEngine → StateStore
+            JobScheduler → ExecutionEngine → StateStore
                   ↓
             BlobStore (chunked, merkle-verified)
 ```
@@ -44,6 +46,7 @@ CLI → RPC → Node → Consensus (DAG) → Network (gossip)
 1. **Upload Blob**: client POSTs blob → RPC → BlobStore → DAG node → gossip to peers
 2. **Deploy Program**: client POSTs wasm → ProgramStore → DAG node → gossip
 3. **Execute**: client POSTs program_id + input → ExecutionEngine (fuel-metered wasm) → StateStore → DAG node → gossip
+4. **Submit Job**: client POSTs job request → JobScheduler → JobExecutor → BlobStore (output) → gossip to peers
 
 ---
 
@@ -130,6 +133,141 @@ Returns JSON metadata (publisher, entrypoint, blob_refs, size).
 
 ---
 
+## Job System
+
+ONVM provides an asynchronous job scheduling system with automatic retry logic, timeout enforcement, and cross-node replication.
+
+### Submit a Job
+```bash
+cargo run -- submit-job \
+  --rpc :8080 \
+  --program-id <program-id> \
+  --input input.json \
+  --request-id my-job-1 \
+  --max-retries 3
+```
+Returns a hex **JobId**. Jobs are automatically queued, executed, and replicated across all nodes.
+
+**Example with job-test program:**
+```bash
+# Deploy the job-test program first
+cd wasm_programs/job-test
+cargo build --target wasm32-unknown-unknown --release
+cd ../..
+
+cargo run -- deploy \
+  --rpc :8080 \
+  --file wasm_programs/job-test/target/wasm32-unknown-unknown/release/job_test.wasm \
+  --entrypoint onvm_main
+
+# Submit compute task
+cargo run -- submit-job \
+  --rpc :8080 \
+  --program-id <program-id> \
+  --input wasm_programs/job-test/test_compute.json \
+  --request-id compute-1
+```
+
+**Input formats (test_*.json files):**
+- `test_compute.json`: `{"task": "compute", "iterations": 100, "data": "42"}`
+- `test_hash.json`: `{"task": "hash", "iterations": 50, "data": "onvm-job-system-test"}`
+- `test_transform.json`: `{"task": "transform", "data": "test the job scheduler with this message"}`
+- `test_stress.json`: `{"task": "stress", "iterations": 500}`
+
+### Check Job Status
+```bash
+cargo run -- job-status \
+  --rpc :8080 \
+  --job-id <job-id>
+```
+Returns JSON with status (pending/running/completed/failed/cancelled/timed_out), fuel consumed, timestamps, and error messages.
+
+**Example output:**
+```json
+{
+  "job_id": "5d9959d26008569cda98c1693449be01d8d3f9ce959a9a5bbd53f547d7c83612",
+  "request_id": "test-1",
+  "program_id": "f36d634041342c561522d403d00f9bf0592cb667f5935b1a80a6c7787ae32bb2",
+  "status": "completed",
+  "fuel_consumed": 23481,
+  "created_at": 1765702557748,
+  "started_at": 1765702558277,
+  "completed_at": 1765702558495,
+  "duration_ms": 218,
+  "retry_count": 0,
+  "error_message": null,
+  "metadata": {}
+}
+```
+
+### Retrieve Job Output
+```bash
+cargo run -- job-output \
+  --rpc :8080 \
+  --job-id <job-id> \
+  --out result.json
+```
+Fetches the job's output blob from any node in the network (automatically synced).
+
+**Example output (compute task):**
+```json
+{
+  "result": "success",
+  "task": "compute",
+  "iterations": 100,
+  "final_value": 142
+}
+```
+
+**Example output (hash task):**
+```json
+{
+  "result": "success",
+  "task": "hash",
+  "iterations": 50,
+  "final_hash": "abc123...def456"
+}
+```
+
+### Cancel a Job
+```bash
+cargo run -- cancel-job \
+  --rpc :8080 \
+  --job-id <job-id>
+```
+
+### List All Jobs
+```bash
+cargo run -- list-jobs --rpc :8080
+```
+
+**Example output:**
+```json
+{
+  "jobs": [
+    {
+      "job_id": "5d9959d26008569cda98c1693449be01d8d3f9ce959a9a5bbd53f547d7c83612",
+      "request_id": "test-1",
+      "program_id": "f36d634041342c561522d403d00f9bf0592cb667f5935b1a80a6c7787ae32bb2",
+      "status": "completed",
+      "created_at": 1765702557748,
+      "completed_at": 1765702558495
+    }
+  ],
+  "total": 1
+}
+```
+
+### Job Features
+- **Automatic Retry**: Jobs retry on failure with exponential backoff (configurable max retries)
+- **Timeout Enforcement**: Per-job timeout limits (default from manifest)
+- **Fuel Metering**: Track computational cost per job
+- **Cross-Node Sync**: Jobs and output blobs replicate across all nodes via gossipsub
+- **Idempotent Requests**: Request IDs prevent duplicate job submissions
+- **Health Monitoring**: Node capacity, queue depth, and execution metrics via `/health` endpoints
+
+---
+
 ## WASM Programs
 
 ONVM supports WebAssembly programs compiled to `wasm32-unknown-unknown` (or `wasm32-wasi` for broader stdlib).
@@ -154,6 +292,7 @@ Located in `wasm_programs/`:
 1. **`echo`** – Uppercases input bytes (no-std, minimal allocator demo)
 2. **`kvstore`** – JSON-based key-value store with `put`/`get`/`list`/`clear`/`stats` operations
 3. **`analytics`** – Text analysis: Blake3 hash, token counting, LZ4 compression, number stats
+4. **`job-test`** – Job system test program with compute, hash, transform, and stress tasks (uses std with threading support)
 
 Build with:
 ```bash
@@ -202,13 +341,19 @@ Override by editing `./data/config.toml` after `init`.
 
 - **Identity**: Ed25519 keypair stored in `./data/identity` (never commit)
 - **Hashing**: Blake3 for content IDs, merkle roots, and DAG node IDs
-- **Sandboxing**: Wasmtime fuel metering (default 50M instructions/exec), no filesystem access by default
+- **Sandboxing**: Wasmtime fuel metering (default 50M instructions/exec), configurable timeouts, memory limits
+- **WASM Threading**: Full std library support including threading and sync primitives (wasm_threads enabled)
 - **Determinism**: Programs must be reproducible; avoid randomness in committed blobs
+- **Job Isolation**: Each job executes in a separate WASM instance with enforced resource limits
 
 ---
 
 ## Roadmap
 
+- [x] Job scheduling system with retry logic and timeout enforcement
+- [x] Cross-node job and blob synchronization
+- [x] Health monitoring and metrics endpoints
+- [x] WASM threading and std library support
 - [ ] Byzantine fault tolerance (signature verification, quorum thresholds)
 - [ ] Advanced state sync (snapshot transfer, incremental merkle proofs)
 - [ ] Persistent execution scheduler (async task queue across node restarts)

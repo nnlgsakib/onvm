@@ -70,6 +70,8 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
 
     let job_store = Arc::new(crate::execution::JobStore::new(db.clone())?);
 
+    let health_reporter = Arc::new(crate::execution::HealthReporter::new_with_db(Some(db.clone())));
+
     let mut job_executor = crate::execution::JobExecutor::new(
         node.execution.clone(),
         job_store.clone(),
@@ -79,32 +81,23 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
     )?;
     job_executor.set_consensus(node.consensus.clone());
 
+    let mut job_scheduler = crate::execution::JobScheduler::new(
+        Arc::new(job_executor),
+        job_store.clone(),
+        10,
+    );
+    job_scheduler.set_health_reporter(health_reporter.clone());
+
     let job_ctx = Arc::new(JobRpcContext {
-        scheduler: Arc::new(crate::execution::JobScheduler::new(
-            Arc::new(job_executor),
-            job_store.clone(),
-            10,
-        )),
+        scheduler: Arc::new(job_scheduler),
         job_store: job_store.clone(),
         blob_store: node.blob_store.clone(),
         consensus: node.consensus.clone(),
     });
 
     let health_ctx = Arc::new(HealthRpcContext {
-        reporter: Arc::new(crate::execution::HealthReporter::new()),
-        get_queue_depth: Arc::new({
-            let scheduler = job_ctx.scheduler.clone();
-            move || {
-                tokio::runtime::Handle::current().block_on(async { scheduler.queue_depth().await })
-            }
-        }),
-        get_running_count: Arc::new({
-            let scheduler = job_ctx.scheduler.clone();
-            move || {
-                tokio::runtime::Handle::current()
-                    .block_on(async { scheduler.running_count().await })
-            }
-        }),
+        reporter: health_reporter,
+        scheduler: Arc::downgrade(&job_ctx.scheduler),
         max_concurrent: 10,
     });
 

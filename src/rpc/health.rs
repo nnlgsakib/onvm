@@ -16,8 +16,7 @@ pub fn health_routes() -> Router<Arc<HealthRpcContext>> {
 #[derive(Clone)]
 pub struct HealthRpcContext {
     pub reporter: Arc<HealthReporter>,
-    pub get_queue_depth: Arc<dyn Fn() -> usize + Send + Sync>,
-    pub get_running_count: Arc<dyn Fn() -> usize + Send + Sync>,
+    pub scheduler: std::sync::Weak<crate::execution::JobScheduler>,
     pub max_concurrent: usize,
 }
 
@@ -33,8 +32,13 @@ async fn liveness() -> Json<LivenessResponse> {
 async fn readiness(
     State(ctx): State<Arc<HealthRpcContext>>,
 ) -> Result<Json<NodeHealth>, StatusCode> {
-    let queue_depth = (ctx.get_queue_depth)();
-    let running_count = (ctx.get_running_count)();
+    let scheduler = ctx
+        .scheduler
+        .upgrade()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let queue_depth = scheduler.queue_depth().await;
+    let running_count = scheduler.running_count().await;
 
     let health = ctx
         .reporter

@@ -103,6 +103,9 @@ async fn submit_job(
     State(ctx): State<Arc<JobRpcContext>>,
     Json(req): Json<SubmitJobRequest>,
 ) -> Result<Json<SubmitJobResponse>, (StatusCode, String)> {
+    let span = tracing::info_span!("submit_job", request_id = %req.request_id);
+    let _guard = span.enter();
+
     let program_id = parse_program_id(&req.program_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid program_id: {e}")))?;
 
@@ -229,6 +232,9 @@ async fn get_job_output(
     State(ctx): State<Arc<JobRpcContext>>,
     Path(job_id_hex): Path<String>,
 ) -> Result<Json<OutputResponse>, (StatusCode, String)> {
+    let span = tracing::debug_span!("get_job_output", job_id = %job_id_hex);
+    let _guard = span.enter();
+
     let job_id = parse_job_id(&job_id_hex)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid job_id: {e}")))?;
 

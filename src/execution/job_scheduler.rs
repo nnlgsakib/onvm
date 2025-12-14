@@ -1,3 +1,4 @@
+use super::health::HealthReporter;
 use super::job::{Job, JobId, JobStatus, JobStore, LogLevel};
 use super::job_executor::JobExecutor;
 use anyhow::Result;
@@ -14,6 +15,7 @@ pub struct JobScheduler {
     max_concurrent: usize,
     running_count: Arc<RwLock<usize>>,
     retry_backoff_ms: u64,
+    health_reporter: Option<Arc<HealthReporter>>,
 }
 
 impl JobScheduler {
@@ -29,10 +31,17 @@ impl JobScheduler {
             max_concurrent,
             running_count: Arc::new(RwLock::new(0)),
             retry_backoff_ms: 5000,
+            health_reporter: None,
         }
     }
 
+    pub fn set_health_reporter(&mut self, reporter: Arc<HealthReporter>) {
+        self.health_reporter = Some(reporter);
+    }
+
     pub async fn start(self: Arc<Self>) {
+        tracing::info!("job scheduler starting");
+
         let mut tick = interval(Duration::from_millis(1000));
         loop {
             tick.tick().await;
@@ -60,6 +69,7 @@ impl JobScheduler {
                 let executor = Arc::clone(&self.executor);
                 let running_count = Arc::clone(&self.running_count);
                 let job_store = Arc::clone(&self.job_store);
+                let health_reporter = self.health_reporter.clone();
 
                 {
                     let mut count = running_count.write().await;
@@ -67,6 +77,7 @@ impl JobScheduler {
                 }
 
                 tokio::spawn(async move {
+                    let start_time = SystemTime::now();
                     let result = executor.execute_job(&job_id).await;
 
                     if let Err(e) = result {
@@ -76,6 +87,26 @@ impl JobScheduler {
                             job.error_message = Some(e.to_string());
                             job.add_log(LogLevel::Error, format!("Scheduler error: {e}"));
                             let _ = job_store.update(&job);
+
+                            if let Some(ref reporter) = health_reporter {
+                                reporter.record_job_failed();
+                            }
+                        }
+                    } else if let Ok(Some(job)) = job_store.get(&job_id) {
+                        if let Some(ref reporter) = health_reporter {
+                            match job.status {
+                                JobStatus::Completed => {
+                                    let duration_ms = start_time
+                                        .elapsed()
+                                        .unwrap_or(Duration::from_secs(0))
+                                        .as_millis() as u64;
+                                    reporter.record_job_completed(job.fuel_consumed, duration_ms);
+                                }
+                                JobStatus::Cancelled => {
+                                    reporter.record_job_cancelled();
+                                }
+                                _ => {}
+                            }
                         }
                     }
 

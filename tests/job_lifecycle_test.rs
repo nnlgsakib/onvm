@@ -1,7 +1,7 @@
 use anyhow::Result;
 use onvm::execution::{
-    ExecutionConfig, ExecutionEngine, Job, JobExecutor, JobId, JobScheduler, JobStatus, JobStore,
-    ManifestStore, ProgramStore, SandboxValidator,
+    ExecutionConfig, ExecutionEngine, Job, JobExecutor, JobScheduler, JobStatus, JobStore,
+    ProgramStore, SandboxValidator,
 };
 use onvm::storage::{BlobStore, StateStore};
 use onvm::types::{NodeId, ProgramId};
@@ -16,7 +16,7 @@ async fn test_job_submission_and_execution() -> Result<()> {
     let program_store = Arc::new(ProgramStore::new(db.clone(), std::env::temp_dir())?);
     let job_store = Arc::new(JobStore::new(db.clone())?);
 
-    let wasm = include_bytes!("");
+    let wasm = include_bytes!("../wasm_programs/echo/target/wasm32-unknown-unknown/release/echo.wasm");
     let program_meta = program_store.deploy(
         wasm,
         "onvm_main".to_string(),

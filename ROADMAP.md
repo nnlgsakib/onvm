@@ -13,7 +13,7 @@ A staged plan to evolve ONVM into a distributed, crypto-powered serverless compu
 - [x] RPC surface for submit-job, get-status, fetch-output/logs, cancel; idempotent request IDs
 - [x] WASM sandbox hardening: fuel metering, timeouts, memory/malloc limits, allowed imports; signature verification on modules
 - [ ] Node health reporting and metrics: liveness/ready endpoints, capacity metrics (CPU/mem/queue), tracing spans
-- [ ] Basic scheduler: pick nodes by capacity/health; include retry/backoff, job TTLs, failure reasons
+- [ ] advanced scheduler: pick nodes by capacity/health; include retry/backoff, job TTLs, failure reasons
 - [ ] CLI/SDK ergonomics: package+upload function, submit job, stream status/logs, local-run parity
 - [ ] Integration tests for job lifecycle and sandbox enforcement
 

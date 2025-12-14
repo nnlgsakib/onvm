@@ -42,6 +42,9 @@ impl JobExecutor {
     }
 
     pub async fn execute_job(&self, job_id: &JobId) -> Result<()> {
+        let span = tracing::info_span!("execute_job", job_id = %job_id);
+        let _guard = span.enter();
+
         {
             let mut active = self.active_jobs.write().await;
             if active.contains(job_id) {
@@ -61,6 +64,8 @@ impl JobExecutor {
     }
 
     async fn execute_job_inner(&self, job_id: &JobId) -> Result<()> {
+        tracing::debug!("starting job execution");
+
         let mut job = self
             .job_store
             .get(job_id)?

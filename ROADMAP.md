@@ -1,6 +1,6 @@
 # ONVM Roadmap
 
-A staged plan to evolve ONVM into a distributed, crypto-powered serverless compute network with per-operation payments, subscriptions, and node rewards. Checkboxes track progress; existing capabilities are marked done.
+A staged plan to evolve ONVM into a distributed, crypto-powered serverless compute network with per-operation payments, subscriptions, and node rewards. Built on a DAG-based hashgraph consensus (inspired by Hedera Hashgraph) for high throughput and fast finality - no traditional blocks.
 
 ## Foundation (existing)
 - [x] CLI entrypoints for init/run-node/upload-blob/deploy/execute/get-blob/program-info (`src/main.rs`, `src/cli.rs`)
@@ -12,7 +12,7 @@ A staged plan to evolve ONVM into a distributed, crypto-powered serverless compu
 - [x] Define job/function model and manifest (resources, capabilities, I/O schemas), content-addressed blobs, versioning
 - [x] RPC surface for submit-job, get-status, fetch-output/logs, cancel; idempotent request IDs
 - [x] WASM sandbox hardening: fuel metering, timeouts, memory/malloc limits, allowed imports; signature verification on modules
-- [ ] Node health reporting and metrics: liveness/ready endpoints, capacity metrics (CPU/mem/queue), tracing spans
+- [x] Node health reporting and metrics: liveness/ready endpoints, capacity metrics (CPU/mem/queue), tracing spans
 - [ ] advanced scheduler: pick nodes by capacity/health; include retry/backoff, job TTLs, failure reasons
 - [ ] CLI/SDK ergonomics: package+upload function, submit job, stream status/logs, local-run parity
 - [ ] Integration tests for job lifecycle and sandbox enforcement
@@ -22,7 +22,7 @@ A staged plan to evolve ONVM into a distributed, crypto-powered serverless compu
 - [ ] Account model and transactions: balances, nonces, signatures, replay protection, key management
 - [ ] Per-operation metering/pricing: translate resource usage (CPU/mem/fuel/storage) into coin fees; tiered subscription allowances with overage billing
 - [ ] Fee collection pipeline: attach payments to job submissions, hold escrow until completion/cancellation, refund rules
-- [ ] Blocks/ledger integration: transaction pool, block assembly with execution receipts, balance updates, state proofs
+- [ ] DAG transaction integration: transaction pool, consensus ordering via hashgraph, execution receipts in DAG events, balance updates, state proofs
 - [ ] Wallet/SDK support: create/import accounts, sign transactions, view balances/allowances
 - [ ] Tests for accounting correctness, overflow/underflow guards, and signature validation
 
@@ -32,14 +32,16 @@ A staged plan to evolve ONVM into a distributed, crypto-powered serverless compu
 - [ ] Execution receipts with commitments (inputs/outputs/resource usage) and audit logs; dispute and re-execution flow
 - [ ] Redundant execution (N-of-M) with majority/threshold validation; tie rewards/penalties to agreement results
 - [ ] Reputation scoring that feeds scheduling (success rate, latency, dispute history, decay)
-- [ ] Payout and settlement cadence: on-block payouts, epochs, or streaming payments; handle dust limits and batching
+- [ ] Payout and settlement cadence: consensus-round payouts, epochs, or streaming payments; handle dust limits and batching
 
-## Phase 4: Network & Consensus Hardening (5–6 milestones)
+## Phase 4: Hashgraph Consensus & Network Hardening (5–6 milestones)
+- [ ] Hashgraph consensus implementation: gossip about gossip protocol, virtual voting, consensus timestamps
+- [ ] Event structure and DAG ordering: witness events, famous witness determination, consensus ordering without blocks
+- [ ] Byzantine fault tolerance: handle up to 1/3 malicious nodes, ensure fairness and fast finality
 - [ ] Peer discovery and membership via gossip/DHT; NAT traversal; normalized multiaddrs
-- [ ] Consensus integration/refinement (e.g., PoS/PoA BFT): proposer/validator roles, leader rotation, fork choice, finality
-- [ ] Mempool policies: fee prioritization, subscription allowance checks, DoS protection, rate limiting
+- [ ] Transaction pool and ordering: fee prioritization via consensus timestamps, subscription allowance checks, DoS protection, rate limiting
 - [ ] Protocol versioning and compatibility gates; rolling upgrade playbook and feature flags
-- [ ] Observability stack: metrics exporter, log shipping, dashboards, alerts for consensus health and payment pipeline
+- [ ] Observability stack: metrics exporter, log shipping, dashboards, alerts for consensus health (round creation, famous witnesses, transaction throughput)
 
 ## Phase 5: Security, UX, and Marketplace (6–7 milestones)
 - [ ] Security reviews and fuzzing for host interfaces, RPC, transaction parsing; admission control defaults deny-all
@@ -58,7 +60,9 @@ A staged plan to evolve ONVM into a distributed, crypto-powered serverless compu
 - [ ] Validation hooks for AI jobs: checksum/attestation of model blobs, deterministic seeds where required
 
 ## Exploratory / Long-Term
+- [ ] Full Hashgraph consensus with stake-weighted voting and dynamic membership
 - [ ] Optional TEE or zk-assisted execution proofs for high-assurance verification
 - [ ] Hybrid settlement/bridging to external chains for liquidity and cross-chain payments
-- [ ] Advanced fee markets (EIP-1559-like) and pre-paid channels for microtransactions
+- [ ] Advanced fee markets with dynamic pricing based on consensus round congestion
 - [ ] Privacy enhancements for inputs/outputs (encryption, access tokens, redaction)
+- [ ] State snapshots and fast sync: periodic state commitments in DAG for quick node bootstrap

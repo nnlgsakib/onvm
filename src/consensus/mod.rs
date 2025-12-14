@@ -8,11 +8,12 @@ use crate::network::{
 };
 use crate::qeue_manager::AsyncQueue;
 use crate::storage::StateStore;
-use crate::storage::{reconstruct_chunk, BlobStore};
+use crate::storage::{reconstruct_chunk, BlobIndex, BlobStore, DagStore, ProgramIndex};
+
+use crate::syncer::sync::SyncState;
 use crate::types::{BlobId, BlobMetadata, ComputeOp, NodeId, ProgramId, ProgramMetadata};
 use anyhow::{anyhow, Context, Result};
-use libp2p::request_response::ResponseChannel;
-use libp2p::PeerId;
+use libp2p::{request_response::ResponseChannel, PeerId};
 use serde::{Deserialize, Serialize};
 use sled::Db;
 use std::collections::HashSet;
@@ -1151,7 +1152,16 @@ impl DagEngine {
             .map(|p| p.id.0)
             .collect();
         let program_bloom = Some(BloomFilter::from_programs(&programs));
-        let blobs = self.blob_index.inventory_entries()?;
+        let blobs = self
+            .blob_index
+            .inventory_records()?
+            .into_iter()
+            .map(|rec| BlobInventoryEntry {
+                id: rec.meta.id.0,
+                has_data: rec.has_data,
+                locations: rec.locations.iter().map(|n| n.to_string()).collect(),
+            })
+            .collect();
         let executions = self.dag_store.execution_ids()?;
         let inv = crate::network::DagInventory {
             programs,
@@ -1291,226 +1301,6 @@ impl DagEngine {
             }
         }
         Ok(())
-    }
-}
-
-struct DagStore {
-    tree: sled::Tree,
-}
-
-impl DagStore {
-    fn new(db: &Db) -> Result<Self> {
-        Ok(Self {
-            tree: db.open_tree("dag_nodes")?,
-        })
-    }
-
-    fn insert(&self, node: &DagNode) -> Result<bool> {
-        let enc = bincode::serde::encode_to_vec(node, bincode::config::standard())?;
-        let inserted = self.tree.insert(node.id.0, enc)?.is_none();
-        self.tree.flush()?;
-        Ok(inserted)
-    }
-
-    fn contains(&self, id: &DagId) -> Result<bool> {
-        Ok(self.tree.contains_key(id.0)?)
-    }
-
-    fn get(&self, id: &DagId) -> Result<Option<DagNode>> {
-        let Some(raw) = self.tree.get(id.0)? else {
-            return Ok(None);
-        };
-        let (node, _): (DagNode, _) =
-            bincode::serde::decode_from_slice(&raw, bincode::config::standard())?;
-        Ok(Some(node))
-    }
-
-    fn execution_ids(&self) -> Result<Vec<[u8; 32]>> {
-        let mut out = Vec::new();
-        for entry in self.tree.iter() {
-            let (_, v) = entry?;
-            let (node, _): (DagNode, _) =
-                bincode::serde::decode_from_slice(&v, bincode::config::standard())?;
-            if matches!(node.op, Operation::Compute(_)) {
-                out.push(node.id.0);
-            }
-        }
-        Ok(out)
-    }
-
-    fn all_compute_ops(&self) -> Result<Vec<DagNode>> {
-        let mut out = Vec::new();
-        for entry in self.tree.iter() {
-            let (_, v) = entry?;
-            let (node, _): (DagNode, _) =
-                bincode::serde::decode_from_slice(&v, bincode::config::standard())?;
-            if matches!(node.op, Operation::Compute(_)) {
-                out.push(node);
-            }
-        }
-        Ok(out)
-    }
-}
-
-struct BlobIndex {
-    tree: sled::Tree,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlobRecord {
-    meta: BlobMetadata,
-    locations: HashSet<NodeId>,
-    has_data: bool,
-}
-
-impl BlobIndex {
-    fn new(db: &Db) -> Result<Self> {
-        Ok(Self {
-            tree: db.open_tree("blob_index")?,
-        })
-    }
-
-    fn record(&self, meta: &BlobMetadata, location: NodeId, has_data: bool) -> Result<()> {
-        let mut rec = self.get(&meta.id)?.unwrap_or_else(|| BlobRecord {
-            meta: meta.clone(),
-            locations: HashSet::new(),
-            has_data: false,
-        });
-        rec.meta = meta.clone();
-        rec.locations.insert(location);
-        rec.has_data = rec.has_data || has_data;
-        let enc = bincode::serde::encode_to_vec(&rec, bincode::config::standard())?;
-        self.tree.insert(meta.id.0, enc)?;
-        self.tree.flush()?;
-        Ok(())
-    }
-
-    fn get(&self, id: &BlobId) -> Result<Option<BlobRecord>> {
-        let Some(raw) = self.tree.get(id.0)? else {
-            return Ok(None);
-        };
-        let (rec, _): (BlobRecord, _) =
-            bincode::serde::decode_from_slice(&raw, bincode::config::standard())?;
-        Ok(Some(rec))
-    }
-
-    fn inventory_entries(&self) -> Result<Vec<BlobInventoryEntry>> {
-        let mut out = Vec::new();
-        for entry in self.tree.iter() {
-            let (_, v) = entry?;
-            let (rec, _): (BlobRecord, _) =
-                bincode::serde::decode_from_slice(&v, bincode::config::standard())?;
-            out.push(BlobInventoryEntry {
-                id: rec.meta.id.0,
-                has_data: rec.has_data,
-                locations: rec.locations.iter().map(|n| n.to_string()).collect(),
-            });
-        }
-        Ok(out)
-    }
-}
-
-struct ProgramIndex {
-    tree: sled::Tree,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProgramRecord {
-    id: ProgramId,
-    locations: HashSet<NodeId>,
-}
-
-impl ProgramIndex {
-    fn new(db: &Db) -> Result<Self> {
-        Ok(Self {
-            tree: db.open_tree("program_index")?,
-        })
-    }
-
-    fn record(&self, id: ProgramId, location: NodeId) -> Result<()> {
-        let mut rec = self.get(&id)?.unwrap_or_else(|| ProgramRecord {
-            id: id.clone(),
-            locations: HashSet::new(),
-        });
-        rec.locations.insert(location);
-        let enc = bincode::serde::encode_to_vec(&rec, bincode::config::standard())?;
-        self.tree.insert(id.0, enc)?;
-        self.tree.flush()?;
-        Ok(())
-    }
-
-    fn get(&self, id: &ProgramId) -> Result<Option<ProgramRecord>> {
-        let Some(raw) = self.tree.get(id.0)? else {
-            return Ok(None);
-        };
-        let (rec, _): (ProgramRecord, _) =
-            bincode::serde::decode_from_slice(&raw, bincode::config::standard())?;
-        Ok(Some(rec))
-    }
-}
-
-#[derive(Default)]
-struct SyncState {
-    last_inventory: Option<crate::network::DagInventory>,
-    missing_programs: usize,
-    missing_blobs: usize,
-    missing_execs: usize,
-    pending_program_ids: HashSet<ProgramId>,
-    pending_exec_ids: HashSet<[u8; 32]>,
-    last_seen: bool,
-}
-
-impl BloomFilter {
-    fn new(size_bytes: usize, k: u8) -> Self {
-        Self {
-            bits: vec![0u8; size_bytes],
-            k,
-        }
-    }
-
-    fn insert(&mut self, data: &[u8]) {
-        for i in 0..self.k {
-            let mut key = [0u8; 32];
-            key[0] = i;
-            let hash = blake3::keyed_hash(&key, data);
-            self.set_bit(hash.as_bytes());
-        }
-    }
-
-    fn contains(&self, data: &[u8]) -> bool {
-        for i in 0..self.k {
-            let mut key = [0u8; 32];
-            key[0] = i;
-            let hash = blake3::keyed_hash(&key, data);
-            if !self.get_bit(hash.as_bytes()) {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn set_bit(&mut self, hash: &[u8]) {
-        let idx =
-            (u64::from_le_bytes(hash[0..8].try_into().unwrap()) as usize) % (self.bits.len() * 8);
-        let byte = idx / 8;
-        let bit = idx % 8;
-        self.bits[byte] |= 1 << bit;
-    }
-
-    fn get_bit(&self, hash: &[u8]) -> bool {
-        let idx =
-            (u64::from_le_bytes(hash[0..8].try_into().unwrap()) as usize) % (self.bits.len() * 8);
-        let byte = idx / 8;
-        let bit = idx % 8;
-        (self.bits[byte] & (1 << bit)) != 0
-    }
-
-    fn from_programs(ids: &[[u8; 32]]) -> Self {
-        let mut bloom = Self::new(256, 3);
-        for id in ids {
-            bloom.insert(id);
-        }
-        bloom
     }
 }
 

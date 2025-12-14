@@ -1,6 +1,7 @@
 use crate::crypto::keys::NodeKeys;
 use crate::types::{BlobId, BlobMetadata, ComputeOp, ProgramId, ProgramMetadata};
 use anyhow::{anyhow, Context, Result};
+use blake3;
 use futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic as Topic};
 use libp2p::identity as libp2p_identity;
@@ -132,6 +133,60 @@ pub struct BloomFilter {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramSyncRequest {
     pub bloom: BloomFilter,
+}
+
+impl BloomFilter {
+    pub fn new(size_bytes: usize, k: u8) -> Self {
+        Self {
+            bits: vec![0u8; size_bytes],
+            k,
+        }
+    }
+
+    pub fn insert(&mut self, data: &[u8]) {
+        for i in 0..self.k {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            let hash = blake3::keyed_hash(&key, data);
+            self.set_bit(hash.as_bytes());
+        }
+    }
+
+    pub fn contains(&self, data: &[u8]) -> bool {
+        for i in 0..self.k {
+            let mut key = [0u8; 32];
+            key[0] = i;
+            let hash = blake3::keyed_hash(&key, data);
+            if !self.get_bit(hash.as_bytes()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn set_bit(&mut self, hash: &[u8]) {
+        let idx =
+            (u64::from_le_bytes(hash[0..8].try_into().unwrap()) as usize) % (self.bits.len() * 8);
+        let byte = idx / 8;
+        let bit = idx % 8;
+        self.bits[byte] |= 1 << bit;
+    }
+
+    fn get_bit(&self, hash: &[u8]) -> bool {
+        let idx =
+            (u64::from_le_bytes(hash[0..8].try_into().unwrap()) as usize) % (self.bits.len() * 8);
+        let byte = idx / 8;
+        let bit = idx % 8;
+        (self.bits[byte] & (1 << bit)) != 0
+    }
+
+    pub fn from_programs(ids: &[[u8; 32]]) -> Self {
+        let mut bloom = Self::new(256, 3);
+        for id in ids {
+            bloom.insert(id);
+        }
+        bloom
+    }
 }
 
 #[derive(Debug)]

@@ -1,8 +1,8 @@
 use crate::consensus::DagEngine;
+pub mod sync;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration, Instant};
-
 pub struct SyncMan {
     dag: Arc<DagEngine>,
 }

@@ -1,0 +1,2 @@
+# Example: Register with orange theme and custom avatar
+{"op":"register","name":"Tech Innovator","email":"tech@innovation.io","bio":"Building the future of decentralized technology","avatar_url":"https://i.pravatar.cc/150?img=33","theme":"orange"}

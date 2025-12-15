@@ -1,0 +1,2 @@
+# Example: Register with minimal info
+{"op":"register","name":"Charlie Davis","email":"charlie@example.com"}

@@ -1,0 +1,24 @@
+{
+  "version": "v1",
+  "metadata": {
+    "name": "school-management-system",
+    "description": "A comprehensive school management system with student, teacher, course, and grade tracking",
+    "author": "ONVM Developer",
+    "version": "1.0.0",
+    "tags": ["education", "school", "management", "students", "teachers"]
+  },
+  "resources": {
+    "max_fuel": 100000000,
+    "max_memory_bytes": 67108864,
+    "timeout_ms": 30000,
+    "capabilities": ["state"]
+  },
+  "runtime": {
+    "allowed_imports": "restricted",
+    "signature_required": false
+  },
+  "io": {
+    "input_content_type": "application/json",
+    "output_content_type": "application/json"
+  }
+}

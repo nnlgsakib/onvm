@@ -1,0 +1,13 @@
+{
+  "operation": "update_student",
+  "data": {
+    "student": {
+      "id": "s001",
+      "name": "John Doe",
+      "grade": "11th",
+      "age": 17,
+      "email": "john.doe.updated@example.com",
+      "subjects": ["Math", "Science", "English", "History"]
+    }
+  }
+}

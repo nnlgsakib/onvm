@@ -1,0 +1,12 @@
+{
+  "operation": "add_teacher",
+  "data": {
+    "teacher": {
+      "id": "t002",
+      "name": "Robert Brown",
+      "subject": "English Literature",
+      "email": "robert.brown@example.com",
+      "phone": "+1-555-0124"
+    }
+  }
+}

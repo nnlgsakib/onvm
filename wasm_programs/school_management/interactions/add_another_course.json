@@ -1,0 +1,13 @@
+{
+  "operation": "add_course",
+  "data": {
+    "course": {
+      "id": "c002",
+      "name": "English Literature",
+      "code": "ENG-101",
+      "teacher_id": "t002",
+      "student_ids": [],
+      "description": "Study of classic and modern literature"
+    }
+  }
+}

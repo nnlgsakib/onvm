@@ -1,0 +1,12 @@
+{
+  "operation": "assign_grade",
+  "data": {
+    "grade": {
+      "id": "g003",
+      "student_id": "s001",
+      "course_id": "c002",
+      "score": 92,
+      "date": "2023-10-17"
+    }
+  }
+}

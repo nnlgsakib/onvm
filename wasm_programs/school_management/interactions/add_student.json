@@ -1,0 +1,13 @@
+{
+  "operation": "add_student",
+  "data": {
+    "student": {
+      "id": "s001",
+      "name": "John Doe",
+      "grade": "10th",
+      "age": 16,
+      "email": "john.doe@example.com",
+      "subjects": ["Math", "Science", "English"]
+    }
+  }
+}

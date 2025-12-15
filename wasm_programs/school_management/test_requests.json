@@ -1,0 +1,91 @@
+[
+  {
+    "operation": "add_student",
+    "data": {
+      "student": {
+        "id": "s001",
+        "name": "John Doe",
+        "grade": "10th",
+        "age": 16,
+        "email": "john.doe@example.com",
+        "subjects": ["Math", "Science", "English"]
+      }
+    }
+  },
+  {
+    "operation": "add_teacher",
+    "data": {
+      "teacher": {
+        "id": "t001",
+        "name": "Jane Smith",
+        "subject": "Mathematics",
+        "email": "jane.smith@example.com",
+        "phone": "+1-555-0123"
+      }
+    }
+  },
+  {
+    "operation": "add_course",
+    "data": {
+      "course": {
+        "id": "c001",
+        "name": "Algebra I",
+        "code": "MATH-101",
+        "teacher_id": "t001",
+        "student_ids": [],
+        "description": "Introduction to algebraic concepts"
+      }
+    }
+  },
+  {
+    "operation": "enroll_student",
+    "data": {
+      "student_id": "s001",
+      "course_id": "c001"
+    }
+  },
+  {
+    "operation": "assign_grade",
+    "data": {
+      "grade": {
+        "id": "g001",
+        "student_id": "s001",
+        "course_id": "c001",
+        "score": 95,
+        "date": "2023-10-15"
+      }
+    }
+  },
+  {
+    "operation": "get_student",
+    "data": "s001"
+  },
+  {
+    "operation": "get_teacher",
+    "data": "t001"
+  },
+  {
+    "operation": "get_course",
+    "data": "c001"
+  },
+  {
+    "operation": "get_student_grades",
+    "data": "s001"
+  },
+  {
+    "operation": "get_course_grades",
+    "data": "c001"
+  },
+  {
+    "operation": "list_students",
+    "data": null
+  },
+  {
+    "operation": "list_teachers",
+    "data": null
+  },
+  {
+    "operation": "list_courses",
+    "data": null
+  }
+]

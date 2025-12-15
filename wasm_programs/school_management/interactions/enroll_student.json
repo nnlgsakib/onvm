@@ -1,0 +1,7 @@
+{
+  "operation": "enroll_student",
+  "data": {
+    "student_id": "s001",
+    "course_id": "c001"
+  }
+}

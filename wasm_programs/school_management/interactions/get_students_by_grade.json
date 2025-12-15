@@ -1,0 +1,6 @@
+{
+  "operation": "get_students_by_grade",
+  "data": {
+    "grade": "10th"
+  }
+}

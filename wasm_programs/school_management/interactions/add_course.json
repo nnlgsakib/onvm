@@ -1,0 +1,13 @@
+{
+  "operation": "add_course",
+  "data": {
+    "course": {
+      "id": "c001",
+      "name": "Algebra I",
+      "code": "MATH-101",
+      "teacher_id": "t001",
+      "student_ids": [],
+      "description": "Introduction to algebraic concepts"
+    }
+  }
+}

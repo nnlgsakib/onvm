@@ -1,0 +1,12 @@
+{
+  "operation": "add_teacher",
+  "data": {
+    "teacher": {
+      "id": "t001",
+      "name": "Jane Smith",
+      "subject": "Mathematics",
+      "email": "jane.smith@example.com",
+      "phone": "+1-555-0123"
+    }
+  }
+}

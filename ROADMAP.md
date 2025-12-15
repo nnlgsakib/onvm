@@ -49,10 +49,10 @@ A staged plan to evolve the ONVM ecosystem into two fully independent protocols:
 - [x] WASM sandbox hardening: fuel metering, timeouts, memory/malloc limits, allowed imports; signature verification on modules
 - [x] Node health reporting and metrics: liveness/ready endpoints, capacity metrics (CPU/mem/queue), tracing spans
 - [x] Network coordination: peer discovery, capability broadcasting, load balancing
-- [ ] Advanced scheduler: pick nodes by capacity/health; include retry/backoff, job TTLs, failure reasons
+- [x] Advanced scheduler: pick nodes by capacity/health; include retry/backoff, job TTLs, failure reasons
 - [ ] CLI/SDK ergonomics: package+upload function, submit job, stream status/logs, local-run parity
 - [ ] Integration tests for job lifecycle and sandbox enforcement
-- [ ] Resource tracking: measure CPU/mem/fuel/storage used per job (metrics only, no payment logic)
+- [x] Resource tracking: measure CPU/mem/fuel/storage used per job (metrics only, no payment logic)
 
 ### Phase 2: Execution Optimization (2–4 milestones)
 - [ ] Redundant execution (N-of-M) with majority/threshold validation for critical workloads

@@ -211,6 +211,8 @@ impl DagEngine {
                         }
                     }
                 }
+                NetworkMessage::Capability(_caps) => {
+                }
             },
             NetworkEvent::TransferRequest(peer, req, channel) => {
                 self.handle_transfer_request(&peer, req, channel).await?;

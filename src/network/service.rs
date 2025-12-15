@@ -39,6 +39,7 @@ pub enum NetworkMessage {
     BlobRequest(BlobRequest),
     ExecutionRequest(Vec<[u8; 32]>),
     Job(crate::syncer::JobBroadcast),
+    Capability(crate::network::coordination::NodeCapabilities),
 }
 
 /// Direct transfer request/response messages used by request-response protocols.
@@ -477,7 +478,8 @@ impl NetworkService {
                             | NetworkMessage::BlobRequest(_)
                             | NetworkMessage::BlobMeta(_)
                             | NetworkMessage::ExecutionRequest(_)
-                            | NetworkMessage::Job(_) => Topic::new(TOPIC_BLOCKS),
+                            | NetworkMessage::Job(_)
+                            | NetworkMessage::Capability(_) => Topic::new(TOPIC_BLOCKS),
                         };
                         let data = match serde_json::to_vec(&msg) {
                             Ok(d) => d,
@@ -527,5 +529,6 @@ fn describe_msg(msg: &NetworkMessage) -> &'static str {
         NetworkMessage::BlobRequest(_) => "blob_request",
         NetworkMessage::ExecutionRequest(_) => "execution_request",
         NetworkMessage::Job(_) => "job",
+        NetworkMessage::Capability(_) => "capability",
     }
 }

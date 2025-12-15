@@ -108,7 +108,10 @@ impl ExecutionEngine {
             .with_context(|| format!("load program {program_id}"))?;
         let module = self.get_or_compile_module(program_id, &wasm)?;
 
-        let wasi = WasiCtxBuilder::new().build();
+        let wasi = WasiCtxBuilder::new()
+            .inherit_stdio()
+            .inherit_env()?
+            .build();
         let ctx = ExecutionContext {
             blob_store: self.blob_store.clone(),
             state_store: self.state_store.clone(),
@@ -121,7 +124,6 @@ impl ExecutionEngine {
         let mut linker = Linker::new(&self.engine);
         attach_blob_host_functions(&mut linker)?;
         attach_state_host_functions(&mut linker)?;
-        // Attach WASI to broaden compatibility; still sandboxed (no FS by default).
         wasmtime_wasi::add_to_linker(&mut linker, |cx: &mut ExecutionContext| &mut cx.wasi)?;
         let instance = linker.instantiate(&mut store, &module)?;
         let memory = instance

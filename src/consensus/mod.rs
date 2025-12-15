@@ -259,7 +259,15 @@ impl DagEngine {
             .record(&input_meta, self.identity.node_id.clone(), true)?;
         self.network.provide(&input_meta.id.0);
 
-        let outcome = self.scheduler.execute(program, input).await?;
+        // Try local execution first
+        let outcome = match self.scheduler.execute(program, input).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // If local execution fails, try remote execution as fallback
+                tracing::warn!("Local execution failed: {:?}. Attempting remote execution.", e);
+                self.submit_remote_execution(program, input).await?
+            }
+        };
 
         let output_meta =
             self.blob_store
@@ -312,6 +320,37 @@ impl DagEngine {
         )
         .await;
         Ok(outcome)
+    }
+
+    /// Submit execution request to a remote node that hosts the program
+    #[allow(unused_variables)]
+    async fn submit_remote_execution(
+        &self,
+        program: &ProgramId,
+        input: &[u8],
+    ) -> Result<ExecutionOutcome> {
+        // Find a peer that hosts this program
+        if let Some(program_record) = self.program_index.get(program)? {
+            // Get the first available peer that hosts this program
+            if let Some(peer_node_id) = program_record.locations.iter().next() {
+                // Convert NodeId to PeerId (this is a simplified approach)
+                // In a real implementation, you would need a mapping between NodeId and PeerId
+                let peer_id_bytes = peer_node_id.0;
+                let peer_id = libp2p::PeerId::from_bytes(&peer_id_bytes).map_err(|_| anyhow!("Invalid peer ID"))?;
+                
+                // Send execution request to remote peer
+                // For now, we'll simulate this by returning an error
+                // A full implementation would involve:
+                // 1. Sending a network message to the remote peer
+                // 2. Waiting for the response
+                // 3. Returning the execution outcome
+                
+                tracing::info!("Would send remote execution request to peer {:?} for program {:?}", peer_id, program);
+                return Err(anyhow!("Remote execution not yet implemented. Program hosted by peer {:?}.", peer_id));
+            }
+        }
+        
+        Err(anyhow!("No peers found hosting program {:?}", program))
     }
 
     /// Used by local RPC paths to ingest and disseminate freshly created blobs.
@@ -831,6 +870,17 @@ impl DagEngine {
                 };
                 TransferResponse::Program(resp)
             }
+            TransferRequest::ProgramChunk { id, chunk_idx } => {
+                let resp = match self.program_store.get_program_chunk(&id, chunk_idx) {
+                    Ok(chunk_data) => chunk_data,
+                    _ => None,
+                };
+                TransferResponse::ProgramChunk {
+                    id,
+                    chunk_idx,
+                    chunk_data: resp,
+                }
+            }
             TransferRequest::Blob(bid) => {
                 let resp = match self.blob_store.metadata(&bid) {
                     Ok(Some(meta)) => Some(BlobBroadcast { meta }),
@@ -879,6 +929,12 @@ impl DagEngine {
             TransferRequest::PushProgram(bcast) => {
                 self.handle_program_broadcast(peer, bcast.clone()).await?;
                 TransferResponse::Program(None)
+            }
+            #[allow(unused_variables)]
+            TransferRequest::PushProgramChunk { id, chunk_idx, chunk_data } => {
+                // TODO: Implement chunk storage logic
+                // For now, we'll just acknowledge receipt
+                TransferResponse::Ack
             }
             TransferRequest::PushBlob(bcast) => {
                 self.handle_blob_broadcast(peer, bcast.clone()).await?;

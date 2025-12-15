@@ -46,10 +46,12 @@ pub enum NetworkMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransferRequest {
     Program(ProgramId),
+    ProgramChunk { id: ProgramId, chunk_idx: usize },
     Blob(BlobId),
     BlobChunk { id: BlobId, chunk_idx: u32 },
     Execution([u8; 32]),
     PushProgram(ProgramBroadcast),
+    PushProgramChunk { id: ProgramId, chunk_idx: usize, chunk_data: Vec<u8> },
     PushBlob(BlobBroadcast),
     PushExecution(ExecutionBroadcast),
     Sync(SyncSnapshot),
@@ -58,6 +60,11 @@ pub enum TransferRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransferResponse {
     Program(Option<ProgramBroadcast>),
+    ProgramChunk {
+        id: ProgramId,
+        chunk_idx: usize,
+        chunk_data: Option<Vec<u8>>,
+    },
     Blob(Option<BlobBroadcast>),
     BlobChunk {
         id: BlobId,

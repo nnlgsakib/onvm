@@ -1,4 +1,4 @@
-use crate::execution::{Job, JobStore};
+use crate::execution::{FailureReason, Job, JobStore};
 use crate::network::{NetworkHandle, NetworkMessage};
 use crate::types::ProgramId;
 use anyhow::Result;
@@ -25,6 +25,7 @@ pub struct JobDescriptor {
     pub started_at: Option<u64>,
     pub completed_at: Option<u64>,
     pub error_message: Option<String>,
+    pub failure_reason: Option<FailureReasonDescriptor>,
     pub metadata: std::collections::HashMap<String, String>,
 }
 
@@ -36,6 +37,21 @@ pub enum JobStatusDescriptor {
     Failed,
     Cancelled,
     TimedOut,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FailureReasonDescriptor {
+    ExecutionError,
+    Timeout,
+    OutOfMemory,
+    OutOfFuel,
+    InvalidProgram,
+    MissingDependency,
+    NetworkError,
+    InsufficientResources,
+    SchedulerError,
+    Unknown,
 }
 
 impl From<&Job> for JobDescriptor {
@@ -53,12 +69,27 @@ impl From<&Job> for JobDescriptor {
                 crate::execution::JobStatus::Failed => JobStatusDescriptor::Failed,
                 crate::execution::JobStatus::Cancelled => JobStatusDescriptor::Cancelled,
                 crate::execution::JobStatus::TimedOut => JobStatusDescriptor::TimedOut,
+                crate::execution::JobStatus::Expired => JobStatusDescriptor::Expired,
             },
             fuel_consumed: job.fuel_consumed,
             created_at: job.created_at,
             started_at: job.started_at,
             completed_at: job.completed_at,
             error_message: job.error_message.clone(),
+            failure_reason: job.failure_reason.as_ref().map(|r| match r {
+                FailureReason::ExecutionError => FailureReasonDescriptor::ExecutionError,
+                FailureReason::Timeout => FailureReasonDescriptor::Timeout,
+                FailureReason::OutOfMemory => FailureReasonDescriptor::OutOfMemory,
+                FailureReason::OutOfFuel => FailureReasonDescriptor::OutOfFuel,
+                FailureReason::InvalidProgram => FailureReasonDescriptor::InvalidProgram,
+                FailureReason::MissingDependency => FailureReasonDescriptor::MissingDependency,
+                FailureReason::NetworkError => FailureReasonDescriptor::NetworkError,
+                FailureReason::InsufficientResources => {
+                    FailureReasonDescriptor::InsufficientResources
+                }
+                FailureReason::SchedulerError => FailureReasonDescriptor::SchedulerError,
+                FailureReason::Unknown => FailureReasonDescriptor::Unknown,
+            }),
             metadata: job.metadata.clone(),
         }
     }
@@ -142,7 +173,21 @@ impl JobSyncManager {
             JobStatusDescriptor::Failed => crate::execution::JobStatus::Failed,
             JobStatusDescriptor::Cancelled => crate::execution::JobStatus::Cancelled,
             JobStatusDescriptor::TimedOut => crate::execution::JobStatus::TimedOut,
+            JobStatusDescriptor::Expired => crate::execution::JobStatus::Expired,
         };
+
+        let failure_reason = broadcast.job.failure_reason.map(|r| match r {
+            FailureReasonDescriptor::ExecutionError => FailureReason::ExecutionError,
+            FailureReasonDescriptor::Timeout => FailureReason::Timeout,
+            FailureReasonDescriptor::OutOfMemory => FailureReason::OutOfMemory,
+            FailureReasonDescriptor::OutOfFuel => FailureReason::OutOfFuel,
+            FailureReasonDescriptor::InvalidProgram => FailureReason::InvalidProgram,
+            FailureReasonDescriptor::MissingDependency => FailureReason::MissingDependency,
+            FailureReasonDescriptor::NetworkError => FailureReason::NetworkError,
+            FailureReasonDescriptor::InsufficientResources => FailureReason::InsufficientResources,
+            FailureReasonDescriptor::SchedulerError => FailureReason::SchedulerError,
+            FailureReasonDescriptor::Unknown => FailureReason::Unknown,
+        });
 
         let job = Job {
             id: job_id,
@@ -158,6 +203,8 @@ impl JobSyncManager {
             completed_at: broadcast.job.completed_at,
             retry_count: 0,
             max_retries: 3,
+            ttl_ms: None,
+            failure_reason,
             metadata: broadcast.job.metadata,
             logs: Vec::new(),
         };

@@ -1,4 +1,4 @@
-use super::job::{JobId, JobStatus, JobStore, LogLevel};
+use super::job::{FailureReason, JobId, JobStatus, JobStore, LogLevel};
 use super::manifest::{JobManifest, ResourceRequirements};
 use super::runtime::ExecutionEngine;
 use super::ProgramStore;
@@ -137,9 +137,8 @@ impl JobExecutor {
                 );
             }
             Ok(Err(e)) => {
-                job.status = JobStatus::Failed;
-                job.error_message = Some(e.to_string());
-                job.add_log(LogLevel::Error, format!("Execution failed: {}", e));
+                let reason = Self::classify_error(&e);
+                job.set_failure(reason, format!("Execution failed: {}", e));
 
                 if job.can_retry() {
                     job.retry_count += 1;
@@ -155,6 +154,7 @@ impl JobExecutor {
             }
             Err(_) => {
                 job.status = JobStatus::TimedOut;
+                job.failure_reason = Some(FailureReason::Timeout);
                 job.error_message = Some(format!(
                     "Execution timed out after {}ms",
                     manifest.resources.timeout_ms
@@ -212,6 +212,24 @@ impl JobExecutor {
         match self.manifest_store.get(program_id)? {
             Some(manifest) => Ok(manifest),
             None => Ok(JobManifest::default()),
+        }
+    }
+
+    fn classify_error(error: &anyhow::Error) -> FailureReason {
+        let err_str = error.to_string().to_lowercase();
+
+        if err_str.contains("out of fuel") || err_str.contains("fuel") {
+            FailureReason::OutOfFuel
+        } else if err_str.contains("out of memory") || err_str.contains("memory") {
+            FailureReason::OutOfMemory
+        } else if err_str.contains("not found") || err_str.contains("missing") {
+            FailureReason::MissingDependency
+        } else if err_str.contains("invalid") || err_str.contains("malformed") {
+            FailureReason::InvalidProgram
+        } else if err_str.contains("network") || err_str.contains("connection") {
+            FailureReason::NetworkError
+        } else {
+            FailureReason::ExecutionError
         }
     }
 

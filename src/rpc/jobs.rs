@@ -332,6 +332,7 @@ fn job_status_to_string(status: &JobStatus) -> String {
         JobStatus::Failed => "failed".to_string(),
         JobStatus::Cancelled => "cancelled".to_string(),
         JobStatus::TimedOut => "timed_out".to_string(),
+        JobStatus::Expired => "expired".to_string(),
     }
 }
 

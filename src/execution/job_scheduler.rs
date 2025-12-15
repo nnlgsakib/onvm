@@ -1,6 +1,7 @@
 use super::health::HealthReporter;
-use super::job::{Job, JobId, JobStatus, JobStore, LogLevel};
+use super::job::{FailureReason, Job, JobId, JobStatus, JobStore, LogLevel};
 use super::job_executor::JobExecutor;
+use super::job_resources::{JobResourceMetrics, ResourceTracker};
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -8,14 +9,29 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tokio::time::interval;
 
+#[derive(Debug, Clone, Copy)]
+pub enum RetryStrategy {
+    ExponentialBackoff,
+    LinearBackoff,
+    FixedDelay,
+}
+
+impl Default for RetryStrategy {
+    fn default() -> Self {
+        Self::ExponentialBackoff
+    }
+}
+
 pub struct JobScheduler {
     executor: Arc<JobExecutor>,
     job_store: Arc<JobStore>,
     pending_queue: Arc<RwLock<VecDeque<JobId>>>,
     max_concurrent: usize,
     running_count: Arc<RwLock<usize>>,
-    retry_backoff_ms: u64,
+    retry_strategy: RetryStrategy,
+    base_retry_backoff_ms: u64,
     health_reporter: Option<Arc<HealthReporter>>,
+    resource_tracker: Option<Arc<ResourceTracker>>,
 }
 
 impl JobScheduler {
@@ -30,13 +46,29 @@ impl JobScheduler {
             pending_queue: Arc::new(RwLock::new(VecDeque::new())),
             max_concurrent,
             running_count: Arc::new(RwLock::new(0)),
-            retry_backoff_ms: 5000,
+            retry_strategy: RetryStrategy::default(),
+            base_retry_backoff_ms: 5000,
             health_reporter: None,
+            resource_tracker: None,
         }
+    }
+
+    pub fn with_retry_strategy(mut self, strategy: RetryStrategy) -> Self {
+        self.retry_strategy = strategy;
+        self
+    }
+
+    pub fn with_base_backoff(mut self, backoff_ms: u64) -> Self {
+        self.base_retry_backoff_ms = backoff_ms;
+        self
     }
 
     pub fn set_health_reporter(&mut self, reporter: Arc<HealthReporter>) {
         self.health_reporter = Some(reporter);
+    }
+
+    pub fn set_resource_tracker(&mut self, tracker: Arc<ResourceTracker>) {
+        self.resource_tracker = Some(tracker);
     }
 
     pub async fn start(self: Arc<Self>) {
@@ -56,6 +88,8 @@ impl JobScheduler {
 
         self.check_timeouts().await?;
 
+        self.check_ttl_expiration().await?;
+
         let running = *self.running_count.read().await;
         let available_slots = self.max_concurrent.saturating_sub(running);
 
@@ -70,6 +104,7 @@ impl JobScheduler {
                 let running_count = Arc::clone(&self.running_count);
                 let job_store = Arc::clone(&self.job_store);
                 let health_reporter = self.health_reporter.clone();
+                let resource_tracker = self.resource_tracker.clone();
 
                 {
                     let mut count = running_count.write().await;
@@ -78,14 +113,21 @@ impl JobScheduler {
 
                 tokio::spawn(async move {
                     let start_time = SystemTime::now();
+
                     let result = executor.execute_job(&job_id).await;
+
+                    let duration_ms = start_time
+                        .elapsed()
+                        .unwrap_or(Duration::from_secs(0))
+                        .as_millis() as u64;
 
                     if let Err(e) = result {
                         tracing::error!("job {job_id} execution error: {e:?}");
                         if let Ok(Some(mut job)) = job_store.get(&job_id) {
-                            job.status = JobStatus::Failed;
-                            job.error_message = Some(e.to_string());
-                            job.add_log(LogLevel::Error, format!("Scheduler error: {e}"));
+                            job.set_failure(
+                                FailureReason::SchedulerError,
+                                format!("Scheduler error: {e}"),
+                            );
                             let _ = job_store.update(&job);
 
                             if let Some(ref reporter) = health_reporter {
@@ -93,17 +135,23 @@ impl JobScheduler {
                             }
                         }
                     } else if let Ok(Some(job)) = job_store.get(&job_id) {
+                        if let Some(ref tracker) = resource_tracker {
+                            let mut metrics = JobResourceMetrics::new(job_id);
+                            metrics.fuel_consumed = job.fuel_consumed;
+                            metrics.execution_duration_ms = duration_ms;
+                            let _ = tracker.record_metrics(&metrics);
+                        }
+
                         if let Some(ref reporter) = health_reporter {
                             match job.status {
                                 JobStatus::Completed => {
-                                    let duration_ms = start_time
-                                        .elapsed()
-                                        .unwrap_or(Duration::from_secs(0))
-                                        .as_millis() as u64;
                                     reporter.record_job_completed(job.fuel_consumed, duration_ms);
                                 }
                                 JobStatus::Cancelled => {
                                     reporter.record_job_cancelled();
+                                }
+                                JobStatus::Failed => {
+                                    reporter.record_job_failed();
                                 }
                                 _ => {}
                             }
@@ -130,7 +178,7 @@ impl JobScheduler {
 
         for job in pending {
             if job.retry_count > 0 {
-                let backoff = self.retry_backoff_ms * (1u64 << (job.retry_count.min(5) - 1));
+                let backoff = self.calculate_backoff(job.retry_count);
                 let retry_after = job.created_at + backoff;
                 if now < retry_after {
                     continue;
@@ -146,6 +194,16 @@ impl JobScheduler {
         Ok(())
     }
 
+    fn calculate_backoff(&self, retry_count: u32) -> u64 {
+        match self.retry_strategy {
+            RetryStrategy::ExponentialBackoff => {
+                self.base_retry_backoff_ms * (1u64 << (retry_count.min(10) - 1))
+            }
+            RetryStrategy::LinearBackoff => self.base_retry_backoff_ms * retry_count as u64,
+            RetryStrategy::FixedDelay => self.base_retry_backoff_ms,
+        }
+    }
+
     async fn check_timeouts(&self) -> Result<()> {
         let running = self.job_store.list_running()?;
         let now = SystemTime::now()
@@ -159,6 +217,7 @@ impl JobScheduler {
                 if elapsed > 300_000 {
                     job.status = JobStatus::TimedOut;
                     job.completed_at = Some(now);
+                    job.failure_reason = Some(FailureReason::Timeout);
                     job.error_message = Some("Job exceeded maximum runtime".to_string());
                     job.add_log(
                         LogLevel::Error,
@@ -166,6 +225,30 @@ impl JobScheduler {
                     );
                     self.job_store.update(&job)?;
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn check_ttl_expiration(&self) -> Result<()> {
+        let pending = self.job_store.list_pending()?;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        for mut job in pending {
+            if job.is_expired(now) {
+                job.status = JobStatus::Expired;
+                job.completed_at = Some(now);
+                job.failure_reason = Some(FailureReason::Timeout);
+                job.error_message = Some(format!(
+                    "Job expired (TTL: {}ms)",
+                    job.ttl_ms.unwrap_or(0)
+                ));
+                job.add_log(LogLevel::Warn, "Job expired before execution".to_string());
+                self.job_store.update(&job)?;
             }
         }
 

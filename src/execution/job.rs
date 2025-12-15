@@ -40,6 +40,21 @@ pub enum JobStatus {
     Failed,
     Cancelled,
     TimedOut,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FailureReason {
+    ExecutionError,
+    Timeout,
+    OutOfMemory,
+    OutOfFuel,
+    InvalidProgram,
+    MissingDependency,
+    NetworkError,
+    InsufficientResources,
+    SchedulerError,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +72,10 @@ pub struct Job {
     pub completed_at: Option<u64>,
     pub retry_count: u32,
     pub max_retries: u32,
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+    #[serde(default)]
+    pub failure_reason: Option<FailureReason>,
     #[serde(default)]
     pub metadata: HashMap<String, String>,
     #[serde(default)]
@@ -106,8 +125,24 @@ impl Job {
             completed_at: None,
             retry_count: 0,
             max_retries,
+            ttl_ms: None,
+            failure_reason: None,
             metadata: HashMap::new(),
             logs: Vec::new(),
+        }
+    }
+
+    pub fn with_ttl(mut self, ttl_ms: u64) -> Self {
+        self.ttl_ms = Some(ttl_ms);
+        self
+    }
+
+    pub fn is_expired(&self, now_ms: u64) -> bool {
+        if let Some(ttl) = self.ttl_ms {
+            let age_ms = now_ms.saturating_sub(self.created_at);
+            age_ms > ttl
+        } else {
+            false
         }
     }
 
@@ -119,7 +154,7 @@ impl Job {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
-            JobStatus::Completed | JobStatus::Cancelled | JobStatus::Failed | JobStatus::TimedOut
+            JobStatus::Completed | JobStatus::Cancelled | JobStatus::Failed | JobStatus::TimedOut | JobStatus::Expired
         ) && !self.can_retry()
     }
 
@@ -140,6 +175,13 @@ impl Job {
             (Some(start), Some(end)) => Some(end.saturating_sub(start)),
             _ => None,
         }
+    }
+
+    pub fn set_failure(&mut self, reason: FailureReason, message: String) {
+        self.status = JobStatus::Failed;
+        self.failure_reason = Some(reason);
+        self.error_message = Some(message.clone());
+        self.add_log(LogLevel::Error, message);
     }
 }
 
@@ -194,10 +236,16 @@ impl JobStore {
         let mut jobs = Vec::new();
         for entry in tree.iter() {
             let (_, v) = entry?;
-            let (job, _): (Job, _) =
-                bincode::serde::decode_from_slice(&v, bincode::config::standard())?;
-            if matches!(job.status, JobStatus::Pending) {
-                jobs.push(job);
+            match bincode::serde::decode_from_slice::<Job, _>(&v, bincode::config::standard()) {
+                Ok((job, _)) => {
+                    if matches!(job.status, JobStatus::Pending) {
+                        jobs.push(job);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("skipping incompatible job entry: {e:?}");
+                    continue;
+                }
             }
         }
         jobs.sort_by_key(|j| j.created_at);
@@ -209,10 +257,16 @@ impl JobStore {
         let mut jobs = Vec::new();
         for entry in tree.iter() {
             let (_, v) = entry?;
-            let (job, _): (Job, _) =
-                bincode::serde::decode_from_slice(&v, bincode::config::standard())?;
-            if matches!(job.status, JobStatus::Running) {
-                jobs.push(job);
+            match bincode::serde::decode_from_slice::<Job, _>(&v, bincode::config::standard()) {
+                Ok((job, _)) => {
+                    if matches!(job.status, JobStatus::Running) {
+                        jobs.push(job);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("skipping incompatible job entry: {e:?}");
+                    continue;
+                }
             }
         }
         Ok(jobs)
@@ -223,9 +277,15 @@ impl JobStore {
         let mut jobs = Vec::new();
         for entry in tree.iter() {
             let (_, v) = entry?;
-            let (job, _): (Job, _) =
-                bincode::serde::decode_from_slice(&v, bincode::config::standard())?;
-            jobs.push(job);
+            match bincode::serde::decode_from_slice::<Job, _>(&v, bincode::config::standard()) {
+                Ok((job, _)) => {
+                    jobs.push(job);
+                }
+                Err(e) => {
+                    tracing::debug!("skipping incompatible job entry: {e:?}");
+                    continue;
+                }
+            }
         }
         jobs.sort_by_key(|j| j.created_at);
         Ok(jobs)

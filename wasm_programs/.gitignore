@@ -1,3 +1,4 @@
 target/
 # school_management/
 node_modules/
+.next/

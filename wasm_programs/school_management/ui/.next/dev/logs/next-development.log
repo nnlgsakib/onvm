@@ -1,0 +1,50 @@
+[00:00:00.631] Server  LOG      ✓ Ready in 401ms
+[00:00:04.212] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[00:00:04.669] Browser ERROR   ONVM Client Error: {}
+[00:00:04.669] Browser ERROR   Failed to fetch stats: {}
+[00:00:04.669] Browser LOG     %c[Vercel Web Analytics]%c Debug mode is enabled by default in development. No requests will be sent to the server. color: rgb(120, 120, 120) color: inherit
+[00:00:04.669] Browser LOG     %c[Vercel Web Analytics]%c Running queued event color: rgb(120, 120, 120) color: inherit pageview {"path":"/","route":"/"}
+[00:00:04.669] Browser LOG     %c[Vercel Web Analytics]%c [pageview] http://localhost:3000/ color: rgb(120, 120, 120) color: inherit {"dp":"/","o":"http://localhost:3000/","sdkn":"@vercel/analytics/next","sdkv":"1.3.1","sv":"0.1.3","ts":1765809888969}
+[00:00:10.986] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[00:00:11.106] Browser ERROR   ONVM Client Error: {}
+[00:00:11.106] Browser ERROR   Failed to fetch stats: {}
+[00:00:11.106] Browser LOG     %c[Vercel Web Analytics]%c Debug mode is enabled by default in development. No requests will be sent to the server. color: rgb(120, 120, 120) color: inherit
+[00:00:11.106] Browser LOG     %c[Vercel Web Analytics]%c Running queued event color: rgb(120, 120, 120) color: inherit pageview {"path":"/","route":"/"}
+[00:00:11.106] Browser LOG     %c[Vercel Web Analytics]%c [pageview] http://localhost:3000/ color: rgb(120, 120, 120) color: inherit {"dp":"/","o":"http://localhost:3000/","sdkn":"@vercel/analytics/next","sdkv":"1.3.1","sv":"0.1.3","ts":1765809895673}
+[00:00:21.188] Browser ERROR   ONVM Client Error: {}
+[00:00:21.188] Browser ERROR   Failed to fetch students: {}
+[00:00:21.188] Browser ERROR   ONVM Client Error: {}
+[00:00:21.189] Browser ERROR   Failed to fetch students: {}
+[00:00:23.644] Browser ERROR   ONVM Client Error: {}
+[00:00:23.644] Browser ERROR   Failed to fetch teachers: {}
+[00:00:23.644] Browser ERROR   ONVM Client Error: {}
+[00:00:23.644] Browser ERROR   Failed to fetch teachers: {}
+[00:00:24.449] Browser ERROR   ONVM Client Error: {}
+[00:00:24.449] Browser ERROR   Failed to fetch students: {}
+[00:00:24.449] Browser ERROR   ONVM Client Error: {}
+[00:00:24.449] Browser ERROR   Failed to fetch students: {}
+[00:00:48.438] Browser ERROR   ONVM Client Error: {}
+[00:00:48.438] Browser ERROR   Failed to fetch stats: {}
+[00:00:48.438] Browser ERROR   ONVM Client Error: {}
+[00:00:48.438] Browser ERROR   Failed to fetch stats: {}
+[00:01:52.365] Server  LOG      ✓ Compiled in 58ms
+[00:01:59.291] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[00:01:59.291] Browser INFO    Provider initialised
+[00:01:59.291] Browser INFO    Provider initialised
+[00:01:59.291] Browser INFO    Provider initialised
+[00:01:59.291] Browser INFO    TronLink initiated
+[00:01:59.457] Browser LOG     %c[Vercel Web Analytics]%c Debug mode is enabled by default in development. No requests will be sent to the server. color: rgb(120, 120, 120) color: inherit
+[00:01:59.458] Browser LOG     %c[Vercel Web Analytics]%c Running queued event color: rgb(120, 120, 120) color: inherit pageview {"path":"/","route":"/"}
+[00:01:59.458] Browser LOG     %c[Vercel Web Analytics]%c [pageview] http://localhost:3000/ color: rgb(120, 120, 120) color: inherit {"dp":"/","o":"http://localhost:3000/","sdkn":"@vercel/analytics/next","sdkv":"1.3.1","sv":"0.1.3","ts":1765810004018}
+[00:02:09.938] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[00:02:10.092] Browser LOG     %c[Vercel Web Analytics]%c Debug mode is enabled by default in development. No requests will be sent to the server. color: rgb(120, 120, 120) color: inherit
+[00:02:10.092] Browser LOG     %c[Vercel Web Analytics]%c Running queued event color: rgb(120, 120, 120) color: inherit pageview {"path":"/","route":"/"}
+[00:02:10.092] Browser LOG     %c[Vercel Web Analytics]%c [pageview] http://localhost:3000/ color: rgb(120, 120, 120) color: inherit {"dp":"/","o":"http://localhost:3000/","sdkn":"@vercel/analytics/next","sdkv":"1.3.1","sv":"0.1.3","ts":1765810014647}
+[00:02:32.599] Browser INFO    %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold
+[00:02:32.599] Browser INFO    Provider initialised
+[00:02:32.599] Browser INFO    Provider initialised
+[00:02:32.599] Browser INFO    Provider initialised
+[00:02:32.599] Browser INFO    TronLink initiated
+[00:02:32.716] Browser LOG     %c[Vercel Web Analytics]%c Debug mode is enabled by default in development. No requests will be sent to the server. color: rgb(120, 120, 120) color: inherit
+[00:02:32.716] Browser LOG     %c[Vercel Web Analytics]%c Running queued event color: rgb(120, 120, 120) color: inherit pageview {"path":"/","route":"/"}
+[00:02:32.716] Browser LOG     %c[Vercel Web Analytics]%c [pageview] http://localhost:3000/ color: rgb(120, 120, 120) color: inherit {"dp":"/","o":"http://localhost:3000/","sdkn":"@vercel/analytics/next","sdkv":"1.3.1","sv":"0.1.3","ts":1765810037285}

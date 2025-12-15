@@ -11,6 +11,8 @@ use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use axum::http::Method;
+use tower_http::cors::{CorsLayer, Any};
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -118,6 +120,12 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
         job_sync_handle.start().await;
     });
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_headers(Any)
+        .allow_credentials(false);
+
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/blobs", post(upload_blob))
@@ -128,6 +136,7 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
         .merge(job_routes().with_state(job_ctx))
         .merge(health_routes().with_state(health_ctx))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_SIZE_BYTES))
+        .layer(cors)
         .with_state(ctx);
 
     let mut port = addr.port();

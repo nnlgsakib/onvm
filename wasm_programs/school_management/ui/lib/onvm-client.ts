@@ -254,7 +254,7 @@ let schoolClient: SchoolManagementClient | null = null;
 
 export const getSchoolClient = (): SchoolManagementClient => {
   if (!schoolClient) {
-    schoolClient = new SchoolManagementClient(RPC_ENDPOINT, "1c7c474ed38bb6a7dd5531102a8edcef6409a802b3005d8697c47e7e561855f6");
+    schoolClient = new SchoolManagementClient(RPC_ENDPOINT, "ddce10e9bc27953dac0458ac16aa9908aea871b97ec76602c06dc5efaac3fd40");
   }
   return schoolClient;
 };

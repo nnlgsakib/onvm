@@ -656,6 +656,9 @@ impl DagEngine {
                 assembled.extend_from_slice(&chunk);
                 continue;
             }
+
+            let mut fetched = false;
+            // Try peers sequentially to avoid congestion
             for peer in &peers {
                 self.network.request_transfer(
                     *peer,
@@ -664,31 +667,40 @@ impl DagEngine {
                         chunk_idx: idx as u32,
                     },
                 );
-            }
-            let deadline = Instant::now() + Duration::from_secs(15);
-            loop {
-                if let Some(chunk) = self.blob_store.try_load_chunk(&meta, idx) {
-                    assembled.extend_from_slice(&chunk);
-                    if Self::should_log_chunk(idx + 1, total_chunks) {
-                        tracing::info!(
-                            "blob {} fetched chunk {}/{}",
-                            hex::encode(id.0),
-                            idx + 1,
-                            total_chunks
-                        );
+                
+                // Wait up to 3 seconds per peer
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    if let Some(chunk) = self.blob_store.try_load_chunk(&meta, idx) {
+                        assembled.extend_from_slice(&chunk);
+                        fetched = true;
+                        if Self::should_log_chunk(idx + 1, total_chunks) {
+                            tracing::info!(
+                                "blob {} fetched chunk {}/{}",
+                                hex::encode(id.0),
+                                idx + 1,
+                                total_chunks
+                            );
+                        }
+                        break;
                     }
-                    break;
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                if Instant::now() >= deadline {
-                    let mut pending = self.pending_blob_fetches.write().await;
-                    pending.remove(id);
-                    return Err(anyhow!(
-                        "blob chunk fetch timed out for {} chunk {}",
-                        hex::encode(id.0),
-                        idx
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                if fetched { break; }
+            }
+
+            if !fetched {
+                 let mut pending = self.pending_blob_fetches.write().await;
+                 pending.remove(id);
+                 return Err(anyhow!(
+                     "blob chunk fetch failed for {} chunk {} (tried {} peers)",
+                     hex::encode(id.0),
+                     idx,
+                     peers.len()
+                 ));
             }
         }
         {
@@ -932,8 +944,14 @@ impl DagEngine {
             }
             #[allow(unused_variables)]
             TransferRequest::PushProgramChunk { id, chunk_idx, chunk_data } => {
-                // TODO: Implement chunk storage logic
-                // For now, we'll just acknowledge receipt
+                match self.program_store.store_chunk(&id, chunk_idx, &chunk_data) {
+                    Ok(_) => {
+                        tracing::debug!("stored chunk {} for program {}", chunk_idx, id);
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to store chunk {} for program {}: {}", chunk_idx, id, e);
+                    }
+                }
                 TransferResponse::Ack
             }
             TransferRequest::PushBlob(bcast) => {

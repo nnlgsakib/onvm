@@ -124,10 +124,9 @@ impl ProgramStore {
     
     pub fn replicate_chunked(&self, chunk_meta: &ChunkedProgramMetadata, chunks: &[(usize, Vec<u8>)]) -> Result<()> {
         let chunks_tree = self.db.open_tree("program_chunks")?;
-        let meta_tree = self.db.open_tree("program_chunk_meta")?;
+        let _meta_tree = self.db.open_tree("program_chunk_meta")?;
         
         // Verify chunk data integrity
-        let mut total_size = 0;
         for (index, chunk) in chunks {
             // Verify chunk index is within bounds
             if *index >= chunk_meta.chunk_count {
@@ -149,21 +148,37 @@ impl ProgramStore {
             key.extend_from_slice(&(*index as u32).to_be_bytes());
             
             chunks_tree.insert(key, &chunk[..])?;
-            total_size += chunk.len();
         }
-        
-        // Verify total size matches metadata
-        let expected_size: usize = chunk_meta.chunk_sizes.iter().sum();
-        if total_size != expected_size {
-            return Err(anyhow::anyhow!("chunk size mismatch: expected {}, got {}", expected_size, total_size));
-        }
-        
-        // Store chunk metadata
-        let encoded = bincode::serde::encode_to_vec(chunk_meta, bincode::config::standard())?;
-        meta_tree.insert(chunk_meta.program_id.0, encoded)?;
         
         chunks_tree.flush()?;
-        meta_tree.flush()?;
+        Ok(())
+    }
+
+    pub fn store_chunk(&self, id: &ProgramId, chunk_idx: usize, chunk_data: &[u8]) -> Result<()> {
+        let chunks_tree = self.db.open_tree("program_chunks")?;
+        let meta_tree = self.db.open_tree("program_chunk_meta")?;
+        
+        // Retrieve metadata to verify chunk
+        let meta_key = id.0;
+        let meta_bytes = meta_tree.get(meta_key)?.ok_or_else(|| anyhow::anyhow!("metadata not found for program"))?;
+        let (chunk_meta, _): (ChunkedProgramMetadata, usize) = bincode::serde::decode_from_slice(&meta_bytes, bincode::config::standard())?;
+        
+        if chunk_idx >= chunk_meta.chunk_count {
+             return Err(anyhow::anyhow!("chunk index out of bounds"));
+        }
+        
+        if let Some(expected_size) = chunk_meta.chunk_sizes.get(chunk_idx) {
+            if chunk_data.len() != *expected_size {
+                 return Err(anyhow::anyhow!("chunk size mismatch"));
+            }
+        }
+        
+        let mut key = Vec::with_capacity(36);
+        key.extend_from_slice(&id.0);
+        key.extend_from_slice(&(chunk_idx as u32).to_be_bytes());
+        
+        chunks_tree.insert(key, chunk_data)?;
+        chunks_tree.flush()?;
         Ok(())
     }
 

@@ -14,34 +14,87 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { getSchoolClient } from "@/lib/onvm-client"
-import { Grade } from "@/types"
+import { Course, Grade, Student } from "@/types"
 
 const PROGRAM_ID = "918c95aa44b129ae2315698637afbb339b7cb43ed6115e433605ae172f617bc4"
 
 export function GradesView() {
   const [grades, setGrades] = useState<Grade[]>([])
+  const [students, setStudents] = useState<Student[]>([])
+  const [courses, setCourses] = useState<Course[]>([])
   const [loading, setLoading] = useState(true)
   const [searchQuery, setSearchQuery] = useState("")
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
-  const [formData, setFormData] = useState<Partial<Grade>>({})
+  const [formData, setFormData] = useState<Partial<Grade>>({
+    date: new Date().toISOString().split("T")[0],
+  })
   
   const client = getSchoolClient()
   
   useEffect(() => {
     fetchGrades()
+    fetchStudents()
+    fetchCourses()
   }, [])
   
-  const fetchGrades = async () => {
+  const fetchStudents = async () => {
     try {
-      setLoading(true)
-      // This is a simplification - in a real app, you might need to fetch grades differently
-      // For now, we'll just use listStudents as a placeholder
       const response = await client.listStudents()
       if (response.status === "success" && response.data) {
-        // This is just placeholder data - you would need to implement proper grade fetching
-        setGrades([])
+        setStudents(response.data)
       }
+    } catch (error) {
+      console.error("Failed to fetch students:", error)
+    }
+  }
+
+  const fetchCourses = async () => {
+    try {
+      const response = await client.listCourses()
+      if (response.status === "success" && response.data) {
+        setCourses(response.data)
+      }
+    } catch (error) {
+      console.error("Failed to fetch courses:", error)
+    }
+  }
+  
+  const fetchGrades = async () => {
+    setLoading(true)
+    try {
+      const allGrades: Grade[] = []
+      // Ensure students and courses are loaded before trying to fetch grades
+      // This might involve chaining promises or using a single useEffect for all data
+      if (students.length === 0) await fetchStudents()
+      if (courses.length === 0) await fetchCourses()
+
+      const currentStudents = students.length > 0 ? students : (await client.listStudents()).data || []
+      const currentCourses = courses.length > 0 ? courses : (await client.listCourses()).data || []
+
+      for (const student of currentStudents) {
+        const response = await client.getStudentGrades(student.id)
+        if (response.status === "success" && response.data) {
+          const studentGrades = response.data.map((grade: Grade) => {
+            const studentInfo = currentStudents.find(s => s.id === grade.student_id)
+            const courseInfo = currentCourses.find(c => c.id === grade.course_id)
+            return {
+              ...grade,
+              studentName: studentInfo?.name || "Unknown Student",
+              courseName: courseInfo?.name || "Unknown Course",
+            }
+          })
+          allGrades.push(...studentGrades)
+        }
+      }
+      setGrades(allGrades)
     } catch (error) {
       console.error("Failed to fetch grades:", error)
     } finally {
@@ -50,21 +103,21 @@ export function GradesView() {
   }
   
   const handleAddGrade = async () => {
-    if (formData.studentId && formData.courseId && formData.score) {
+    if (formData.student_id && formData.course_id && formData.score) {
       try {
         const newGrade: any = {
           id: Date.now().toString(),
-          student_id: formData.studentId,
-          course_id: formData.courseId,
+          student_id: formData.student_id,
+          course_id: formData.course_id,
           score: formData.score,
-          date: formData.date || new Date().toISOString().split("T")[0],
+          date: formData.date,
         }
         
         const response = await client.assignGrade(newGrade)
         if (response.status === "success") {
           await fetchGrades() // Refresh the list
           setIsAddDialogOpen(false)
-          setFormData({})
+          setFormData({ date: new Date().toISOString().split("T")[0] })
         } else {
           console.error("Failed to assign grade:", response.error)
         }
@@ -76,8 +129,8 @@ export function GradesView() {
 
   const filteredGrades = grades.filter(
     (grade) =>
-      (grade as any).student_name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (grade as any).course_name?.toLowerCase().includes(searchQuery.toLowerCase()),
+      grade.studentName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      grade.courseName?.toLowerCase().includes(searchQuery.toLowerCase()),
   )
   
   if (loading) {
@@ -147,16 +200,17 @@ export function GradesView() {
                   <td className="px-6 py-4 whitespace-nowrap">
                     <div className="flex items-center gap-3">
                       <div className="flex size-8 items-center justify-center rounded-full bg-primary/10 text-primary font-semibold text-xs">
-                        {grade.studentName
+                        {/* Assuming studentName is available through a join or direct property */}
+                        {((grade as any).studentName || "?")
                           .split(" ")
-                          .map((n) => n[0])
+                          .map((n: string) => n[0])
                           .join("")}
                       </div>
-                      <span className="text-sm font-medium text-foreground">{grade.studentName}</span>
+                      <span className="text-sm font-medium text-foreground">{(grade as any).studentName}</span>
                     </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
-                    <span className="text-sm text-foreground">{grade.courseName}</span>
+                    <span className="text-sm text-foreground">{(grade as any).courseName}</span>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
                     <span className="text-sm font-semibold text-foreground">{grade.score}%</span>
@@ -187,22 +241,40 @@ export function GradesView() {
           </DialogHeader>
           <div className="space-y-4 py-4">
             <div className="space-y-2">
-              <Label htmlFor="student">Student Name</Label>
-              <Input
-                id="student"
-                placeholder="Emma Wilson"
-                value={formData.studentName || ""}
-                onChange={(e) => setFormData({ ...formData, studentName: e.target.value })}
-              />
+              <Label htmlFor="student-id">Student</Label>
+              <Select
+                onValueChange={(value) => setFormData({ ...formData, student_id: value })}
+                value={formData.student_id || ""}
+              >
+                <SelectTrigger id="student-id">
+                  <SelectValue placeholder="Select a student" />
+                </SelectTrigger>
+                <SelectContent>
+                  {students.map((student) => (
+                    <SelectItem key={student.id} value={student.id}>
+                      {student.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="course">Course Name</Label>
-              <Input
-                id="course"
-                placeholder="Advanced Mathematics"
-                value={formData.courseName || ""}
-                onChange={(e) => setFormData({ ...formData, courseName: e.target.value })}
-              />
+              <Label htmlFor="course-id">Course</Label>
+              <Select
+                onValueChange={(value) => setFormData({ ...formData, course_id: value })}
+                value={formData.course_id || ""}
+              >
+                <SelectTrigger id="course-id">
+                  <SelectValue placeholder="Select a course" />
+                </SelectTrigger>
+                <SelectContent>
+                  {courses.map((course) => (
+                    <SelectItem key={course.id} value={course.id}>
+                      {course.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-2">

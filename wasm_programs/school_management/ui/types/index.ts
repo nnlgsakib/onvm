@@ -30,4 +30,6 @@ export interface Grade {
   course_id: string;
   score: number;
   date: string;
+  studentName?: string;
+  courseName?: string;
 }

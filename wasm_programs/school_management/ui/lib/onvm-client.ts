@@ -8,7 +8,7 @@ import type {
   Grade
 } from '@/types'
 
-const RPC_ENDPOINT = 'http://localhost:8081';
+const RPC_ENDPOINT = 'http://localhost:8080';
 
 export class SchoolManagementClient {
   private rpcEndpoint: string;
@@ -254,7 +254,7 @@ let schoolClient: SchoolManagementClient | null = null;
 
 export const getSchoolClient = (): SchoolManagementClient => {
   if (!schoolClient) {
-    schoolClient = new SchoolManagementClient(RPC_ENDPOINT, "ddce10e9bc27953dac0458ac16aa9908aea871b97ec76602c06dc5efaac3fd40");
+    schoolClient = new SchoolManagementClient(RPC_ENDPOINT, "051f4454558b730b4889d64a2c47ecb7fd0cf5dfae9f83682e6ee84288a7c1be");
   }
   return schoolClient;
 };

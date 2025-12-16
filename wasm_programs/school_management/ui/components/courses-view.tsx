@@ -119,7 +119,7 @@ export function CoursesView() {
             <div className="space-y-3 mb-4">
               <div className="flex items-center gap-2 text-sm">
                 <div className="flex size-8 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 font-semibold text-xs">
-                  {course.teacherName
+                  {(course.teacherName || "?")
                     .split(" ")
                     .map((n) => n[0])
                     .join("")}
@@ -128,7 +128,7 @@ export function CoursesView() {
               </div>
               <div className="flex items-center gap-2 text-sm">
                 <Users className="size-4 text-muted-foreground" />
-                <span className="text-muted-foreground">{course.studentIds.length} students enrolled</span>
+                <span className="text-muted-foreground">{(course.studentIds || []).length} students enrolled</span>
               </div>
             </div>
 

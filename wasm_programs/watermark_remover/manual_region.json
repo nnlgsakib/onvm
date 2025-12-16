@@ -1,0 +1,14 @@
+{
+  "image_data": "base64-encoded-image-data-here",
+  "operation": {
+    "type": "manual_region",
+    "x": 100,
+    "y": 50,
+    "width": 200,
+    "height": 80
+  },
+  "parameters": {
+    "method": "content_aware",
+    "feather_edges": true
+  }
+}

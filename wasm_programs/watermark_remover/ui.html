@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Watermark Remover - ONVM</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .subtitle {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+
+        .panel {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            backdrop-filter: blur(10px);
+        }
+
+        .panel-title {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: #333;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: linear-gradient(45deg, #f8f9ff 0%, #fff 100%);
+        }
+
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: linear-gradient(45deg, #f0f2ff 0%, #fff 100%);
+        }
+
+        .upload-area.dragging {
+            border-color: #4CAF50;
+            background: linear-gradient(45deg, #f1f8f1 0%, #fff 100%);
+        }
+
+        .upload-icon {
+            font-size: 3rem;
+            margin-bottom: 15px;
+            color: #667eea;
+        }
+
+        .upload-text {
+            color: #666;
+            font-size: 1rem;
+            margin-bottom: 10px;
+        }
+
+        .upload-hint {
+            color: #999;
+            font-size: 0.9rem;
+        }
+
+        .image-preview {
+            position: relative;
+            border-radius: 15px;
+            overflow: hidden;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+            background: #f5f5f5;
+            min-height: 200px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .image-preview img {
+            width: 100%;
+            height: auto;
+            display: block;
+            border-radius: 12px;
+        }
+
+        .empty-state {
+            color: #999;
+            font-size: 1.1rem;
+            text-align: center;
+            padding: 40px 20px;
+        }
+
+        .controls-section {
+            margin-bottom: 25px;
+        }
+
+        .control-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+            font-size: 0.95rem;
+        }
+
+        select, input[type="number"], input[type="range"], input[type="color"] {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e1e5e9;
+            border-radius: 10px;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            background: #f8f9fa;
+        }
+
+        select:focus, input:focus {
+            outline: none;
+            border-color: #667eea;
+            background: white;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .manual-controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+
+        .color-controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .color-picker {
+            width: 60px;
+            height: 40px;
+            border-radius: 8px;
+            border: 2px solid #e1e5e9;
+            cursor: pointer;
+        }
+
+        .process-btn {
+            width: 100%;
+            padding: 15px 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .process-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5);
+        }
+
+        .process-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .processing {
+            display: inline-block;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        .metadata {
+            background: linear-gradient(135deg, #f8f9ff 0%, #fff 100%);
+            border-radius: 12px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+
+        .metadata-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #e1e5e9;
+            font-size: 0.95rem;
+        }
+
+        .metadata-item:last-child {
+            border-bottom: none;
+        }
+
+        .metadata-label {
+            color: #666;
+            font-weight: 500;
+        }
+
+        .metadata-value {
+            color: #333;
+            font-weight: 600;
+        }
+
+        .status-message {
+            padding: 15px 20px;
+            border-radius: 10px;
+            margin-top: 20px;
+            font-weight: 500;
+            display: none;
+        }
+
+        .status-success {
+            background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
+            color: white;
+        }
+
+        .status-error {
+            background: linear-gradient(135deg, #f44336 0%, #da190b 100%);
+            color: white;
+        }
+
+        .download-btn {
+            width: 100%;
+            padding: 15px 30px;
+            background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(76, 175, 80, 0.4);
+            margin-top: 15px;
+        }
+
+        .download-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(76, 175, 80, 0.5);
+        }
+
+        .loading-spinner {
+            display: none;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        @media (max-width: 768px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+            
+            h1 {
+                font-size: 2rem;
+            }
+            
+            .manual-controls {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎨 Watermark Remover</h1>
+            <p class="subtitle">Advanced AI-powered watermark removal using ONVM</p>
+        </header>
+
+        <div class="main-content">
+            <div class="panel">
+                <h2 class="panel-title">
+                    <span>📤</span> Upload Image
+                </h2>
+                
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">📸</div>
+                    <div class="upload-text">Drop your image here or click to browse</div>
+                    <div class="upload-hint">Supports: JPG, PNG, BMP (Max 10MB)</div>
+                </div>
+                <input type="file" id="fileInput" accept="image/*" style="display: none;">
+                
+                <div class="image-preview" id="originalPreview">
+                    <div class="empty-state">No image selected</div>
+                </div>
+            </div>
+
+            <div class="panel">
+                <h2 class="panel-title">
+                    <span>⚙️</span> Watermark Detection Settings
+                </h2>
+                
+                <div class="controls-section">
+                    <div class="control-group">
+                        <label for="detectionMethod">Detection Method</label>
+                        <select id="detectionMethod">
+                            <option value="auto_detect">Auto Detect</option>
+                            <option value="manual_region">Manual Region</option>
+                            <option value="brightness_threshold">Brightness Threshold</option>
+                            <option value="color_based">Color Based</option>
+                        </select>
+                    </div>
+
+                    <div id="manualRegion" style="display: none;">
+                        <div class="manual-controls">
+                            <div class="control-group">
+                                <label for="regionX">X Position</label>
+                                <input type="number" id="regionX" value="100" min="0">
+                            </div>
+                            <div class="control-group">
+                                <label for="regionY">Y Position</label>
+                                <input type="number" id="regionY" value="100" min="0">
+                            </div>
+                            <div class="control-group">
+                                <label for="regionWidth">Width</label>
+                                <input type="number" id="regionWidth" value="200" min="1">
+                            </div>
+                            <div class="control-group">
+                                <label for="regionHeight">Height</label>
+                                <input type="number" id="regionHeight" value="80" min="1">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="brightnessThreshold" style="display: none;">
+                        <div class="control-group">
+                            <label for="threshold">Brightness Threshold: <span id="thresholdValue">200</span></label>
+                            <input type="range" id="threshold" value="200" min="0" max="255">
+                        </div>
+                    </div>
+
+                    <div id="colorBased" style="display: none;">
+                        <div class="control-group">
+                            <label>Target Color</label>
+                            <div class="color-controls">
+                                <input type="color" id="targetColor" class="color-picker" value="#ffffff">
+                                <input type="number" id="colorTolerance" value="30" min="0" max="100" placeholder="Tolerance">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="control-group">
+                        <label for="removalMethod">Removal Method</label>
+                        <select id="removalMethod">
+                            <option value="inpaint">Inpaint (Recommended)</option>
+                            <option value="blur">Gaussian Blur</option>
+                            <option value="median_filter">Median Filter</option>
+                            <option value="clone">Clone</option>
+                            <option value="content_aware">Content Aware</option>
+                        </select>
+                    </div>
+                </div>
+
+                <button class="process-btn" id="processBtn" disabled>
+                    🚀 Remove Watermark
+                </button>
+
+                <div class="loading-spinner" id="loadingSpinner"></div>
+                <div class="status-message" id="statusMessage"></div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2 class="panel-title">
+                <span>🖼️</span> Processed Result
+            </h2>
+            
+            <div class="image-preview" id="resultPreview">
+                <div class="empty-state">Process an image to see results</div>
+            </div>
+
+            <div class="metadata" id="metadata" style="display: none;">
+                <h3 style="margin-bottom: 15px; color: #333;">Processing Information</h3>
+                <div class="metadata-item">
+                    <span class="metadata-label">Original Size:</span>
+                    <span class="metadata-value" id="originalSize">-</span>
+                </div>
+                <div class="metadata-item">
+                    <span class="metadata-label">Watermark Detected:</span>
+                    <span class="metadata-value" id="watermarkDetected">-</span>
+                </div>
+                <div class="metadata-item">
+                    <span class="metadata-label">Watermark Region:</span>
+                    <span class="metadata-value" id="watermarkRegion">-</span>
+                </div>
+                <div class="metadata-item">
+                    <span class="metadata-label">Processing Time:</span>
+                    <span class="metadata-value" id="processingTime">-</span>
+                </div>
+                <div class="metadata-item">
+                    <span class="metadata-label">Method Used:</span>
+                    <span class="metadata-value" id="methodUsed">-</span>
+                </div>
+            </div>
+
+            <button class="download-btn" id="downloadBtn" style="display: none;">
+                💾 Download Result
+            </button>
+        </div>
+    </div>
+
+    <script>
+        // ONVM Client for Watermark Removal
+        class WatermarkRemoverClient {
+            constructor() {
+                this.rpcEndpoint = 'http://localhost:8080';
+                this.programId = '8fccfb9281b960be9c5af571d6b3cd9e040db8585edba1667f32443eb1cc2d10'; // Replace with actual program ID
+            }
+
+            async removeWatermark(config) {
+                try {
+                    const inputBase64 = btoa(JSON.stringify(config));
+                    
+                    const response = await fetch(`${this.rpcEndpoint}/execute`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            program_id: this.programId,
+                            input_base64: inputBase64,
+                        }),
+                    });
+
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        throw new Error(`RPC error: ${response.status} - ${errorText}`);
+                    }
+
+                    const result = await response.json();
+                    const returnData = atob(result.return_base64);
+                    return JSON.parse(returnData);
+                } catch (error) {
+                    console.error('Watermark Remover Client Error:', error);
+                    throw error;
+                }
+            }
+        }
+
+        // Initialize client
+        const client = new WatermarkRemoverClient();
+        let selectedImage = null;
+        let processedImageData = null;
+
+        // DOM elements
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const originalPreview = document.getElementById('originalPreview');
+        const resultPreview = document.getElementById('resultPreview');
+        const processBtn = document.getElementById('processBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const loadingSpinner = document.getElementById('loadingSpinner');
+        const statusMessage = document.getElementById('statusMessage');
+        const metadata = document.getElementById('metadata');
+
+        // Controls
+        const detectionMethod = document.getElementById('detectionMethod');
+        const manualRegion = document.getElementById('manualRegion');
+        const brightnessThreshold = document.getElementById('brightnessThreshold');
+        const colorBased = document.getElementById('colorBased');
+        const threshold = document.getElementById('threshold');
+        const thresholdValue = document.getElementById('thresholdValue');
+        const targetColor = document.getElementById('targetColor');
+        const colorTolerance = document.getElementById('colorTolerance');
+        const removalMethod = document.getElementById('removalMethod');
+
+        // Manual region inputs
+        const regionX = document.getElementById('regionX');
+        const regionY = document.getElementById('regionY');
+        const regionWidth = document.getElementById('regionWidth');
+        const regionHeight = document.getElementById('regionHeight');
+
+        // File upload handlers
+        uploadArea.addEventListener('click', () => fileInput.click());
+        
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragging');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragging');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragging');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFileSelect(files[0]);
+            }
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFileSelect(e.target.files[0]);
+            }
+        });
+
+        // Detection method change handler
+        detectionMethod.addEventListener('change', () => {
+            manualRegion.style.display = 'none';
+            brightnessThreshold.style.display = 'none';
+            colorBased.style.display = 'none';
+
+            switch (detectionMethod.value) {
+                case 'manual_region':
+                    manualRegion.style.display = 'block';
+                    break;
+                case 'brightness_threshold':
+                    brightnessThreshold.style.display = 'block';
+                    break;
+                case 'color_based':
+                    colorBased.style.display = 'block';
+                    break;
+            }
+        });
+
+        // Threshold slider handler
+        threshold.addEventListener('input', () => {
+            thresholdValue.textContent = threshold.value;
+        });
+
+        // Process button handler
+        processBtn.addEventListener('click', processImage);
+        downloadBtn.addEventListener('click', downloadResult);
+
+        function handleFileSelect(file) {
+            if (file.size > 10 * 1024 * 1024) {
+                showError('File size must be less than 10MB');
+                return;
+            }
+
+            if (!file.type.startsWith('image/')) {
+                showError('Please select an image file');
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                selectedImage = e.target.result;
+                displayImage(originalPreview, selectedImage);
+                processBtn.disabled = false;
+            };
+            reader.readAsDataURL(file);
+        }
+
+        function displayImage(container, imageSrc) {
+            container.innerHTML = `<img src="${imageSrc}" alt="Preview">`;
+        }
+
+        function showStatus(message, isSuccess) {
+            statusMessage.textContent = message;
+            statusMessage.className = `status-message ${isSuccess ? 'status-success' : 'status-error'}`;
+            statusMessage.style.display = 'block';
+        }
+
+        function showError(message) {
+            showStatus(message, false);
+        }
+
+        function showSuccess(message) {
+            showStatus(message, true);
+        }
+
+        function hideStatus() {
+            statusMessage.style.display = 'none';
+        }
+
+        function updateProcessingInfo(response) {
+            if (response.metadata) {
+                document.getElementById('originalSize').textContent = 
+                    `${response.metadata.original_size[0]} × ${response.metadata.original_size[1]}`;
+                document.getElementById('watermarkDetected').textContent = 
+                    response.metadata.watermark_detected ? 'Yes' : 'No';
+                
+                if (response.metadata.watermark_region) {
+                    const [x, y, w, h] = response.metadata.watermark_region;
+                    document.getElementById('watermarkRegion').textContent = `${x}, ${y}, ${w}, ${h}`;
+                } else {
+                    document.getElementById('watermarkRegion').textContent = 'Not detected';
+                }
+                
+                document.getElementById('processingTime').textContent = 
+                    `${response.metadata.processing_time_ms}ms`;
+                document.getElementById('methodUsed').textContent = 
+                    response.metadata.method_used;
+            }
+        }
+
+        async function processImage() {
+            if (!selectedImage) {
+                showError('Please select an image first');
+                return;
+            }
+
+            // Hide status and show loading
+            hideStatus();
+            loadingSpinner.style.display = 'block';
+            processBtn.disabled = true;
+            processBtn.innerHTML = '<span class="processing">🔄 Processing...</span>';
+
+            try {
+                // Get base64 image data (without data:image prefix)
+                const base64Data = selectedImage.split(',')[1];
+
+                // Build request object
+                const operation = {};
+                switch (detectionMethod.value) {
+                    case 'auto_detect':
+                        operation.type = 'auto_detect';
+                        break;
+                    case 'manual_region':
+                        operation.type = 'manual_region';
+                        operation.x = parseInt(regionX.value);
+                        operation.y = parseInt(regionY.value);
+                        operation.width = parseInt(regionWidth.value);
+                        operation.height = parseInt(regionHeight.value);
+                        break;
+                    case 'brightness_threshold':
+                        operation.type = 'brightness_threshold';
+                        operation.threshold = parseInt(threshold.value);
+                        break;
+                    case 'color_based':
+                        operation.type = 'color_based';
+                        operation.target_color = hexToRgb(targetColor.value);
+                        operation.tolerance = parseInt(colorTolerance.value);
+                        break;
+                }
+
+                const config = {
+                    image_data: base64Data,
+                    operation: operation,
+                    parameters: {
+                        method: removalMethod.value,
+                        feather_edges: true,
+                        blend_mode: 'normal'
+                    }
+                };
+
+                // Call ONVM
+                const response = await client.removeWatermark(config);
+
+                if (response.success) {
+                    processedImageData = response.processed_image;
+                    displayImage(resultPreview, `data:image/png;base64,${processedImageData}`);
+                    updateProcessingInfo(response);
+                    metadata.style.display = 'block';
+                    downloadBtn.style.display = 'block';
+                    showSuccess(response.message);
+                } else {
+                    showError(response.message);
+                }
+
+            } catch (error) {
+                console.error('Processing error:', error);
+                showError(`Processing failed: ${error.message}`);
+            } finally {
+                loadingSpinner.style.display = 'none';
+                processBtn.disabled = false;
+                processBtn.innerHTML = '🚀 Remove Watermark';
+            }
+        }
+
+        function downloadResult() {
+            if (!processedImageData) {
+                showError('No processed image available');
+                return;
+            }
+
+            const link = document.createElement('a');
+            link.download = 'watermark_removed.png';
+            link.href = `data:image/png;base64,${processedImageData}`;
+            link.click();
+        }
+
+        function hexToRgb(hex) {
+            const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+            return result ? [
+                parseInt(result[1], 16),
+                parseInt(result[2], 16),
+                parseInt(result[3], 16)
+            ] : [255, 255, 255];
+        }
+    </script>
+</body>
+</html>

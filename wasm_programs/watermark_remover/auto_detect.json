@@ -1,0 +1,11 @@
+{
+  "image_data": "base64-encoded-image-data-here",
+  "operation": {
+    "type": "auto_detect"
+  },
+  "parameters": {
+    "method": "inpaint",
+    "feather_edges": true,
+    "blend_mode": "normal"
+  }
+}

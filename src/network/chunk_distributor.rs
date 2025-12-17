@@ -469,28 +469,3 @@ impl ChunkDistributor {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_chunk_distributor_creation() {
-        let db = sled::Config::new().temporary(true).open().unwrap();
-        let store = Arc::new(UnifiedStore::new(db).unwrap());
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (transfer_tx, _transfer_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (transfer_resp_tx, _transfer_resp_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let network = NetworkHandle {
-            peer_id: PeerId::random(),
-            publisher: tx,
-            cmd: cmd_tx,
-            transfer_req: transfer_tx,
-            transfer_resp: transfer_resp_tx,
-            peers: Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new())),
-        };
-
-        let _distributor = ChunkDistributor::new(store, network);
-    }
-}

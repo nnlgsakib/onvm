@@ -1,6 +1,6 @@
-use crate::execution::ProgramStore;
-use crate::storage::{BlobStore, StateStore};
-use crate::types::{BlobId, ProgramId, StateWrite};
+use crate::execution::ExecutionAdapter;
+use crate::storage::{StateStore, UnifiedStore};
+use crate::types::{ObjectId, ProgramId, StateWrite};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -10,11 +10,11 @@ use wasmtime_wasi::WasiCtxBuilder;
 #[derive(Clone)]
 pub struct ExecutionEngine {
     engine: Engine,
-    blob_store: Arc<BlobStore>,
+    unified_store: Arc<UnifiedStore>,
     state_store: Arc<StateStore>,
-    programs: Arc<ProgramStore>,
+    execution_adapter: Arc<ExecutionAdapter>,
     max_fuel: u64,
-    module_cache: Arc<RwLock<HashMap<ProgramId, Module>>>,
+    module_cache: Arc<RwLock<HashMap<ObjectId, Module>>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -46,7 +46,7 @@ enum EntryPoint {
 }
 
 struct ExecutionContext {
-    blob_store: Arc<BlobStore>,
+    unified_store: Arc<UnifiedStore>,
     state_store: Arc<StateStore>,
     program_id: ProgramId,
     pending_writes: HashMap<Vec<u8>, Vec<u8>>,
@@ -55,9 +55,9 @@ struct ExecutionContext {
 
 impl ExecutionEngine {
     pub fn new(
-        blob_store: Arc<BlobStore>,
+        unified_store: Arc<UnifiedStore>,
         state_store: Arc<StateStore>,
-        programs: Arc<ProgramStore>,
+        execution_adapter: Arc<ExecutionAdapter>,
         cfg: ExecutionConfig,
     ) -> Result<Self> {
         let mut config = Config::new();
@@ -71,9 +71,9 @@ impl ExecutionEngine {
         let engine = Engine::new(&config)?;
         Ok(Self {
             engine,
-            blob_store,
+            unified_store,
             state_store,
-            programs,
+            execution_adapter,
             max_fuel: cfg.max_fuel,
             module_cache: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -85,35 +85,36 @@ impl ExecutionEngine {
         }
     }
 
-    pub fn blob_store(&self) -> Arc<BlobStore> {
-        Arc::clone(&self.blob_store)
+    pub fn blob_store(&self) -> Arc<UnifiedStore> {
+        Arc::clone(&self.unified_store)
     }
 
     pub fn state_store(&self) -> Arc<StateStore> {
         Arc::clone(&self.state_store)
     }
 
-    pub fn program_store(&self) -> Arc<ProgramStore> {
-        Arc::clone(&self.programs)
+    pub fn program_store(&self) -> Arc<ExecutionAdapter> {
+        Arc::clone(&self.execution_adapter)
     }
 
     pub fn execute(&self, program_id: &ProgramId, input: &[u8]) -> Result<ExecutionOutcome> {
-        let meta = self
-            .programs
-            .metadata(program_id)?
-            .ok_or_else(|| anyhow::anyhow!("program metadata missing"))?;
-        let wasm = self
-            .programs
-            .load(program_id)
+        let object_id = program_id.to_object_id();
+        
+        let wasm = self.execution_adapter
+            .load_wasm_by_object_id(&object_id)
             .with_context(|| format!("load program {program_id}"))?;
-        let module = self.get_or_compile_module(program_id, &wasm)?;
+        
+        let entrypoint = self.execution_adapter
+            .get_entrypoint(&object_id)?;
+        
+        let module = self.get_or_compile_module(&object_id, &wasm)?;
 
         let wasi = WasiCtxBuilder::new()
             .inherit_stdio()
             .inherit_env()?
             .build();
         let ctx = ExecutionContext {
-            blob_store: self.blob_store.clone(),
+            unified_store: self.unified_store.clone(),
             state_store: self.state_store.clone(),
             program_id: program_id.clone(),
             pending_writes: HashMap::new(),
@@ -130,10 +131,10 @@ impl ExecutionEngine {
             .get_memory(&mut store, "memory")
             .ok_or_else(|| anyhow::anyhow!("program missing exported memory"))?;
         let entry_multi =
-            instance.get_typed_func::<(i32, i32), (i32, i32)>(&mut store, &meta.entrypoint);
-        let entry_packed = instance.get_typed_func::<(i32, i32), i64>(&mut store, &meta.entrypoint);
+            instance.get_typed_func::<(i32, i32), (i32, i32)>(&mut store, &entrypoint);
+        let entry_packed = instance.get_typed_func::<(i32, i32), i64>(&mut store, &entrypoint);
         let entry_sret =
-            instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, &meta.entrypoint);
+            instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, &entrypoint);
         let entry = match (entry_multi, entry_packed, entry_sret) {
             (Ok(f), _, _) => EntryPoint::Multi(f),
             (_, Ok(f), _) => EntryPoint::Packed(f),
@@ -141,7 +142,7 @@ impl ExecutionEngine {
             _ => {
                 return Err(anyhow::anyhow!(
                     "program must export {} as (i32,i32)->(i32,i32), (i32,i32)->i64, or (i32,i32,i32)->() with sret",
-                    meta.entrypoint
+                    entrypoint
                 ))
             }
         };
@@ -149,7 +150,6 @@ impl ExecutionEngine {
         let ptr = 0;
         memory.write(&mut store, ptr as usize, input)?;
 
-        // scratch space for sret / output metadata placed after input
         let scratch_ptr = ptr + input.len() as i32 + 64;
 
         let (out_ptr, out_len) = match entry {
@@ -161,7 +161,6 @@ impl ExecutionEngine {
                 (out_ptr, out_len)
             }
             EntryPoint::Sret(f) => {
-                // write zeroes to scratch, call, then read two i32 results back
                 memory.write(&mut store, scratch_ptr as usize, &[0u8; 8])?;
                 f.call(&mut store, (scratch_ptr, ptr, input.len() as i32))?;
                 let mut meta_buf = [0u8; 8];
@@ -175,7 +174,6 @@ impl ExecutionEngine {
         memory.read(&mut store, out_ptr as usize, &mut buf)?;
         let remaining = store.get_fuel().unwrap_or(0);
         let consumed = self.max_fuel.saturating_sub(remaining);
-        // Apply pending writes deterministically by key order.
         let mut writes: Vec<(Vec<u8>, Vec<u8>)> = store
             .data()
             .pending_writes
@@ -205,16 +203,16 @@ impl ExecutionEngine {
         })
     }
 
-    fn get_or_compile_module(&self, pid: &ProgramId, wasm: &[u8]) -> Result<Module> {
-        if let Some(cached) = self.module_cache.read().unwrap().get(pid).cloned() {
+    fn get_or_compile_module(&self, oid: &ObjectId, wasm: &[u8]) -> Result<Module> {
+        if let Some(cached) = self.module_cache.read().unwrap().get(oid).cloned() {
             return Ok(cached);
         }
         let module = Module::new(&self.engine, wasm)
-            .with_context(|| format!("compile module for program {}", pid))?;
+            .with_context(|| format!("compile module for object {}", oid))?;
         self.module_cache
             .write()
             .unwrap()
-            .insert(pid.clone(), module.clone());
+            .insert(*oid, module.clone());
         Ok(module)
     }
 }
@@ -247,10 +245,10 @@ fn attach_blob_host_functions(linker: &mut Linker<ExecutionContext>) -> Result<(
             if id_bytes.len() != 32 {
                 return -5;
             }
-            let mut blob_id = [0u8; 32];
-            blob_id.copy_from_slice(&id_bytes);
-            let blob_id = BlobId(blob_id);
-            let data = match caller.data().blob_store.get(&blob_id) {
+            let mut object_id_arr = [0u8; 32];
+            object_id_arr.copy_from_slice(&id_bytes);
+            let object_id = ObjectId(object_id_arr);
+            let data = match caller.data().unified_store.get_object(&object_id) {
                 Ok(d) => d,
                 Err(_) => return -6,
             };

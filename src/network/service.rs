@@ -16,9 +16,10 @@ use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::yamux;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 
 pub const TOPIC_BLOBS: &str = "onvm-blobs";
 pub const TOPIC_PROGRAMS: &str = "onvm-programs";
@@ -40,6 +41,8 @@ pub enum NetworkMessage {
     ExecutionRequest(Vec<[u8; 32]>),
     Job(crate::syncer::JobBroadcast),
     Capability(crate::network::coordination::NodeCapabilities),
+    UnifiedProtocol(crate::network::unified_protocol::UnifiedProtocolMessage),
+    StateSync(StateSyncMessage),
 }
 
 /// Direct transfer request/response messages used by request-response protocols.
@@ -55,6 +58,8 @@ pub enum TransferRequest {
     PushBlob(BlobBroadcast),
     PushExecution(ExecutionBroadcast),
     Sync(SyncSnapshot),
+    Unified(crate::network::unified_protocol::UnifiedRequest),
+    StateRequest(StateRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +79,8 @@ pub enum TransferResponse {
     Execution(Option<ExecutionBroadcast>),
     Sync(SyncDelta),
     Ack,
+    Unified(crate::network::unified_protocol::UnifiedResponse),
+    StateResponse(StateResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +117,27 @@ pub struct ProgramBroadcast {
 pub struct ExecutionBroadcast {
     pub dag_id: [u8; 32],
     pub op: ComputeOp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSyncMessage {
+    pub program_id: ProgramId,
+    pub state_writes: Vec<crate::types::StateWrite>,
+    pub state_root: [u8; 32],
+    pub executor_node: crate::types::NodeId,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateRequest {
+    pub program_id: ProgramId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateResponse {
+    pub program_id: ProgramId,
+    pub state_root: [u8; 32],
+    pub state_entries: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +248,7 @@ pub struct NetworkHandle {
     cmd: mpsc::UnboundedSender<KadCommand>,
     transfer_req: mpsc::UnboundedSender<TransferJob>,
     transfer_resp: mpsc::UnboundedSender<TransferResponseJob>,
+    peers: Arc<RwLock<HashSet<PeerId>>>,
 }
 
 impl NetworkHandle {
@@ -243,6 +272,11 @@ impl NetworkHandle {
         let _ = self
             .transfer_resp
             .send(TransferResponseJob { channel, response });
+    }
+
+    pub async fn get_connected_peers(&self) -> Vec<PeerId> {
+        let peers = self.peers.read().await;
+        peers.iter().copied().collect()
     }
 }
 
@@ -319,7 +353,15 @@ impl NetworkService {
 
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
         let store = MemoryStore::new(peer_id);
-        let kademlia = Kademlia::new(peer_id, store);
+        
+        let mut kad_config = libp2p::kad::Config::default();
+        kad_config
+            .set_provider_record_ttl(Some(Duration::from_secs(3600)))
+            .set_provider_publication_interval(Some(Duration::from_secs(600)));
+        
+        let mut kademlia = Kademlia::with_config(peer_id, store, kad_config);
+        kademlia.set_mode(Some(libp2p::kad::Mode::Server));
+        
         let transfer_protocol = StreamProtocol::new("/onvm/transfer/1.0.0");
         let transfer_config = libp2p::request_response::Config::default()
             .with_request_timeout(Duration::from_secs(60))
@@ -363,6 +405,9 @@ impl NetworkService {
         let mut recent_ids: std::collections::VecDeque<gossipsub::MessageId> =
             std::collections::VecDeque::new();
         let dedupe_window: usize = 256;
+
+        let peers_shared = Arc::new(RwLock::new(HashSet::new()));
+        let peers_clone = Arc::clone(&peers_shared);
 
         tokio::spawn(async move {
             loop {
@@ -418,12 +463,18 @@ impl NetworkService {
                                 tracing::info!("listening on {}", address);
                                 let _ = event_tx.send(NetworkEvent::Listening(address));
                             }
-                            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                                tracing::info!("connected to peer {}", peer_id);
+                            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                                tracing::info!("connected to peer {} at {:?}", peer_id, endpoint.get_remote_address());
+                                peers_clone.write().await.insert(peer_id);
+                                
+                                swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
+                                let _ = swarm.behaviour_mut().kademlia.bootstrap();
+                                
                                 let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
                             }
                             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                                 tracing::warn!("disconnected from peer {}", peer_id);
+                                peers_clone.write().await.remove(&peer_id);
                                 let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Transfer(event)) => match event {
@@ -486,7 +537,9 @@ impl NetworkService {
                             | NetworkMessage::BlobMeta(_)
                             | NetworkMessage::ExecutionRequest(_)
                             | NetworkMessage::Job(_)
-                            | NetworkMessage::Capability(_) => Topic::new(TOPIC_BLOCKS),
+                            | NetworkMessage::Capability(_)
+                            | NetworkMessage::UnifiedProtocol(_)
+                            | NetworkMessage::StateSync(_) => Topic::new(TOPIC_BLOCKS),
                         };
                         let data = match serde_json::to_vec(&msg) {
                             Ok(d) => d,
@@ -515,6 +568,7 @@ impl NetworkService {
                 cmd: cmd_tx,
                 transfer_req: transfer_tx,
                 transfer_resp: transfer_resp_tx,
+                peers: peers_shared,
             },
             events: event_rx,
         })
@@ -537,5 +591,7 @@ fn describe_msg(msg: &NetworkMessage) -> &'static str {
         NetworkMessage::ExecutionRequest(_) => "execution_request",
         NetworkMessage::Job(_) => "job",
         NetworkMessage::Capability(_) => "capability",
+        NetworkMessage::UnifiedProtocol(_) => "unified_protocol",
+        NetworkMessage::StateSync(_) => "state_sync",
     }
 }

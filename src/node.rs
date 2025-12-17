@@ -1,8 +1,8 @@
 use crate::consensus::{BlobSyncMode, DagConfig, DagEngine};
 use crate::crypto::keys::NodeKeys;
-use crate::execution::{ExecutionEngine, ExecutionPool, ProgramStore};
-use crate::network::{NetworkConfig, NetworkHandle, NetworkService, NetworkStreams};
-use crate::storage::BlobStore;
+use crate::execution::{ExecutionAdapter, ExecutionEngine, ExecutionPool};
+use crate::network::{ChunkDistributor, NetworkConfig, NetworkHandle, NetworkService, NetworkStreams};
+use crate::storage::UnifiedStore;
 use crate::syncer::SyncMan;
 use anyhow::{Context, Result};
 use libp2p::multiaddr::Protocol;
@@ -22,8 +22,9 @@ pub struct NodeConfig {
 
 pub struct Node {
     pub identity: Arc<NodeKeys>,
-    pub blob_store: Arc<BlobStore>,
-    pub program_store: Arc<ProgramStore>,
+    pub unified_store: Arc<UnifiedStore>,
+    pub execution_adapter: Arc<ExecutionAdapter>,
+    pub chunk_distributor: Arc<ChunkDistributor>,
     pub execution: Arc<ExecutionEngine>,
     pub scheduler: Arc<ExecutionPool>,
     pub consensus: Arc<DagEngine>,
@@ -38,23 +39,25 @@ pub struct Node {
 impl Node {
     pub async fn start(config: NodeConfig) -> Result<Self> {
         let db_path = config.data_dir.join("db");
-        let blob_path = config.data_dir.join("blobs");
-        let program_path = config.data_dir.join("programs");
 
         tokio::fs::create_dir_all(&config.data_dir).await?;
 
         let db = sled::open(db_path).context("opening sled db")?;
         let identity = Arc::new(config.identity);
-        let blob_store = Arc::new(BlobStore::new(db.clone(), blob_path)?);
-        let program_store = Arc::new(ProgramStore::new(db.clone(), program_path)?);
+        
+        let unified_store = Arc::new(UnifiedStore::new(db.clone())?);
+        
         let state_store = Arc::new(crate::storage::StateStore::new(
             db.clone(),
             "contract_state",
         )?);
+        
+        let execution_adapter = Arc::new(ExecutionAdapter::new(unified_store.clone()));
+        
         let exec = Arc::new(ExecutionEngine::new(
-            blob_store.clone(),
+            unified_store.clone(),
             state_store.clone(),
-            program_store.clone(),
+            execution_adapter.clone(),
             crate::execution::ExecutionConfig::default(),
         )?);
         let scheduler = Arc::new(ExecutionPool::new(exec.clone(), None));
@@ -90,12 +93,17 @@ impl Node {
             handle: network,
             events,
         } = streams;
+        
+        let chunk_distributor = Arc::new(ChunkDistributor::new(
+            unified_store.clone(),
+            network.clone(),
+        ));
 
-        let consensus = Arc::new(DagEngine::new(
+        let mut consensus = DagEngine::new(
             db.clone(),
-            blob_store.clone(),
+            unified_store.clone(),
             state_store.clone(),
-            program_store.clone(),
+            execution_adapter.clone(),
             scheduler.clone(),
             identity.clone(),
             network.clone(),
@@ -103,7 +111,11 @@ impl Node {
                 min_peers: config.min_peers,
                 blob_sync_mode: config.blob_sync_mode.clone(),
             },
-        )?);
+        )?;
+        
+        consensus.set_chunk_distributor(chunk_distributor.clone());
+        let consensus = Arc::new(consensus);
+        
         if matches!(config.blob_sync_mode, BlobSyncMode::FullData) {
             consensus.start_fetch_workers(5).await;
         }
@@ -127,8 +139,9 @@ impl Node {
 
         Ok(Self {
             identity,
-            blob_store,
-            program_store,
+            unified_store,
+            execution_adapter,
+            chunk_distributor,
             execution: exec,
             scheduler,
             consensus,

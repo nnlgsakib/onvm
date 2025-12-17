@@ -38,6 +38,19 @@ impl StateStore {
         }
         Ok(merkle_root(&pairs))
     }
+
+    pub fn get_all_scoped(&self, ns: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let tree = self.db.open_tree(self.tree_name)?;
+        let mut pairs = Vec::new();
+        let ns_prefix = ns.to_vec();
+        for entry in tree.scan_prefix(&ns_prefix) {
+            let (k, v) = entry?;
+            // strip namespace prefix
+            let key = k[ns.len()..].to_vec();
+            pairs.push((key, v.to_vec()));
+        }
+        Ok(pairs)
+    }
 }
 
 fn prefixed(ns: &[u8], key: &[u8]) -> Vec<u8> {

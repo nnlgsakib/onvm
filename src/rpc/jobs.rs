@@ -24,7 +24,7 @@ pub fn job_routes() -> Router<Arc<JobRpcContext>> {
 pub struct JobRpcContext {
     pub scheduler: Arc<JobScheduler>,
     pub job_store: Arc<JobStore>,
-    pub blob_store: Arc<crate::storage::BlobStore>,
+    pub unified_store: Arc<crate::storage::UnifiedStore>,
     pub consensus: Arc<crate::consensus::DagEngine>,
 }
 
@@ -121,21 +121,23 @@ async fn submit_job(
             .decode(base64_input)
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid base64: {e}")))?;
 
-        let meta = ctx
-            .blob_store
-            .put(
+        let object = ctx
+            .unified_store
+            .put_object(
                 &data,
-                Some("application/octet-stream".to_string()),
+                crate::types::ObjectType::Blob {
+                    mime_type: Some("application/octet-stream".to_string()),
+                },
                 crate::types::NodeId::from_public_key(&[0u8; 32]),
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         ctx.consensus
-            .ingest_local_blob(meta.clone(), data)
+            .ingest_local_blob(object.clone(), data)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        Some(meta.id)
+        Some(BlobId(object.id.0))
     } else {
         None
     };
@@ -251,7 +253,8 @@ async fn get_job_output(
         )
     })?;
 
-    let data = match ctx.blob_store.get(&output_blob_id) {
+    let object_id = output_blob_id.to_object_id();
+    let data = match ctx.unified_store.get_object(&object_id) {
         Ok(data) => data,
         Err(_) => ctx
             .consensus

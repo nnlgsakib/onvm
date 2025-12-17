@@ -1,9 +1,8 @@
 use super::job::{FailureReason, JobId, JobStatus, JobStore, LogLevel};
 use super::manifest::{JobManifest, ResourceRequirements};
 use super::runtime::ExecutionEngine;
-use super::ProgramStore;
-use crate::storage::BlobStore;
-use crate::types::ProgramId;
+use crate::storage::UnifiedStore;
+use crate::types::{ObjectType, ProgramId};
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -13,7 +12,7 @@ use tokio::time::timeout;
 pub struct JobExecutor {
     engine: Arc<ExecutionEngine>,
     job_store: Arc<JobStore>,
-    blob_store: Arc<BlobStore>,
+    unified_store: Arc<UnifiedStore>,
     manifest_store: Arc<ManifestStore>,
     active_jobs: Arc<RwLock<std::collections::HashSet<JobId>>>,
     consensus: Option<Arc<crate::consensus::DagEngine>>,
@@ -23,14 +22,13 @@ impl JobExecutor {
     pub fn new(
         engine: Arc<ExecutionEngine>,
         job_store: Arc<JobStore>,
-        _program_store: Arc<ProgramStore>,
-        blob_store: Arc<BlobStore>,
+        unified_store: Arc<UnifiedStore>,
         db: sled::Db,
     ) -> Result<Self> {
         Ok(Self {
             engine,
             job_store,
-            blob_store,
+            unified_store,
             manifest_store: Arc::new(ManifestStore::new(db)?),
             active_jobs: Arc::new(RwLock::new(std::collections::HashSet::new())),
             consensus: None,
@@ -89,7 +87,10 @@ impl JobExecutor {
         manifest.validate()?;
 
         let input_data = match &job.input_blob_id {
-            Some(blob_id) => self.blob_store.get(blob_id).context("loading input blob")?,
+            Some(blob_id) => {
+                let object_id = blob_id.to_object_id();
+                self.unified_store.get_object(&object_id).context("loading input blob")?
+            }
             None => Vec::new(),
         };
 
@@ -109,11 +110,13 @@ impl JobExecutor {
 
         match execution_result {
             Ok(Ok(outcome)) => {
-                let output_blob = self
-                    .blob_store
-                    .put(
+                let output_object = self
+                    .unified_store
+                    .put_object(
                         &outcome.return_data,
-                        Some("application/octet-stream".to_string()),
+                        ObjectType::Blob {
+                            mime_type: Some("application/octet-stream".to_string()),
+                        },
                         crate::types::NodeId::from_public_key(&[0u8; 32]),
                     )
                     .context("storing output blob")?;
@@ -121,11 +124,11 @@ impl JobExecutor {
                 if let Some(ref consensus) = self.consensus {
                     let blob_data = outcome.return_data.clone();
                     let _ = consensus
-                        .ingest_local_blob(output_blob.clone(), blob_data)
+                        .ingest_local_blob(output_object.clone(), blob_data)
                         .await;
                 }
 
-                job.output_blob_id = Some(output_blob.id);
+                job.output_blob_id = Some(crate::types::BlobId(output_object.id.0));
                 job.fuel_consumed = outcome.fuel_consumed;
                 job.status = JobStatus::Completed;
                 job.add_log(

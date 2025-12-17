@@ -1,37 +1,28 @@
-use crate::crypto::hashing::hash_bytes;
 use crate::crypto::keys::NodeKeys;
-use crate::execution::{ExecutionOutcome, ExecutionPool, ProgramStore};
-use crate::network::{
-    BlobAdvertisement, BlobBroadcast, BlobInventoryEntry, BlobRequest, BloomFilter,
-    ExecutionBroadcast, NetworkEvent, NetworkHandle, NetworkMessage, ProgramBroadcast,
-    ProgramSyncRequest, ProviderKind, SyncDelta, SyncSnapshot, TransferRequest, TransferResponse,
-};
+use crate::execution::{ExecutionAdapter, ExecutionOutcome, ExecutionPool};
+use crate::network::{NetworkEvent, NetworkHandle, NetworkMessage};
 use crate::qeue_manager::AsyncQueue;
-use crate::storage::StateStore;
-use crate::storage::{reconstruct_chunk, BlobIndex, BlobStore, DagStore, ProgramIndex};
-
+use crate::storage::{StateStore, UnifiedStore, BlobIndex, DagStore, ProgramIndex};
 use crate::syncer::sync::SyncState;
-use crate::types::{BlobId, BlobMetadata, ComputeOp, NodeId, ProgramId, ProgramMetadata};
+use crate::types::{BlobId, ComputeOp, NodeId, Object, ObjectId, ProgramId};
 use anyhow::{anyhow, Context, Result};
-use libp2p::{request_response::ResponseChannel, PeerId};
+use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use sled::Db;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, Duration, Instant};
+use tokio::time::{interval, Duration};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Operation {
-    PublishBlob(BlobMetadata),
-    DeployProgram(ProgramMetadata),
+    PublishObject(Object),
     Compute(ComputeOp),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum DagRef {
-    Program(ProgramId),
-    Blob(BlobId),
+    Object(ObjectId),
     Execution(DagId),
 }
 
@@ -59,32 +50,44 @@ pub struct DagConfig {
     pub blob_sync_mode: BlobSyncMode,
 }
 
-const PROGRAM_META_BATCH: usize = 256;
-
 pub struct DagEngine {
-    blob_store: Arc<BlobStore>,
+    unified_store: Arc<UnifiedStore>,
+    #[allow(dead_code)]
     state_store: Arc<StateStore>,
+    #[allow(dead_code)]
+    execution_adapter: Arc<ExecutionAdapter>,
+    #[allow(dead_code)]
     blob_index: BlobIndex,
-    program_store: Arc<ProgramStore>,
+    #[allow(dead_code)]
     program_index: ProgramIndex,
+    #[allow(dead_code)]
     dag_store: DagStore,
+    #[allow(dead_code)]
     scheduler: Arc<ExecutionPool>,
+    #[allow(dead_code)]
     identity: Arc<NodeKeys>,
     network: NetworkHandle,
     peers: Arc<RwLock<HashSet<PeerId>>>,
+    #[allow(dead_code)]
     config: DagConfig,
+    #[allow(dead_code)]
     sync_state: Arc<RwLock<SyncState>>,
-    pending_blob_fetches: Arc<RwLock<HashSet<BlobId>>>,
-    fetch_queue: Arc<RwLock<Option<AsyncQueue<BlobId>>>>,
+    #[allow(dead_code)]
+    pending_object_fetches: Arc<RwLock<HashSet<ObjectId>>>,
+    #[allow(dead_code)]
+    fetch_queue: Arc<RwLock<Option<AsyncQueue<ObjectId>>>>,
     job_sync: Arc<RwLock<Option<Arc<crate::syncer::JobSyncManager>>>>,
+    chunk_distributor: Option<Arc<crate::network::ChunkDistributor>>,
+    program_state_versions: Arc<RwLock<HashMap<ProgramId, u64>>>,
+    state_sync_in_progress: Arc<RwLock<HashSet<ProgramId>>>,
 }
 
 impl DagEngine {
     pub fn new(
         db: Db,
-        blob_store: Arc<BlobStore>,
+        unified_store: Arc<UnifiedStore>,
         state_store: Arc<StateStore>,
-        program_store: Arc<ProgramStore>,
+        execution_adapter: Arc<ExecutionAdapter>,
         scheduler: Arc<ExecutionPool>,
         identity: Arc<NodeKeys>,
         network: NetworkHandle,
@@ -94,1321 +97,651 @@ impl DagEngine {
             blob_index: BlobIndex::new(&db)?,
             program_index: ProgramIndex::new(&db)?,
             dag_store: DagStore::new(&db)?,
-            blob_store,
+            unified_store,
             state_store,
-            program_store,
+            execution_adapter,
             scheduler,
             identity,
             network,
             peers: Arc::new(RwLock::new(HashSet::new())),
             config,
             sync_state: Arc::new(RwLock::new(SyncState::default())),
-            pending_blob_fetches: Arc::new(RwLock::new(HashSet::new())),
+            pending_object_fetches: Arc::new(RwLock::new(HashSet::new())),
             fetch_queue: Arc::new(RwLock::new(None)),
             job_sync: Arc::new(RwLock::new(None)),
+            chunk_distributor: None,
+            program_state_versions: Arc::new(RwLock::new(HashMap::new())),
+            state_sync_in_progress: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
-    pub async fn set_job_sync(&self, job_sync: Arc<crate::syncer::JobSyncManager>) {
-        *self.job_sync.write().await = Some(job_sync);
+    pub fn set_chunk_distributor(&mut self, distributor: Arc<crate::network::ChunkDistributor>) {
+        self.chunk_distributor = Some(distributor);
     }
 
-    pub async fn start_fetch_workers(self: &Arc<Self>, concurrency: usize) {
-        if concurrency == 0 {
-            return;
-        }
-        let me = Arc::clone(self);
-        let queue = AsyncQueue::new(concurrency, move |blob_id: BlobId| {
-            let me = Arc::clone(&me);
-            async move {
-                if let Err(e) = me.fetch_blob(&blob_id).await {
-                    tracing::warn!("prefetch blob {} failed: {e:?}", hex::encode(blob_id.0));
+    pub async fn ingest_local_object(&self, object: Object, _data: Vec<u8>) -> Result<()> {
+        self.network.provide(&object.id.0);
+        
+        let object_meta_msg = crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadata(object.clone());
+        let meta_network_msg = NetworkMessage::UnifiedProtocol(object_meta_msg);
+        
+        let _ = self.network.publisher.send(meta_network_msg);
+        
+        let announcement = crate::network::unified_protocol::ObjectAnnouncement::from_object(
+            &object,
+            &self.network.peer_id
+        );
+        
+        let unified_msg = crate::network::unified_protocol::UnifiedProtocolMessage::ObjectAnnouncement(announcement);
+        let msg = NetworkMessage::UnifiedProtocol(unified_msg);
+        
+        self.network.publisher.send(msg)
+            .map_err(|_| anyhow!("failed to announce object"))?;
+        
+        tracing::info!("announced object {} to DHT and gossipsub", object.id);
+        
+        Ok(())
+    }
+
+    pub async fn ingest_local_blob(&self, object: Object, data: Vec<u8>) -> Result<()> {
+        self.ingest_local_object(object, data).await
+    }
+
+    pub async fn ingest_local_program(&self, object: Object, data: Vec<u8>) -> Result<()> {
+        self.ingest_local_object(object, data).await
+    }
+
+    pub async fn submit_execution(&self, program_id: &ProgramId, input: &[u8]) -> Result<ExecutionOutcome> {
+        let object_id = program_id.to_object_id();
+        
+        if !self.unified_store.is_complete(&object_id)? {
+            tracing::info!("program {} not available locally, attempting to fetch from network", program_id);
+            
+            if let Some(ref distributor) = self.chunk_distributor {
+                match distributor.fetch_object(&object_id).await {
+                    Ok(data) => {
+                        tracing::info!(
+                            "successfully fetched program {} from network ({} bytes)",
+                            program_id,
+                            data.len()
+                        );
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "program not available locally and fetch from network failed: {}",
+                            e
+                        ));
+                    }
                 }
+            } else {
+                return Err(anyhow!("program not available and chunk distributor not initialized"));
             }
-        });
-        let mut guard = self.fetch_queue.write().await;
-        *guard = Some(queue);
+            
+            if !self.unified_store.is_complete(&object_id)? {
+                return Err(anyhow!("program fetch completed but object is still incomplete"));
+            }
+        }
+        
+        let has_state = {
+            let versions = self.program_state_versions.read().await;
+            versions.contains_key(program_id)
+        };
+        
+        if !has_state {
+            let in_progress = self.state_sync_in_progress.read().await.contains(program_id);
+            
+            if !in_progress {
+                self.state_sync_in_progress.write().await.insert(program_id.clone());
+                
+                let state_store = Arc::clone(&self.state_store);
+                let network = self.network.clone();
+                let peers = Arc::clone(&self.peers);
+                let versions = Arc::clone(&self.program_state_versions);
+                let in_progress = Arc::clone(&self.state_sync_in_progress);
+                let pid = program_id.clone();
+                
+                tokio::spawn(async move {
+                    if let Err(e) = Self::background_state_sync_static(
+                        &state_store,
+                        &network,
+                        &peers,
+                        &versions,
+                        &pid
+                    ).await {
+                        tracing::debug!("background state sync failed for {}: {}", pid, e);
+                    }
+                    in_progress.write().await.remove(&pid);
+                });
+            }
+        }
+        
+        let outcome = self.scheduler.execute(program_id, input).await?;
+        
+        if !outcome.state_writes.is_empty() {
+            let new_version = {
+                let mut versions = self.program_state_versions.write().await;
+                let version = versions.entry(program_id.clone()).or_insert(0);
+                *version += 1;
+                *version
+            };
+            
+            let sync_msg = crate::network::StateSyncMessage {
+                program_id: program_id.clone(),
+                state_writes: outcome.state_writes.clone(),
+                state_root: outcome.state_root,
+                executor_node: self.identity.node_id.clone(),
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            };
+            
+            let msg = NetworkMessage::StateSync(sync_msg);
+            let _ = self.network.publisher.send(msg);
+            
+            tracing::debug!(
+                "broadcasted {} state writes for program {} (version {})",
+                outcome.state_writes.len(),
+                program_id,
+                new_version
+            );
+        }
+        
+        Ok(outcome)
     }
 
-    async fn enqueue_prefetch(&self, id: BlobId) {
-        if let Some(q) = self.fetch_queue.read().await.as_ref() {
-            q.enqueue(id);
+    async fn background_state_sync_static(
+        state_store: &Arc<StateStore>,
+        network: &NetworkHandle,
+        peers: &Arc<RwLock<HashSet<PeerId>>>,
+        versions: &Arc<RwLock<HashMap<ProgramId, u64>>>,
+        program_id: &ProgramId,
+    ) -> Result<()> {
+        let peer_list: Vec<_> = peers.read().await.iter().copied().collect();
+        
+        if peer_list.is_empty() {
+            return Err(anyhow!("no peers available"));
         }
+        
+        for peer in peer_list.iter().take(3) {
+            let req = crate::network::StateRequest {
+                program_id: program_id.clone(),
+            };
+            
+            network.request_transfer(
+                *peer,
+                crate::network::TransferRequest::StateRequest(req),
+            );
+            
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            
+            let state_count = state_store.get_all_scoped(&program_id.0)?.len();
+            if state_count > 0 {
+                versions.write().await.insert(program_id.clone(), 1);
+                tracing::info!("background sync: fetched {} state entries for program {}", state_count, program_id);
+                return Ok(());
+            }
+        }
+        
+        versions.write().await.insert(program_id.clone(), 0);
+        tracing::debug!("background sync: no state found for program {}, marked as initialized", program_id);
+        Ok(())
+    }
+
+    pub async fn fetch_blob(&self, blob_id: &BlobId) -> Result<Vec<u8>> {
+        let object_id = blob_id.to_object_id();
+        self.unified_store.get_object(&object_id)
     }
 
     pub async fn run(self: Arc<Self>, mut events: mpsc::UnboundedReceiver<NetworkEvent>) {
-        let mut sync_timer = interval(Duration::from_secs(5));
+        let mut tick = interval(Duration::from_secs(5));
+        let mut dht_announce_tick = interval(Duration::from_secs(300));
+
         loop {
             tokio::select! {
-                Some(event) = events.recv() => {
-                    if let Err(err) = self.handle_event(event).await {
-                        tracing::warn!("dag event error: {err:?}");
+                _ = tick.tick() => {
+                    if let Err(e) = self.periodic_sync().await {
+                        tracing::warn!("periodic sync error: {e:?}");
                     }
                 }
-                _ = sync_timer.tick() => {
-                    let _ = self.broadcast_inventory(false).await;
-                    let _ = self.retry_missing().await;
+                _ = dht_announce_tick.tick() => {
+                    if let Err(e) = self.periodic_dht_announce().await {
+                        tracing::warn!("DHT announce error: {e:?}");
+                    }
+                }
+                Some(event) = events.recv() => {
+                    if let Err(e) = self.handle_event(event).await {
+                        tracing::warn!("event handling error: {e:?}");
+                    }
                 }
             }
         }
+    }
+
+    async fn periodic_dht_announce(&self) -> Result<()> {
+        let objects = self.unified_store.list_objects()?;
+        
+        tracing::info!("announcing {} objects to DHT", objects.len());
+        
+        for object in objects {
+            if self.unified_store.is_complete(&object.id).unwrap_or(false) {
+                self.network.provide(&object.id.0);
+                tracing::debug!("announced object {} to DHT", object.id);
+            }
+        }
+        
+        Ok(())
     }
 
     async fn handle_event(&self, event: NetworkEvent) -> Result<()> {
         match event {
-            NetworkEvent::Inbound(peer, msg) => match msg {
-                NetworkMessage::Program(bcast) => {
-                    self.handle_program_broadcast(&peer, bcast).await?;
+            NetworkEvent::PeerConnected(peer_id) => {
+                self.peers.write().await.insert(peer_id);
+                tracing::info!("peer connected: {}", peer_id);
+            }
+            NetworkEvent::PeerDisconnected(peer_id) => {
+                self.peers.write().await.remove(&peer_id);
+                tracing::info!("peer disconnected: {}", peer_id);
+            }
+            NetworkEvent::Inbound(_peer_id, msg) => {
+                self.handle_network_message(msg).await?;
+            }
+            NetworkEvent::TransferRequest(peer_id, req, channel) => {
+                self.handle_transfer_request(peer_id, req, channel).await?;
+            }
+            NetworkEvent::TransferResponse(_peer_id, resp) => {
+                self.handle_transfer_response(resp).await?;
+            }
+            NetworkEvent::ProvidersFound { key, peers, kind } => {
+                self.handle_providers_found(key, peers, kind).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_providers_found(
+        &self,
+        key: Vec<u8>,
+        peers: Vec<PeerId>,
+        _kind: crate::network::ProviderKind,
+    ) -> Result<()> {
+        if key.len() == 32 {
+            let mut object_id_bytes = [0u8; 32];
+            object_id_bytes.copy_from_slice(&key);
+            let object_id = ObjectId(object_id_bytes);
+            
+            if peers.is_empty() {
+                tracing::warn!("DHT query for {} returned 0 providers", object_id);
+                return Ok(());
+            }
+            
+            tracing::info!(
+                "DHT found {} providers for object {}: {:?}",
+                peers.len(),
+                object_id,
+                peers.iter().map(|p| p.to_string()).collect::<Vec<_>>()
+            );
+            
+            if let Some(ref distributor) = self.chunk_distributor {
+                let mut provider_map = distributor.provider_map.write().await;
+                let entry = provider_map
+                    .entry(object_id)
+                    .or_insert_with(HashSet::new);
+                    
+                for peer in peers {
+                    entry.insert(peer);
                 }
-                NetworkMessage::ProgramMeta(list) => {
-                    self.handle_program_metadata(&peer, list).await?;
-                }
-                NetworkMessage::InventoryRequest => {
-                    let _ = self.broadcast_inventory(true).await;
-                }
-                NetworkMessage::ProgramSyncRequest(req) => {
-                    self.handle_program_sync_request(req).await?;
-                }
-                NetworkMessage::ProgramRequest(pid) => {
-                    if let Some(meta) = self
-                        .program_store
-                        .metadata(&pid)
-                        .context("program lookup")?
-                    {
-                        if let Ok(wasm) = self.program_store.load(&pid) {
-                            let _ = self
-                                .network
-                                .publisher
-                                .send(NetworkMessage::Program(ProgramBroadcast { meta, wasm }));
+                
+                tracing::info!("added {} providers for object {}", entry.len(), object_id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_transfer_response(&self, response: crate::network::TransferResponse) -> Result<()> {
+        match response {
+            crate::network::TransferResponse::Unified(unified_resp) => {
+                use crate::network::unified_protocol::*;
+                match unified_resp {
+                    UnifiedResponse::Manifest(manifest_resp) => {
+                        if let Some(manifest) = manifest_resp.manifest {
+                            tracing::info!("received manifest for object {}", manifest.object_id);
+                            let _ = self.unified_store.store_manifest(&manifest);
                         }
                     }
-                }
-                NetworkMessage::ProgramResponse(bcast) => {
-                    self.handle_program_broadcast(&peer, bcast).await?;
-                }
-                NetworkMessage::Blob(bcast) => {
-                    self.handle_blob_broadcast(&peer, bcast).await?;
-                }
-                NetworkMessage::BlobMeta(ad) => {
-                    self.handle_blob_advertisement(&peer, ad).await?;
-                }
-                NetworkMessage::BlobRequest(req) => {
-                    self.handle_blob_request(req).await?;
-                }
-                NetworkMessage::Execution(bcast) => {
-                    self.handle_execution_broadcast(&peer, bcast).await?;
-                }
-                NetworkMessage::ExecutionRequest(ids) => {
-                    self.handle_execution_request(ids).await?;
-                }
-                NetworkMessage::Inventory(inv) => {
-                    self.handle_inventory(&peer, inv).await?;
-                }
-                NetworkMessage::Job(job_bcast) => {
-                    let sync_mgr_guard = self.job_sync.read().await;
-                    if let Some(ref sync_mgr) = *sync_mgr_guard {
-                        if let Err(e) = sync_mgr.handle_job_broadcast(job_bcast).await {
-                            tracing::warn!("job broadcast handling error: {e:?}");
+                    UnifiedResponse::Chunk(chunk_resp) => {
+                        if let Some(data) = chunk_resp.data {
+                            let chunk = crate::types::Chunk {
+                                id: chunk_resp.chunk_id,
+                                data,
+                            };
+                            tracing::debug!("received chunk {}", chunk_resp.chunk_id);
+                            let _ = self.unified_store.store_chunk(&chunk);
                         }
                     }
-                }
-                NetworkMessage::Capability(_caps) => {
-                }
-            },
-            NetworkEvent::TransferRequest(peer, req, channel) => {
-                self.handle_transfer_request(&peer, req, channel).await?;
-            }
-            NetworkEvent::TransferResponse(peer, resp) => {
-                self.handle_transfer_response(&peer, resp).await?;
-            }
-            NetworkEvent::PeerConnected(peer) => {
-                self.peers.write().await.insert(peer);
-                let _ = self.broadcast_inventory(true).await;
-                let _ = self.request_inventory().await;
-                let _ = self.request_program_sync().await;
-                // proactively push known programs to the newly connected peer
-                let _ = self.push_all_programs_to_peer(peer).await;
-                let _ = self.push_all_executions_to_peer(peer).await;
-                let _ = self.push_program_meta_to_peer(peer).await;
-                let _ = self.request_missing_executions(peer).await;
-                let _ = self.send_sync_snapshot(peer).await;
-            }
-            NetworkEvent::PeerDisconnected(peer) => {
-                self.peers.write().await.remove(&peer);
-            }
-            NetworkEvent::Listening(_) => {}
-            NetworkEvent::ProvidersFound { key, kind, .. } => {
-                self.handle_provider_hint(&key, kind).await?;
-            }
-        }
-        Ok(())
-    }
-
-    pub async fn submit_execution(
-        &self,
-        program: &ProgramId,
-        input: &[u8],
-    ) -> Result<ExecutionOutcome> {
-        if self.program_store.metadata(program)?.is_none() {
-            return Err(anyhow!("program metadata missing locally"));
-        }
-
-        let input_meta = self
-            .blob_store
-            .put(input, None, self.identity.node_id.clone())?;
-        self.blob_index
-            .record(&input_meta, self.identity.node_id.clone(), true)?;
-        self.network.provide(&input_meta.id.0);
-
-        // Try local execution first
-        let outcome = match self.scheduler.execute(program, input).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                // If local execution fails, try remote execution as fallback
-                tracing::warn!("Local execution failed: {:?}. Attempting remote execution.", e);
-                self.submit_remote_execution(program, input).await?
-            }
-        };
-
-        let output_meta =
-            self.blob_store
-                .put(&outcome.return_data, None, self.identity.node_id.clone())?;
-        self.blob_index
-            .record(&output_meta, self.identity.node_id.clone(), true)?;
-        self.network.provide(&output_meta.id.0);
-
-        let _ = self
-            .network
-            .publisher
-            .send(NetworkMessage::Blob(crate::network::BlobBroadcast {
-                meta: output_meta.clone(),
-            }));
-        self.push_blob_to_peers(
-            None,
-            crate::network::BlobBroadcast {
-                meta: output_meta.clone(),
-            },
-        )
-        .await;
-
-        let compute = ComputeOp {
-            program_id: program.clone(),
-            input: input_meta.id.clone(),
-            output: output_meta.clone(),
-            fuel_used: outcome.fuel_consumed,
-            state_root: outcome.state_root,
-            state_writes: outcome.state_writes.clone(),
-        };
-        let parents = vec![
-            DagRef::Program(compute.program_id.clone()),
-            DagRef::Blob(compute.input.clone()),
-            DagRef::Blob(compute.output.id.clone()),
-        ];
-        let node = self.record_operation(Operation::Compute(compute.clone()), parents)?;
-        let _ = self
-            .network
-            .publisher
-            .send(NetworkMessage::Execution(ExecutionBroadcast {
-                dag_id: node.id.0,
-                op: compute.clone(),
-            }));
-        self.push_execution_to_peers(
-            None,
-            ExecutionBroadcast {
-                dag_id: node.id.0,
-                op: compute,
-            },
-        )
-        .await;
-        Ok(outcome)
-    }
-
-    /// Submit execution request to a remote node that hosts the program
-    #[allow(unused_variables)]
-    async fn submit_remote_execution(
-        &self,
-        program: &ProgramId,
-        input: &[u8],
-    ) -> Result<ExecutionOutcome> {
-        // Find a peer that hosts this program
-        if let Some(program_record) = self.program_index.get(program)? {
-            // Get the first available peer that hosts this program
-            if let Some(peer_node_id) = program_record.locations.iter().next() {
-                // Convert NodeId to PeerId (this is a simplified approach)
-                // In a real implementation, you would need a mapping between NodeId and PeerId
-                let peer_id_bytes = peer_node_id.0;
-                let peer_id = libp2p::PeerId::from_bytes(&peer_id_bytes).map_err(|_| anyhow!("Invalid peer ID"))?;
-                
-                // Send execution request to remote peer
-                // For now, we'll simulate this by returning an error
-                // A full implementation would involve:
-                // 1. Sending a network message to the remote peer
-                // 2. Waiting for the response
-                // 3. Returning the execution outcome
-                
-                tracing::info!("Would send remote execution request to peer {:?} for program {:?}", peer_id, program);
-                return Err(anyhow!("Remote execution not yet implemented. Program hosted by peer {:?}.", peer_id));
-            }
-        }
-        
-        Err(anyhow!("No peers found hosting program {:?}", program))
-    }
-
-    /// Used by local RPC paths to ingest and disseminate freshly created blobs.
-    pub async fn ingest_local_blob(&self, meta: BlobMetadata, data: Vec<u8>) -> Result<()> {
-        let bcast = crate::network::BlobBroadcast { meta: meta.clone() };
-        // Store locally (replicate into store) before advertising.
-        self.blob_store.replicate(&meta, &data)?;
-        self.blob_index
-            .record(&meta, meta.publisher.clone(), true)?;
-        self.network.provide(&meta.id.0);
-        let _ = self
-            .network
-            .publisher
-            .send(NetworkMessage::Blob(bcast.clone()));
-        self.handle_blob_broadcast(&self.network.peer_id, bcast.clone())
-            .await?;
-        self.push_blob_to_peers(Some(self.network.peer_id), bcast)
-            .await;
-        Ok(())
-    }
-
-    /// Used by local RPC paths to ingest and disseminate freshly deployed programs.
-    pub async fn ingest_local_program(&self, meta: ProgramMetadata, wasm: Vec<u8>) -> Result<()> {
-        let bcast = ProgramBroadcast {
-            meta: meta.clone(),
-            wasm: wasm.clone(),
-        };
-        let _ = self
-            .network
-            .publisher
-            .send(NetworkMessage::Program(bcast.clone()));
-        self.handle_program_broadcast(&self.network.peer_id, bcast.clone())
-            .await?;
-        self.push_program_to_peers(Some(self.network.peer_id), bcast)
-            .await;
-        Ok(())
-    }
-
-    fn record_operation(&self, op: Operation, parents: Vec<DagRef>) -> Result<DagNode> {
-        let id = dag_id(&op, &parents);
-        let node = DagNode {
-            id: id.clone(),
-            parents,
-            op,
-            timestamp_ms: now_ms(),
-            publisher: self.identity.node_id.clone(),
-        };
-        let _ = self.dag_store.insert(&node)?;
-        Ok(node)
-    }
-
-    async fn handle_program_broadcast(&self, peer: &PeerId, bcast: ProgramBroadcast) -> Result<()> {
-        let already_present = self.program_store.metadata(&bcast.meta.id)?.is_some();
-        if let Some(existing) = self.program_store.metadata(&bcast.meta.id)? {
-            if existing.deploy_salt != bcast.meta.deploy_salt {
-                return Err(anyhow!("program id collision with different salt"));
-            }
-        }
-        self.program_store
-            .replicate(&bcast.meta, &bcast.wasm)
-            .context("replicate program")?;
-        self.program_index
-            .record(bcast.meta.id.clone(), bcast.meta.publisher.clone())?;
-        self.network.provide(&bcast.meta.id.0);
-        let parents = bcast
-            .meta
-            .blob_refs
-            .iter()
-            .cloned()
-            .map(DagRef::Blob)
-            .collect::<Vec<_>>();
-        let op = Operation::DeployProgram(bcast.meta.clone());
-        let _ = self.record_operation(op, parents)?;
-        self.refresh_sync_state().await?;
-        if !already_present {
-            self.push_program_to_peers(Some(*peer), bcast.clone()).await;
-        }
-        {
-            let mut st = self.sync_state.write().await;
-            st.pending_program_ids.remove(&bcast.meta.id);
-        }
-        Ok(())
-    }
-
-    async fn handle_program_metadata(
-        &self,
-        from: &PeerId,
-        metas: Vec<ProgramMetadata>,
-    ) -> Result<()> {
-        for meta in metas {
-            if self.program_store.metadata(&meta.id)?.is_some() {
-                continue;
-            }
-            self.program_store.store_metadata(&meta)?;
-            self.program_index
-                .record(meta.id.clone(), meta.publisher.clone())?;
-            self.network
-                .request_transfer(*from, TransferRequest::Program(meta.id.clone()));
-            let _ = self
-                .network
-                .publisher
-                .send(NetworkMessage::ProgramRequest(meta.id.clone()));
-            self.network
-                .find_providers(&meta.id.0, crate::network::ProviderKind::Program);
-        }
-        self.refresh_sync_state().await?;
-        Ok(())
-    }
-
-    async fn handle_program_sync_request(&self, req: ProgramSyncRequest) -> Result<()> {
-        let mut missing = Vec::new();
-        for meta in self.program_store.list()? {
-            if !req.bloom.contains(&meta.id.0) {
-                missing.push(meta);
-            }
-            if missing.len() >= PROGRAM_META_BATCH {
-                break;
-            }
-        }
-        if !missing.is_empty() {
-            let _ = self
-                .network
-                .publisher
-                .send(NetworkMessage::ProgramMeta(missing));
-        }
-        Ok(())
-    }
-
-    async fn handle_blob_broadcast(
-        &self,
-        peer: &PeerId,
-        bcast: crate::network::BlobBroadcast,
-    ) -> Result<()> {
-        let had_blob = self.blob_store.metadata(&bcast.meta.id)?.is_some();
-        // Always persist metadata; data fetched on demand via chunk requests.
-        self.blob_store.store_metadata(&bcast.meta)?;
-        // Record that the publisher has data; record local presence if we already have shards.
-        self.blob_index
-            .record(&bcast.meta, bcast.meta.publisher.clone(), true)?;
-        self.blob_index
-            .record(&bcast.meta, self.identity.node_id.clone(), had_blob)?;
-        // Only provide if we actually have shard data locally.
-        if had_blob {
-            self.network.provide(&bcast.meta.id.0);
-        } else if matches!(self.config.blob_sync_mode, BlobSyncMode::FullData) {
-            // Schedule prefetch in full sync mode.
-            self.enqueue_prefetch(bcast.meta.id.clone()).await;
-        }
-        let op = Operation::PublishBlob(bcast.meta.clone());
-        let _ = self.record_operation(op, Vec::new())?;
-        self.refresh_sync_state().await?;
-        if !had_blob {
-            self.push_blob_to_peers(Some(*peer), bcast).await;
-        }
-        Ok(())
-    }
-
-    async fn handle_blob_advertisement(&self, _peer: &PeerId, ad: BlobAdvertisement) -> Result<()> {
-        self.blob_index
-            .record(&ad.meta, ad.meta.publisher.clone(), ad.has_data)?;
-        // Keep metadata so we can request data later.
-        self.blob_store.store_metadata(&ad.meta).ok();
-        self.refresh_sync_state().await?;
-        Ok(())
-    }
-
-    async fn handle_blob_request(&self, req: BlobRequest) -> Result<()> {
-        for raw in req.ids {
-            let mut id_bytes = [0u8; 32];
-            id_bytes.copy_from_slice(&raw);
-            let id = BlobId(id_bytes);
-            if !req.want_data {
-                if let Some(meta) = self.blob_store.metadata(&id)? {
-                    let has_data = self.identity.node_id == meta.publisher
-                        || self.blob_store.load_shards(&id, 0).is_ok();
-                    let _ =
-                        self.network
-                            .publisher
-                            .send(NetworkMessage::BlobMeta(BlobAdvertisement {
-                                meta,
-                                has_data,
-                                locations: vec![self.identity.node_id.to_string()],
-                            }));
-                }
-                continue;
-            }
-            // Data path now uses chunk transfer; respond with advertisement only.
-            if let Some(meta) = self.blob_store.metadata(&id)? {
-                let _ = self
-                    .network
-                    .publisher
-                    .send(NetworkMessage::BlobMeta(BlobAdvertisement {
-                        meta,
-                        has_data: true,
-                        locations: vec![self.identity.node_id.to_string()],
-                    }));
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_execution_broadcast(
-        &self,
-        peer: &PeerId,
-        bcast: ExecutionBroadcast,
-    ) -> Result<()> {
-        let op = Operation::Compute(bcast.op.clone());
-        let parents = vec![
-            DagRef::Program(bcast.op.program_id.clone()),
-            DagRef::Blob(bcast.op.input.clone()),
-            DagRef::Blob(bcast.op.output.id.clone()),
-        ];
-        let id = dag_id(&op, &parents);
-        if id.0 != bcast.dag_id {
-            return Err(anyhow!("execution dag id mismatch"));
-        }
-        if self.dag_store.contains(&id)? {
-            return Ok(());
-        }
-        // apply state writes for this program in order
-        for sw in &bcast.op.state_writes {
-            self.state_store
-                .set_scoped(&bcast.op.program_id.0, &sw.key, &sw.value)?;
-        }
-        // ensure output blob present or at least indexed
-        if self.blob_store.metadata(&bcast.op.output.id)?.is_none() {
-            self.blob_store.store_metadata(&bcast.op.output).ok();
-            self.blob_index
-                .record(&bcast.op.output, bcast.op.output.publisher.clone(), false)?;
-        }
-        self.dag_store.insert(&DagNode {
-            id,
-            parents,
-            op,
-            timestamp_ms: now_ms(),
-            publisher: self.identity.node_id.clone(),
-        })?;
-        self.refresh_sync_state().await?;
-        self.push_execution_to_peers(Some(*peer), bcast.clone())
-            .await;
-        {
-            let mut st = self.sync_state.write().await;
-            st.pending_exec_ids.remove(&bcast.dag_id);
-        }
-        Ok(())
-    }
-
-    /// Attempt to fetch a blob from peers, storing it locally if successful.
-    pub async fn fetch_blob(&self, id: &BlobId) -> Result<Vec<u8>> {
-        // Ensure we have metadata; request it if missing.
-        let meta = match self.blob_store.metadata(id)? {
-            Some(m) => m,
-            None => {
-                let _ = self
-                    .network
-                    .publisher
-                    .send(NetworkMessage::BlobRequest(BlobRequest {
-                        ids: vec![id.0],
-                        want_data: false,
-                    }));
-                let peers = self.peers.read().await.clone();
-                for peer in &peers {
-                    self.network
-                        .request_transfer(*peer, TransferRequest::Blob(id.clone()));
-                }
-                self.network.find_providers(&id.0, ProviderKind::Blob);
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let meta_wait = loop {
-                    if let Some(m) = self.blob_store.metadata(id)? {
-                        break Some(m);
+                    UnifiedResponse::ObjectMetadata(metadata_resp) => {
+                        if let Some(object) = metadata_resp.metadata {
+                            tracing::info!("received object metadata for {}", object.id);
+                            let _ = self.unified_store.store_object(&object);
+                        }
                     }
-                    if Instant::now() >= deadline {
-                        break None;
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                };
-                meta_wait.ok_or_else(|| anyhow!("blob metadata missing"))?
+                    _ => {}
+                }
             }
-        };
-
-        if let Ok(existing) = self.blob_store.get(id) {
-            return Ok(existing);
-        }
-        {
-            let mut pending = self.pending_blob_fetches.write().await;
-            pending.insert(id.clone());
-        }
-        // Request data availability hints
-        let _ = self
-            .network
-            .publisher
-            .send(NetworkMessage::BlobRequest(BlobRequest {
-                ids: vec![id.0],
-                want_data: true,
-            }));
-        self.network.find_providers(&id.0, ProviderKind::Blob);
-        let peers = self.peers.read().await.clone();
-
-        let mut assembled = Vec::with_capacity(meta.size as usize);
-        let total_chunks = meta.chunk_sizes.len();
-        for (idx, _) in meta.chunk_sizes.iter().enumerate() {
-            if let Some(chunk) = self.blob_store.try_load_chunk(&meta, idx) {
-                assembled.extend_from_slice(&chunk);
-                continue;
-            }
-
-            let mut fetched = false;
-            // Try peers sequentially to avoid congestion
-            for peer in &peers {
-                self.network.request_transfer(
-                    *peer,
-                    TransferRequest::BlobChunk {
-                        id: id.clone(),
-                        chunk_idx: idx as u32,
-                    },
+            crate::network::TransferResponse::StateResponse(state_resp) => {
+                tracing::info!(
+                    "received state response for program {} ({} entries)",
+                    state_resp.program_id,
+                    state_resp.state_entries.len()
                 );
                 
-                // Wait up to 3 seconds per peer
-                let deadline = Instant::now() + Duration::from_secs(3);
-                loop {
-                    if let Some(chunk) = self.blob_store.try_load_chunk(&meta, idx) {
-                        assembled.extend_from_slice(&chunk);
-                        fetched = true;
-                        if Self::should_log_chunk(idx + 1, total_chunks) {
-                            tracing::info!(
-                                "blob {} fetched chunk {}/{}",
-                                hex::encode(id.0),
-                                idx + 1,
-                                total_chunks
-                            );
-                        }
-                        break;
-                    }
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                for (key, value) in &state_resp.state_entries {
+                    let _ = self.state_store.set_scoped(&state_resp.program_id.0, key, value);
                 }
-                if fetched { break; }
+                
+                let local_root = self.state_store.root_scoped(&state_resp.program_id.0)?;
+                if local_root == state_resp.state_root {
+                    tracing::info!("state sync successful, root matches: {}", hex::encode(local_root));
+                } else {
+                    tracing::warn!(
+                        "state root mismatch: expected {}, got {}",
+                        hex::encode(state_resp.state_root),
+                        hex::encode(local_root)
+                    );
+                }
             }
-
-            if !fetched {
-                 let mut pending = self.pending_blob_fetches.write().await;
-                 pending.remove(id);
-                 return Err(anyhow!(
-                     "blob chunk fetch failed for {} chunk {} (tried {} peers)",
-                     hex::encode(id.0),
-                     idx,
-                     peers.len()
-                 ));
-            }
+            _ => {}
         }
-        {
-            let mut pending = self.pending_blob_fetches.write().await;
-            pending.remove(id);
-        }
-        Ok(assembled)
+        Ok(())
     }
 
-    fn should_log_chunk(idx: usize, total: usize) -> bool {
-        idx == 1 || idx == total || idx.is_multiple_of(10)
-    }
-
-    async fn handle_execution_request(&self, ids: Vec<[u8; 32]>) -> Result<()> {
-        for raw in ids {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&raw);
-            let did = DagId(arr);
-            if let Some(node) = self.dag_store.get(&did)? {
-                if let Operation::Compute(op) = node.op {
-                    let _ = self.network.publisher.send(NetworkMessage::Execution(
-                        ExecutionBroadcast { dag_id: did.0, op },
-                    ));
-                }
+    async fn handle_network_message(&self, msg: NetworkMessage) -> Result<()> {
+        match msg {
+            NetworkMessage::UnifiedProtocol(unified_msg) => {
+                self.handle_unified_protocol(unified_msg).await?;
+            }
+            NetworkMessage::StateSync(state_sync) => {
+                self.handle_state_sync(state_sync).await?;
+            }
+            _ => {
+                tracing::debug!("received non-unified message");
             }
         }
         Ok(())
     }
 
-    async fn handle_inventory(
-        &self,
-        from: &PeerId,
-        inv: crate::network::DagInventory,
-    ) -> Result<()> {
-        let mut missing_programs = Vec::new();
-        for raw in &inv.programs {
-            let mut id_bytes = [0u8; 32];
-            id_bytes.copy_from_slice(raw);
-            let pid = ProgramId(id_bytes);
-            if self.program_store.metadata(&pid)?.is_none() {
-                missing_programs.push(pid);
-            }
+    async fn handle_state_sync(&self, sync_msg: crate::network::StateSyncMessage) -> Result<()> {
+        if sync_msg.executor_node == self.identity.node_id {
+            return Ok(());
         }
-
-        let mut missing_blobs = Vec::new();
-        for entry in &inv.blobs {
-            let mut id_bytes = [0u8; 32];
-            id_bytes.copy_from_slice(&entry.id);
-            let bid = BlobId(id_bytes);
-            if self.blob_store.metadata(&bid)?.is_none() {
-                missing_blobs.push(entry.clone());
-            }
+        
+        tracing::debug!(
+            "received state sync for program {} with {} writes from node {}",
+            sync_msg.program_id,
+            sync_msg.state_writes.len(),
+            sync_msg.executor_node
+        );
+        
+        for write in &sync_msg.state_writes {
+            self.state_store
+                .set_scoped(&sync_msg.program_id.0, &write.key, &write.value)
+                .context("applying remote state write")?;
         }
-
-        let mut missing_execs = Vec::new();
-        for raw in &inv.executions {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(raw);
-            let did = DagId(arr);
-            if !self.dag_store.contains(&did)? {
-                missing_execs.push(*raw);
-            }
+        
+        let mut versions = self.program_state_versions.write().await;
+        let version = versions.entry(sync_msg.program_id.clone()).or_insert(0);
+        *version += 1;
+        
+        let local_root = self.state_store.root_scoped(&sync_msg.program_id.0)?;
+        if local_root == sync_msg.state_root {
+            tracing::debug!("state sync successful for program {} (version {})", sync_msg.program_id, version);
+        } else {
+            tracing::warn!(
+                "state root mismatch for program {}: expected {}, got {}",
+                sync_msg.program_id,
+                hex::encode(sync_msg.state_root),
+                hex::encode(local_root)
+            );
         }
+        
+        Ok(())
+    }
 
-        if !missing_programs.is_empty() {
-            {
-                let mut state = self.sync_state.write().await;
-                for pid in &missing_programs {
-                    state.pending_program_ids.insert(pid.clone());
+    async fn handle_unified_protocol(&self, msg: crate::network::unified_protocol::UnifiedProtocolMessage) -> Result<()> {
+        match msg {
+            crate::network::unified_protocol::UnifiedProtocolMessage::ObjectAnnouncement(announcement) => {
+                tracing::info!(
+                    "received object announcement: {} ({} bytes, {} chunks)",
+                    announcement.object_id,
+                    announcement.total_size,
+                    announcement.chunk_count
+                );
+                
+                if let Some(ref distributor) = self.chunk_distributor {
+                    let _ = distributor.handle_announcement(announcement.clone()).await;
                 }
             }
-            for pid in missing_programs {
-                self.network
-                    .request_transfer(*from, TransferRequest::Program(pid.clone()));
-                let _ = self
-                    .network
-                    .publisher
-                    .send(NetworkMessage::ProgramRequest(pid.clone()));
-                self.network.find_providers(&pid.0, ProviderKind::Program);
+            crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadata(object) => {
+                let already_have = self.unified_store.get_object_metadata(&object.id).ok().flatten().is_some();
+                let is_complete = self.unified_store.is_complete(&object.id).unwrap_or(false);
+                
+                if !already_have {
+                    tracing::info!("received new object metadata: {}", object.id);
+                    if let Err(e) = self.unified_store.store_object(&object) {
+                        tracing::warn!("failed to store object metadata: {}", e);
+                        return Ok(());
+                    }
+                    tracing::info!("object {} metadata stored", object.id);
+                } else {
+                    tracing::debug!("already have metadata for object {}", object.id);
+                }
+                
+                if !is_complete && !already_have {
+                    if let Some(ref distributor) = self.chunk_distributor {
+                        tracing::info!("object {} not complete, triggering fetch", object.id);
+                        
+                        let distributor = distributor.clone();
+                        let object_id = object.id;
+                        tokio::spawn(async move {
+                            match distributor.fetch_object(&object_id).await {
+                                Ok(data) => {
+                                    tracing::info!("successfully fetched object {} ({} bytes)", object_id, data.len());
+                                }
+                                Err(e) => {
+                                    tracing::warn!("failed to fetch object {}: {}", object_id, e);
+                                }
+                            }
+                        });
+                    }
+                } else if is_complete {
+                    tracing::debug!("object {} already complete locally", object.id);
+                }
             }
-        } else if let Some(bloom) = inv.program_bloom.clone() {
-            let local = self.program_store.list()?;
-            for meta in local {
-                if !bloom.contains(&meta.id.0) {
-                    let _ = self
-                        .network
-                        .publisher
-                        .send(NetworkMessage::ProgramRequest(meta.id.clone()));
-                    self.network
-                        .find_providers(&meta.id.0, ProviderKind::Program);
+            crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadataRequest(req) => {
+                tracing::debug!("received metadata request for object {}", req.object_id);
+                
+                if let Ok(Some(object)) = self.unified_store.get_object_metadata(&req.object_id) {
+                    if self.unified_store.is_complete(&req.object_id).unwrap_or(false) {
+                        tracing::info!("responding with metadata for {}", req.object_id);
+                        
+                        let response_msg = crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadata(object);
+                        let network_msg = NetworkMessage::UnifiedProtocol(response_msg);
+                        let _ = self.network.publisher.send(network_msg);
+                    } else {
+                        tracing::debug!("have metadata for {} but object incomplete", req.object_id);
+                    }
+                } else {
+                    tracing::debug!("don't have metadata for {}", req.object_id);
+                }
+            }
+            crate::network::unified_protocol::UnifiedProtocolMessage::ManifestRequest(req) => {
+                tracing::debug!("received manifest request for object {}", req.object_id);
+                
+                if let Ok(Some(manifest)) = self.unified_store.get_manifest_by_object(&req.object_id) {
+                    tracing::info!("responding with manifest for {}", req.object_id);
+                    
+                    let response_msg = crate::network::unified_protocol::UnifiedProtocolMessage::ManifestResponse(manifest);
+                    let network_msg = NetworkMessage::UnifiedProtocol(response_msg);
+                    let _ = self.network.publisher.send(network_msg);
+                } else {
+                    tracing::debug!("don't have manifest for {}", req.object_id);
+                }
+            }
+            crate::network::unified_protocol::UnifiedProtocolMessage::ManifestResponse(manifest) => {
+                tracing::info!("received manifest response for object {}", manifest.object_id);
+                
+                if self.unified_store.get_manifest_by_object(&manifest.object_id).ok().flatten().is_none() {
+                    let _ = self.unified_store.store_manifest(&manifest);
+                    tracing::info!("stored manifest for {}", manifest.object_id);
                 }
             }
         }
-
-        if !missing_blobs.is_empty() {
-            let ids = missing_blobs.iter().map(|b| b.id).collect::<Vec<_>>();
-            let want_data = matches!(self.config.blob_sync_mode, BlobSyncMode::FullData);
-            let _ = self
-                .network
-                .publisher
-                .send(NetworkMessage::BlobRequest(BlobRequest { ids, want_data }));
-            for ad in &missing_blobs {
-                let mut id_bytes = [0u8; 32];
-                id_bytes.copy_from_slice(&ad.id);
-                let bid = BlobId(id_bytes);
-                self.network
-                    .request_transfer(*from, TransferRequest::Blob(bid.clone()));
-            }
-            for ad in missing_blobs {
-                let mut id_bytes = [0u8; 32];
-                id_bytes.copy_from_slice(&ad.id);
-                let bid = BlobId(id_bytes);
-                let meta = BlobMetadata {
-                    id: bid.clone(),
-                    publisher: NodeId::new(&[]),
-                    size: 0,
-                    mime: None,
-                    chunk_sizes: Vec::new(),
-                    chunk_hashes: Vec::new(),
-                    merkle_root: [0u8; 32],
-                    data_shards: 0,
-                    parity_shards: 0,
-                };
-                let node_id = ad
-                    .locations
-                    .first()
-                    .and_then(|s| hex::decode(s).ok())
-                    .and_then(|bytes| {
-                        let mut arr = [0u8; 32];
-                        if bytes.len() == 32 {
-                            arr.copy_from_slice(&bytes);
-                            Some(NodeId(arr))
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| self.identity.node_id.clone());
-                self.blob_index.record(&meta, node_id, false)?;
-                self.network
-                    .find_providers(&id_bytes, crate::network::ProviderKind::Blob);
-            }
-        }
-
-        if !missing_execs.is_empty() {
-            {
-                let mut state = self.sync_state.write().await;
-                for did in &missing_execs {
-                    state.pending_exec_ids.insert(*did);
-                }
-            }
-            let _ = self
-                .network
-                .publisher
-                .send(NetworkMessage::ExecutionRequest(missing_execs.clone()));
-            for did in &missing_execs {
-                self.network
-                    .request_transfer(*from, TransferRequest::Execution(*did));
-            }
-        }
-        self.update_sync_state(inv).await?;
         Ok(())
     }
 
     async fn handle_transfer_request(
         &self,
-        peer: &PeerId,
-        req: TransferRequest,
-        channel: ResponseChannel<TransferResponse>,
+        peer_id: PeerId,
+        req: crate::network::TransferRequest,
+        channel: libp2p::request_response::ResponseChannel<crate::network::TransferResponse>,
     ) -> Result<()> {
-        let response = match req {
-            TransferRequest::Program(pid) => {
-                let resp = match self.program_store.metadata(&pid) {
-                    Ok(Some(meta)) => self
-                        .program_store
-                        .load(&pid)
-                        .ok()
-                        .map(|wasm| ProgramBroadcast { meta, wasm }),
-                    _ => None,
-                };
-                TransferResponse::Program(resp)
+        match req {
+            crate::network::TransferRequest::Unified(unified_req) => {
+                let response = self.handle_unified_request(unified_req).await?;
+                self.network.respond_transfer(
+                    channel,
+                    crate::network::TransferResponse::Unified(response),
+                );
             }
-            TransferRequest::ProgramChunk { id, chunk_idx } => {
-                let resp = match self.program_store.get_program_chunk(&id, chunk_idx) {
-                    Ok(chunk_data) => chunk_data,
-                    _ => None,
-                };
-                TransferResponse::ProgramChunk {
-                    id,
-                    chunk_idx,
-                    chunk_data: resp,
-                }
+            crate::network::TransferRequest::StateRequest(state_req) => {
+                let response = self.handle_state_request(state_req).await?;
+                self.network.respond_transfer(
+                    channel,
+                    crate::network::TransferResponse::StateResponse(response),
+                );
             }
-            TransferRequest::Blob(bid) => {
-                let resp = match self.blob_store.metadata(&bid) {
-                    Ok(Some(meta)) => Some(BlobBroadcast { meta }),
-                    _ => None,
-                };
-                TransferResponse::Blob(resp)
-            }
-            TransferRequest::BlobChunk { id, chunk_idx } => {
-                let resp = match self.blob_store.metadata(&id) {
-                    Ok(Some(meta)) => self
-                        .blob_store
-                        .load_shards(&id, chunk_idx)
-                        .and_then(|shards| {
-                            reconstruct_chunk(
-                                shards.clone(),
-                                meta.data_shards as usize,
-                                meta.parity_shards as usize,
-                                *meta.chunk_sizes.get(chunk_idx as usize).unwrap_or(&0) as usize,
-                            )
-                            .map(|_| shards)
-                        })
-                        .ok(),
-                    _ => None,
-                };
-                TransferResponse::BlobChunk {
-                    id,
-                    chunk_idx,
-                    shards: resp,
-                }
-            }
-            TransferRequest::Execution(did) => {
-                let mut id = [0u8; 32];
-                id.copy_from_slice(&did);
-                let resp = match self.dag_store.get(&DagId(id)) {
-                    Ok(Some(node)) => {
-                        if let Operation::Compute(op) = node.op {
-                            Some(ExecutionBroadcast { dag_id: did, op })
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-                TransferResponse::Execution(resp)
-            }
-            TransferRequest::PushProgram(bcast) => {
-                self.handle_program_broadcast(peer, bcast.clone()).await?;
-                TransferResponse::Program(None)
-            }
-            #[allow(unused_variables)]
-            TransferRequest::PushProgramChunk { id, chunk_idx, chunk_data } => {
-                match self.program_store.store_chunk(&id, chunk_idx, &chunk_data) {
-                    Ok(_) => {
-                        tracing::debug!("stored chunk {} for program {}", chunk_idx, id);
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to store chunk {} for program {}: {}", chunk_idx, id, e);
-                    }
-                }
-                TransferResponse::Ack
-            }
-            TransferRequest::PushBlob(bcast) => {
-                self.handle_blob_broadcast(peer, bcast.clone()).await?;
-                TransferResponse::Blob(None)
-            }
-            TransferRequest::PushExecution(bcast) => {
-                self.handle_execution_broadcast(peer, bcast.clone()).await?;
-                TransferResponse::Execution(None)
-            }
-            TransferRequest::Sync(snapshot) => {
-                let (missing_programs, missing_execs) = self.diff_snapshot(&snapshot)?;
-                // also proactively request missing items
-                for pid in &missing_programs {
-                    self.network
-                        .request_transfer(*peer, TransferRequest::Program(pid.clone()));
-                    self.network.find_providers(&pid.0, ProviderKind::Program);
-                }
-                for did in &missing_execs {
-                    self.network
-                        .request_transfer(*peer, TransferRequest::Execution(*did));
-                }
-                TransferResponse::Sync(SyncDelta {
-                    missing_programs,
-                    missing_executions: missing_execs,
-                })
-            }
-        };
-        self.network.respond_transfer(channel, response);
-        Ok(())
-    }
-
-    async fn handle_transfer_response(&self, peer: &PeerId, resp: TransferResponse) -> Result<()> {
-        match resp {
-            TransferResponse::Program(Some(bcast)) => {
-                self.handle_program_broadcast(peer, bcast.clone()).await?;
-                let mut state = self.sync_state.write().await;
-                state.pending_program_ids.remove(&bcast.meta.id);
-                self.refresh_sync_state().await?;
-            }
-            TransferResponse::Blob(Some(bcast)) => {
-                self.handle_blob_broadcast(peer, bcast).await?;
-            }
-            TransferResponse::BlobChunk {
-                id,
-                chunk_idx,
-                shards,
-            } => {
-                if let Some(shards) = shards {
-                    if let Some(meta) = self.blob_store.metadata(&id)? {
-                        match self
-                            .blob_store
-                            .store_chunk(&meta, chunk_idx as usize, &shards)
-                        {
-                            Ok(_) => {
-                                self.blob_index.record(
-                                    &meta,
-                                    self.identity.node_id.clone(),
-                                    true,
-                                )?;
-                                if Self::should_log_chunk(
-                                    chunk_idx as usize + 1,
-                                    meta.chunk_sizes.len(),
-                                ) {
-                                    tracing::info!(
-                                        "received chunk {}/{} for blob {}",
-                                        chunk_idx + 1,
-                                        meta.chunk_sizes.len(),
-                                        hex::encode(id.0)
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "failed to store chunk {} for blob {}: {e:?}",
-                                    chunk_idx,
-                                    hex::encode(id.0)
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            TransferResponse::Execution(Some(bcast)) => {
-                self.handle_execution_broadcast(peer, bcast.clone()).await?;
-                let mut state = self.sync_state.write().await;
-                state.pending_exec_ids.remove(&bcast.dag_id);
-                self.refresh_sync_state().await?;
-            }
-            TransferResponse::Sync(delta) => {
-                {
-                    let mut state = self.sync_state.write().await;
-                    for pid in &delta.missing_programs {
-                        state.pending_program_ids.insert(pid.clone());
-                    }
-                    for did in &delta.missing_executions {
-                        state.pending_exec_ids.insert(*did);
-                    }
-                }
-                // If delta is empty, we might already be in sync; refresh state.
-                if delta.missing_programs.is_empty() && delta.missing_executions.is_empty() {
-                    self.refresh_sync_state().await?;
-                }
-                for pid in delta.missing_programs {
-                    self.network
-                        .request_transfer(*peer, TransferRequest::Program(pid.clone()));
-                    self.network.find_providers(&pid.0, ProviderKind::Program);
-                }
-                for did in delta.missing_executions {
-                    self.network
-                        .request_transfer(*peer, TransferRequest::Execution(did));
-                }
-            }
-            _ => {}
-        }
-        if self.is_fully_synced().await {
-            tracing::info!("sync complete: programs/blobs/executions fully present");
-        }
-        Ok(())
-    }
-
-    async fn push_program_to_peers(&self, exclude: Option<PeerId>, bcast: ProgramBroadcast) {
-        let peers = self.peers.read().await.clone();
-        for peer in peers {
-            if exclude.as_ref().map(|p| p == &peer).unwrap_or(false) {
-                continue;
-            }
-            self.network
-                .request_transfer(peer, TransferRequest::PushProgram(bcast.clone()));
-        }
-    }
-
-    async fn push_blob_to_peers(&self, exclude: Option<PeerId>, bcast: BlobBroadcast) {
-        let peers = self.peers.read().await.clone();
-        for peer in peers {
-            if exclude.as_ref().map(|p| p == &peer).unwrap_or(false) {
-                continue;
-            }
-            self.network
-                .request_transfer(peer, TransferRequest::PushBlob(bcast.clone()));
-        }
-    }
-
-    async fn push_execution_to_peers(&self, exclude: Option<PeerId>, bcast: ExecutionBroadcast) {
-        let peers = self.peers.read().await.clone();
-        for peer in peers {
-            if exclude.as_ref().map(|p| p == &peer).unwrap_or(false) {
-                continue;
-            }
-            self.network
-                .request_transfer(peer, TransferRequest::PushExecution(bcast.clone()));
-        }
-    }
-
-    async fn push_all_programs_to_peer(&self, peer: PeerId) -> Result<()> {
-        for meta in self.program_store.list()? {
-            if let Ok(wasm) = self.program_store.load(&meta.id) {
-                self.network.request_transfer(
-                    peer,
-                    TransferRequest::PushProgram(ProgramBroadcast {
-                        meta: meta.clone(),
-                        wasm,
-                    }),
+            _ => {
+                tracing::debug!("received non-unified transfer request from {}", peer_id);
+                self.network.respond_transfer(
+                    channel,
+                    crate::network::TransferResponse::Ack,
                 );
             }
         }
         Ok(())
     }
 
-    async fn push_all_executions_to_peer(&self, peer: PeerId) -> Result<()> {
-        for entry in self.dag_store.all_compute_ops()? {
-            if let Operation::Compute(op) = entry.op.clone() {
-                let bcast = ExecutionBroadcast {
-                    dag_id: entry.id.0,
-                    op: op.clone(),
-                };
-                let _ = self
-                    .network
-                    .publisher
-                    .send(NetworkMessage::Execution(bcast.clone()));
-                // also direct push to the peer via transfer to reduce reliance on gossip
-                self.network
-                    .request_transfer(peer, TransferRequest::PushExecution(bcast));
-            }
-        }
-        Ok(())
-    }
-
-    async fn push_program_meta_to_peer(&self, _peer: PeerId) -> Result<()> {
-        let metas = self.program_store.list()?;
-        if metas.is_empty() {
-            return Ok(());
-        }
-        // send via gossip path so all connected peers get it
-        let _ = self
-            .network
-            .publisher
-            .send(NetworkMessage::ProgramMeta(metas));
-        Ok(())
-    }
-
-    async fn request_missing_executions(&self, _peer: PeerId) -> Result<()> {
-        let ids = self.dag_store.execution_ids()?;
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let _ = self
-            .network
-            .publisher
-            .send(NetworkMessage::ExecutionRequest(ids));
-        Ok(())
-    }
-
-    async fn send_sync_snapshot(&self, peer: PeerId) -> Result<()> {
-        let programs = self
-            .program_store
-            .list()?
-            .into_iter()
-            .map(|m| m.id)
-            .collect::<Vec<_>>();
-        let executions = self.dag_store.execution_ids()?;
-        self.network.request_transfer(
-            peer,
-            TransferRequest::Sync(SyncSnapshot {
-                programs,
-                executions,
-            }),
+    async fn handle_state_request(&self, req: crate::network::StateRequest) -> Result<crate::network::StateResponse> {
+        let state_entries = self.state_store.get_all_scoped(&req.program_id.0)?;
+        let state_root = self.state_store.root_scoped(&req.program_id.0)?;
+        
+        tracing::info!(
+            "responding to state request for program {} ({} entries, root: {})",
+            req.program_id,
+            state_entries.len(),
+            hex::encode(state_root)
         );
-        Ok(())
+        
+        Ok(crate::network::StateResponse {
+            program_id: req.program_id,
+            state_root,
+            state_entries,
+        })
     }
 
-    fn diff_snapshot(&self, snapshot: &SyncSnapshot) -> Result<(Vec<ProgramId>, Vec<[u8; 32]>)> {
-        let mut missing_programs = Vec::new();
-        for pid in &snapshot.programs {
-            if self.program_store.metadata(pid)?.is_none() {
-                missing_programs.push(pid.clone());
+    async fn handle_unified_request(
+        &self,
+        req: crate::network::unified_protocol::UnifiedRequest,
+    ) -> Result<crate::network::unified_protocol::UnifiedResponse> {
+        use crate::network::unified_protocol::*;
+        
+        match req {
+            UnifiedRequest::GetChunk(chunk_req) => {
+                let chunk_data = self.unified_store.get_chunk(&chunk_req.chunk_id)?;
+                Ok(UnifiedResponse::Chunk(ChunkResponse {
+                    chunk_id: chunk_req.chunk_id,
+                    data: chunk_data.map(|c| c.data),
+                }))
+            }
+            UnifiedRequest::GetManifest(manifest_req) => {
+                let manifest = self.unified_store.get_manifest_by_object(&manifest_req.object_id)?;
+                Ok(UnifiedResponse::Manifest(ManifestResponse { manifest }))
+            }
+            UnifiedRequest::GetChunks(batch_req) => {
+                let chunks: Vec<_> = batch_req.chunk_ids
+                    .iter()
+                    .map(|cid| {
+                        let data = self.unified_store.get_chunk(cid).ok().flatten().map(|c| c.data);
+                        (*cid, data)
+                    })
+                    .collect();
+                Ok(UnifiedResponse::Chunks(BatchChunkResponse { chunks }))
+            }
+            UnifiedRequest::GetObjectAvailability(avail_req) => {
+                let has_object = self.unified_store.is_complete(&avail_req.object_id).unwrap_or(false);
+                let manifest = self.unified_store.get_manifest_by_object(&avail_req.object_id).ok().flatten();
+                let has_manifest = manifest.is_some();
+                let metadata = self.unified_store.get_object_metadata(&avail_req.object_id).ok().flatten();
+                
+                let (available_chunks, missing_chunks) = if let Some(ref m) = manifest {
+                    let missing = self.unified_store.get_missing_chunks(m).unwrap_or_default();
+                    let available: Vec<_> = m.chunks.iter()
+                        .filter(|c| !missing.contains(&c.chunk_id))
+                        .map(|c| c.chunk_id)
+                        .collect();
+                    (available, missing)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                
+                Ok(UnifiedResponse::ObjectAvailability(ObjectAvailabilityResponse {
+                    object_id: avail_req.object_id,
+                    has_object,
+                    has_manifest,
+                    available_chunks,
+                    missing_chunks,
+                    metadata,
+                }))
+            }
+            UnifiedRequest::GetObjectMetadata(metadata_req) => {
+                let metadata = self.unified_store.get_object_metadata(&metadata_req.object_id).ok().flatten();
+                Ok(UnifiedResponse::ObjectMetadata(ObjectMetadataResponse {
+                    object_id: metadata_req.object_id,
+                    metadata,
+                }))
             }
         }
-        let mut missing_execs = Vec::new();
-        for did in &snapshot.executions {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(did);
-            let did = DagId(arr);
-            if !self.dag_store.contains(&did)? {
-                missing_execs.push(did.0);
-            }
-        }
-        Ok((missing_programs, missing_execs))
     }
 
-    async fn retry_missing(&self) -> Result<()> {
-        let peers = self.peers.read().await.clone();
-        if peers.is_empty() {
-            return Ok(());
-        }
-        let peer = *peers.iter().next().unwrap();
-        let (programs, execs) = {
-            let state = self.sync_state.read().await;
-            (
-                state.pending_program_ids.clone(),
-                state.pending_exec_ids.clone(),
-            )
-        };
-        for pid in programs {
-            self.network
-                .request_transfer(peer, TransferRequest::Program(pid));
-        }
-        for did in execs {
-            self.network
-                .request_transfer(peer, TransferRequest::Execution(did));
-        }
+    async fn periodic_sync(&self) -> Result<()> {
         Ok(())
     }
 
-    async fn broadcast_inventory(&self, force: bool) -> Result<()> {
-        if !force && self.peers.read().await.len() < self.config.min_peers {
-            return Ok(());
-        }
-        let programs: Vec<[u8; 32]> = self
-            .program_store
-            .list()?
-            .into_iter()
-            .map(|p| p.id.0)
-            .collect();
-        let program_bloom = Some(BloomFilter::from_programs(&programs));
-        let blobs = self
-            .blob_index
-            .inventory_records()?
-            .into_iter()
-            .map(|rec| BlobInventoryEntry {
-                id: rec.meta.id.0,
-                has_data: rec.has_data,
-                locations: rec.locations.iter().map(|n| n.to_string()).collect(),
-            })
-            .collect();
-        let executions = self.dag_store.execution_ids()?;
-        let inv = crate::network::DagInventory {
-            programs,
-            program_bloom,
-            blobs,
-            executions,
-        };
-        let _ = self.network.publisher.send(NetworkMessage::Inventory(inv));
-        Ok(())
-    }
-
-    pub async fn request_inventory(&self) -> Result<()> {
-        let _ = self
-            .network
-            .publisher
-            .send(NetworkMessage::InventoryRequest);
-        Ok(())
-    }
-
-    pub async fn request_program_sync(&self) -> Result<()> {
-        let program_ids: Vec<[u8; 32]> = self
-            .program_store
-            .list()?
-            .into_iter()
-            .map(|p| p.id.0)
-            .collect();
-        let bloom = BloomFilter::from_programs(&program_ids);
-        let _ = self
-            .network
-            .publisher
-            .send(NetworkMessage::ProgramSyncRequest(ProgramSyncRequest {
-                bloom,
-            }));
-        Ok(())
-    }
-
-    pub async fn is_fully_synced(&self) -> bool {
-        let state = self.sync_state.read().await;
-        state.last_seen
-            && state.missing_programs == 0
-            && state.missing_blobs == 0
-            && state.missing_execs == 0
-            && state.pending_program_ids.is_empty()
-            && state.pending_exec_ids.is_empty()
-    }
-
-    pub async fn refresh_sync_state(&self) -> Result<()> {
-        let inv = {
-            let state = self.sync_state.read().await;
-            state.last_inventory.clone()
-        };
-        if let Some(inv) = inv {
-            self.update_sync_state(inv).await?;
-        }
-        Ok(())
-    }
-
-    async fn update_sync_state(&self, inv: crate::network::DagInventory) -> Result<()> {
-        let missing_programs = inv
-            .programs
-            .iter()
-            .filter(|raw| {
-                let pid = ProgramId(**raw);
-                self.program_store
-                    .metadata(&pid)
-                    .map(|m| m.is_none())
-                    .unwrap_or(true)
-            })
-            .count();
-        let missing_blobs = inv
-            .blobs
-            .iter()
-            .filter(|entry| {
-                let bid = BlobId(entry.id);
-                self.blob_store
-                    .metadata(&bid)
-                    .map(|m| m.is_none())
-                    .unwrap_or(true)
-            })
-            .count();
-        let missing_execs = inv
-            .executions
-            .iter()
-            .filter(|raw| {
-                let did = DagId(**raw);
-                !self.dag_store.contains(&did).unwrap_or(false)
-            })
-            .count();
-        let mut state = self.sync_state.write().await;
-        state.last_inventory = Some(inv);
-        state.missing_programs = missing_programs;
-        state.missing_blobs = missing_blobs;
-        state.missing_execs = missing_execs;
-        state.last_seen = true;
-        Ok(())
+    pub async fn start_fetch_workers(&self, _worker_count: usize) {
     }
 
     pub async fn peer_count(&self) -> usize {
         self.peers.read().await.len()
     }
 
-    pub async fn sync_gaps(&self) -> Option<(usize, usize, usize)> {
-        let state = self.sync_state.read().await;
-        state.last_inventory.as_ref().map(|_| {
-            (
-                state.missing_programs,
-                state.missing_blobs,
-                state.missing_execs,
-            )
-        })
-    }
-
-    async fn handle_provider_hint(&self, key: &[u8], kind: ProviderKind) -> Result<()> {
-        if key.len() != 32 {
-            return Ok(());
-        }
-        let mut id_bytes = [0u8; 32];
-        id_bytes.copy_from_slice(key);
-        match kind {
-            ProviderKind::Program => {
-                let pid = ProgramId(id_bytes);
-                let _ = self
-                    .network
-                    .publisher
-                    .send(NetworkMessage::ProgramRequest(pid));
-            }
-            ProviderKind::Blob => {
-                let want_data = matches!(self.config.blob_sync_mode, BlobSyncMode::FullData);
-                let _ = self
-                    .network
-                    .publisher
-                    .send(NetworkMessage::BlobRequest(BlobRequest {
-                        ids: vec![id_bytes],
-                        want_data,
-                    }));
-                self.network.find_providers(&id_bytes, ProviderKind::Blob);
-            }
-        }
+    pub async fn request_inventory(&self) -> Result<()> {
         Ok(())
     }
-}
 
-fn dag_id(op: &Operation, parents: &[DagRef]) -> DagId {
-    let mut buf = Vec::new();
-    for p in parents {
-        match p {
-            DagRef::Program(id) => buf.extend_from_slice(&id.0),
-            DagRef::Blob(id) => buf.extend_from_slice(&id.0),
-            DagRef::Execution(id) => buf.extend_from_slice(&id.0),
-        }
+    pub async fn refresh_sync_state(&self) -> Result<()> {
+        Ok(())
     }
-    buf.extend(
-        serde_json::to_vec(op)
-            .expect("operation serializes")
-            .as_slice(),
-    );
-    DagId(hash_bytes(&buf))
-}
 
-fn now_ms() -> u64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
-    now.as_millis() as u64
+    pub async fn is_fully_synced(&self) -> bool {
+        true
+    }
+
+    pub async fn sync_gaps(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
+
+    pub async fn set_job_sync(&self, job_sync: Arc<crate::syncer::JobSyncManager>) {
+        *self.job_sync.write().await = Some(job_sync);
+    }
 }

@@ -1,7 +1,6 @@
 use super::runtime::{ExecutionConfig, ExecutionEngine};
 use crate::execution::manifest::{AllowedImports, RuntimeConfig};
-use crate::execution::ProgramStore;
-use crate::storage::{BlobStore, StateStore};
+use crate::storage::StateStore;
 use crate::types::ProgramId;
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
@@ -120,18 +119,18 @@ pub struct SandboxedExecutor {
 
 impl SandboxedExecutor {
     pub fn new(
-        blob_store: Arc<BlobStore>,
+        unified_store: Arc<crate::storage::UnifiedStore>,
         state_store: Arc<StateStore>,
-        program_store: Arc<ProgramStore>,
+        execution_adapter: Arc<crate::execution::ExecutionAdapter>,
         validator: SandboxValidator,
     ) -> Result<Self> {
         let config = ExecutionConfig {
             max_fuel: validator.max_fuel_limit,
         };
         let base_engine = Arc::new(ExecutionEngine::new(
-            blob_store,
+            unified_store,
             state_store,
-            program_store,
+            execution_adapter,
             config,
         )?);
 

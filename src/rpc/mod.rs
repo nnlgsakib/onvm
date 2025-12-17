@@ -45,7 +45,6 @@ struct DeployProgramRequest {
     wasm_base64: String,
     entrypoint: String,
     blob_refs: Vec<String>,
-    salt_base64: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -77,8 +76,7 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
     let mut job_executor = crate::execution::JobExecutor::new(
         node.execution.clone(),
         job_store.clone(),
-        node.program_store.clone(),
-        node.blob_store.clone(),
+        node.unified_store.clone(),
         db.clone(),
     )?;
     job_executor.set_consensus(node.consensus.clone());
@@ -93,7 +91,7 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
     let job_ctx = Arc::new(JobRpcContext {
         scheduler: Arc::new(job_scheduler),
         job_store: job_store.clone(),
-        blob_store: node.blob_store.clone(),
+        unified_store: node.unified_store.clone(),
         consensus: node.consensus.clone(),
     });
 
@@ -180,19 +178,23 @@ async fn upload_blob(
                 .map(|s| s.to_string())
         });
     let data = body.to_vec();
-    let meta = ctx
+    let object = ctx
         .node
-        .blob_store
-        .put(&data, mime, ctx.node.identity.node_id.clone())
+        .unified_store
+        .put_object(
+            &data,
+            crate::types::ObjectType::Blob { mime_type: mime },
+            ctx.node.identity.node_id.clone(),
+        )
         .map_err(internal_err)?;
     ctx.node
         .consensus
-        .ingest_local_blob(meta.clone(), data)
+        .ingest_local_blob(object.clone(), data)
         .await
         .map_err(internal_err)?;
     Ok(Json(UploadBlobResponse {
-        id: hex::encode(meta.id.0),
-        size: meta.size,
+        id: hex::encode(object.id.0),
+        size: object.total_size,
     }))
 }
 
@@ -201,7 +203,8 @@ async fn fetch_blob(
     Path(id_hex): Path<String>,
 ) -> Result<Vec<u8>, (axum::http::StatusCode, String)> {
     let id = parse_blob_id(&id_hex).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
-    match ctx.node.blob_store.get(&id) {
+    let object_id = id.to_object_id();
+    match ctx.node.unified_store.get_object(&object_id) {
         Ok(data) => Ok(data),
         Err(_) => ctx
             .node
@@ -223,35 +226,49 @@ async fn deploy_program(
     let blob_refs = req
         .blob_refs
         .into_iter()
-        .map(|h| parse_blob_id(&h))
+        .map(|h| {
+            let id = parse_blob_id(&h)?;
+            Ok(id.to_object_id())
+        })
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
-    let deploy_salt = if let Some(s) = req.salt_base64 {
-        general_purpose::STANDARD
-            .decode(s)
-            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?
-    } else {
-        uuid::Uuid::new_v4().as_bytes().to_vec()
+        .map_err(|e: String| (axum::http::StatusCode::BAD_REQUEST, e))?;
+
+    let deploy_salt = {
+        use std::time::SystemTime;
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&timestamp.to_le_bytes());
+        hasher.update(&ctx.node.identity.node_id.0);
+        hasher.update(&wasm);
+        hasher.finalize().as_bytes().to_vec()
     };
 
-    let meta = ctx
+    let object = ctx
         .node
-        .program_store
-        .deploy(
+        .unified_store
+        .put_object(
             &wasm,
-            req.entrypoint,
+            crate::types::ObjectType::WasmProgram {
+                entrypoint: req.entrypoint,
+                wasm_version: Some("1.0".to_string()),
+                source_language: None,
+                compiler: None,
+                blob_refs,
+                deploy_salt,
+            },
             ctx.node.identity.node_id.clone(),
-            blob_refs,
-            deploy_salt,
         )
         .map_err(internal_err)?;
     ctx.node
         .consensus
-        .ingest_local_program(meta.clone(), wasm)
+        .ingest_local_program(object.clone(), wasm)
         .await
         .map_err(internal_err)?;
     Ok(Json(DeployProgramResponse {
-        id: hex::encode(meta.id.0),
+        id: hex::encode(object.id.0),
     }))
 }
 
@@ -260,15 +277,23 @@ async fn program_info(
     Path(id_hex): Path<String>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let id = parse_program_id(&id_hex).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
-    let meta = ctx.node.program_store.metadata(&id).map_err(internal_err)?;
-    match meta {
-        Some(m) => Ok(Json(serde_json::json!({
-            "id": hex::encode(m.id.0),
-            "publisher": hex::encode(m.publisher.0),
-            "size": m.size,
-            "entrypoint": m.entrypoint,
-            "blob_refs": m.blob_refs.iter().map(|b| hex::encode(b.0)).collect::<Vec<_>>(),
-        }))),
+    let object_id = id.to_object_id();
+    let object = ctx.node.unified_store.get_object_metadata(&object_id).map_err(internal_err)?;
+    match object {
+        Some(obj) => {
+            match &obj.object_type {
+                crate::types::ObjectType::WasmProgram { entrypoint, blob_refs, .. } => {
+                    Ok(Json(serde_json::json!({
+                        "id": hex::encode(obj.id.0),
+                        "publisher": hex::encode(obj.publisher.0),
+                        "size": obj.total_size,
+                        "entrypoint": entrypoint,
+                        "blob_refs": blob_refs.iter().map(|b| hex::encode(b.0)).collect::<Vec<_>>(),
+                    })))
+                }
+                _ => Err((axum::http::StatusCode::BAD_REQUEST, "not a WASM program".to_string())),
+            }
+        }
         None => Err((axum::http::StatusCode::NOT_FOUND, "not found".to_string())),
     }
 }

@@ -64,16 +64,47 @@ struct ExecuteResponse {
     fuel: u64,
 }
 
+#[derive(Deserialize)]
+struct EstimateFuelRequest {
+    program_id: String,
+    input_base64: String,
+}
+
+#[derive(Serialize)]
+struct EstimateFuelResponse {
+    estimated_fuel: u64,
+    confidence: f64,
+    based_on_samples: usize,
+    input_size_bytes: usize,
+    estimated_execution_time_ms: u64,
+}
+
+#[derive(Serialize)]
+struct FuelProfileResponse {
+    program_id: String,
+    samples: Vec<FuelSampleResponse>,
+    average_fuel_per_byte: f64,
+    base_fuel_cost: u64,
+}
+
+#[derive(Serialize)]
+struct FuelSampleResponse {
+    input_size: usize,
+    fuel_consumed: u64,
+    execution_time_ms: u64,
+    timestamp: u64,
+}
+
 pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
     let ctx = RpcContext { node: node.clone() };
 
     let db = node.db.clone();
 
-    let job_store = Arc::new(crate::execution::JobStore::new(db.clone())?);
+    let job_store = Arc::new(crate::wasm_runtime::JobStore::new(db.clone())?);
 
-    let health_reporter = Arc::new(crate::execution::HealthReporter::new_with_db(Some(db.clone())));
+    let health_reporter = Arc::new(crate::wasm_runtime::HealthReporter::new_with_db(Some(db.clone())));
 
-    let mut job_executor = crate::execution::JobExecutor::new(
+    let mut job_executor = crate::wasm_runtime::JobExecutor::new(
         node.execution.clone(),
         job_store.clone(),
         node.unified_store.clone(),
@@ -81,7 +112,7 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
     )?;
     job_executor.set_consensus(node.consensus.clone());
 
-    let mut job_scheduler = crate::execution::JobScheduler::new(
+    let mut job_scheduler = crate::wasm_runtime::JobScheduler::new(
         Arc::new(job_executor),
         job_store.clone(),
         10,
@@ -131,6 +162,8 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
         .route("/programs", post(deploy_program))
         .route("/programs/:id", get(program_info))
         .route("/execute", post(execute_program))
+        .route("/estimate-fuel", post(estimate_fuel))
+        .route("/fuel-profile/:program_id", get(get_fuel_profile))
         .merge(job_routes().with_state(job_ctx))
         .merge(health_routes().with_state(health_ctx))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_SIZE_BYTES))
@@ -307,15 +340,79 @@ async fn execute_program(
     let input = general_purpose::STANDARD
         .decode(req.input_base64)
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    
+    let start_time = std::time::Instant::now();
     let result = ctx
         .node
         .consensus
         .submit_execution(&program_id, &input)
         .await
         .map_err(internal_err)?;
+    let execution_time_ms = start_time.elapsed().as_millis() as u64;
+    
+    let _ = ctx.node.fuel_estimator.record_execution(
+        &program_id,
+        input.len(),
+        result.fuel_consumed,
+        execution_time_ms,
+    ).await;
+    
     Ok(Json(ExecuteResponse {
         return_base64: general_purpose::STANDARD.encode(result.return_data),
         fuel: result.fuel_consumed,
+    }))
+}
+
+async fn estimate_fuel(
+    State(ctx): State<RpcContext>,
+    Json(req): Json<EstimateFuelRequest>,
+) -> Result<Json<EstimateFuelResponse>, (axum::http::StatusCode, String)> {
+    let program_id =
+        parse_program_id(&req.program_id).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    let input = general_purpose::STANDARD
+        .decode(req.input_base64)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    
+    let estimate = ctx
+        .node
+        .fuel_estimator
+        .estimate_fuel(&program_id, &input)
+        .await
+        .map_err(internal_err)?;
+    
+    Ok(Json(EstimateFuelResponse {
+        estimated_fuel: estimate.estimated_fuel,
+        confidence: estimate.confidence,
+        based_on_samples: estimate.based_on_samples,
+        input_size_bytes: estimate.input_size_bytes,
+        estimated_execution_time_ms: estimate.estimated_execution_time_ms,
+    }))
+}
+
+async fn get_fuel_profile(
+    State(ctx): State<RpcContext>,
+    Path(program_id_hex): Path<String>,
+) -> Result<Json<FuelProfileResponse>, (axum::http::StatusCode, String)> {
+    let program_id =
+        parse_program_id(&program_id_hex).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    
+    let profile = ctx
+        .node
+        .fuel_estimator
+        .get_profile(&program_id)
+        .await
+        .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "no profile found".to_string()))?;
+    
+    Ok(Json(FuelProfileResponse {
+        program_id: program_id_hex,
+        samples: profile.samples.iter().map(|s| FuelSampleResponse {
+            input_size: s.input_size,
+            fuel_consumed: s.fuel_consumed,
+            execution_time_ms: s.execution_time_ms,
+            timestamp: s.timestamp,
+        }).collect(),
+        average_fuel_per_byte: profile.average_fuel_per_byte,
+        base_fuel_cost: profile.base_fuel_cost,
     }))
 }
 

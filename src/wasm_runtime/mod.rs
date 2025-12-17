@@ -1,4 +1,5 @@
 mod execution_pool;
+mod fuel_estimator;
 mod health;
 mod job;
 mod job_executor;
@@ -12,6 +13,7 @@ mod execution_adapter;
 
 pub use crate::storage::StateStore;
 pub use execution_pool::ExecutionPool;
+pub use fuel_estimator::{FuelEstimate, FuelEstimator, FuelProfile, FuelSample};
 pub use health::{
     HealthReporter, HealthStatus, NodeCapacity, NodeHealth, NodeMetrics, ResourceUsage,
 };

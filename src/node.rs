@@ -1,6 +1,6 @@
 use crate::consensus::{BlobSyncMode, DagConfig, DagEngine};
 use crate::crypto::keys::NodeKeys;
-use crate::execution::{ExecutionAdapter, ExecutionEngine, ExecutionPool};
+use crate::wasm_runtime::{ExecutionAdapter, ExecutionEngine, ExecutionPool, FuelEstimator};
 use crate::network::{ChunkDistributor, NetworkConfig, NetworkHandle, NetworkService, NetworkStreams};
 use crate::storage::UnifiedStore;
 use crate::syncer::SyncMan;
@@ -28,6 +28,7 @@ pub struct Node {
     pub execution: Arc<ExecutionEngine>,
     pub scheduler: Arc<ExecutionPool>,
     pub consensus: Arc<DagEngine>,
+    pub fuel_estimator: Arc<FuelEstimator>,
     pub network: NetworkHandle,
     pub db: sled::Db,
     #[allow(dead_code)]
@@ -58,9 +59,14 @@ impl Node {
             unified_store.clone(),
             state_store.clone(),
             execution_adapter.clone(),
-            crate::execution::ExecutionConfig::default(),
+            crate::wasm_runtime::ExecutionConfig::default(),
         )?);
         let scheduler = Arc::new(ExecutionPool::new(exec.clone(), None));
+        
+        let fuel_estimator = Arc::new(FuelEstimator::new(
+            unified_store.clone(),
+            state_store.clone(),
+        ));
 
         let mut listen_addr = config.listen_addr.clone();
         let streams = loop {
@@ -145,6 +151,7 @@ impl Node {
             execution: exec,
             scheduler,
             consensus,
+            fuel_estimator,
             network,
             db,
             background: consensus_task,

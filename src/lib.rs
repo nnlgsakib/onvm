@@ -2,7 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod consensus;
 pub mod crypto;
-pub mod execution;
+pub mod wasm_runtime;
 pub mod network;
 pub mod node;
 pub mod qeue_manager;

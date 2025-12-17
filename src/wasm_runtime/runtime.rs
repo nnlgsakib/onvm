@@ -1,4 +1,4 @@
-use crate::execution::ExecutionAdapter;
+use crate::wasm_runtime::ExecutionAdapter;
 use crate::storage::{StateStore, UnifiedStore};
 use crate::types::{ObjectId, ProgramId, StateWrite};
 use anyhow::{Context, Result};

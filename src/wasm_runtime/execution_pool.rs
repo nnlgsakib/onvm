@@ -1,4 +1,4 @@
-use crate::execution::{ExecutionEngine, ExecutionOutcome};
+use crate::wasm_runtime::{ExecutionEngine, ExecutionOutcome};
 use crate::types::ProgramId;
 use anyhow::Result;
 use std::sync::Arc;

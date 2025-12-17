@@ -1,4 +1,4 @@
-use crate::execution::{HealthReporter, NodeHealth, NodeMetrics};
+use crate::wasm_runtime::{HealthReporter, NodeHealth, NodeMetrics};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -16,7 +16,7 @@ pub fn health_routes() -> Router<Arc<HealthRpcContext>> {
 #[derive(Clone)]
 pub struct HealthRpcContext {
     pub reporter: Arc<HealthReporter>,
-    pub scheduler: std::sync::Weak<crate::execution::JobScheduler>,
+    pub scheduler: std::sync::Weak<crate::wasm_runtime::JobScheduler>,
     pub max_concurrent: usize,
 }
 
@@ -44,7 +44,7 @@ async fn readiness(
         .reporter
         .get_health(running_count, queue_depth, ctx.max_concurrent);
 
-    if matches!(health.status, crate::execution::HealthStatus::Unavailable) {
+    if matches!(health.status, crate::wasm_runtime::HealthStatus::Unavailable) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 

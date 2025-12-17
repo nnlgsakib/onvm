@@ -140,6 +140,12 @@ pub enum Commands {
             help = "Print raw JSON response instead of base64-decoded stdout"
         )]
         json: bool,
+        #[arg(
+            short = 'e',
+            long,
+            help = "Estimate fuel cost without executing"
+        )]
+        estimate: bool,
     },
     /// Fetch a blob
     GetBlob {
@@ -399,50 +405,94 @@ pub async fn run() -> Result<()> {
             program_id,
             input,
             json,
+            estimate,
         } => {
             let data = if let Some(path) = input {
                 std::fs::read(path)?
             } else {
                 Vec::new()
             };
-            let body = serde_json::json!({
-                "program_id": program_id,
-                "input_base64": general_purpose::STANDARD.encode(&data),
-            });
-            let client = reqwest::Client::new();
-            let endpoint = normalize_rpc_endpoint(&rpc);
-            let res = client
-                .post(format!("{endpoint}/execute"))
-                .json(&body)
-                .send()
-                .await?;
-            let status = res.status();
-            let text = res.text().await?;
-            if !status.is_success() {
-                return Err(anyhow::anyhow!(text));
-            }
-            if json {
-                let v: serde_json::Value = serde_json::from_str(&text)?;
-                let ret_b64 = v
-                    .get("return_base64")
-                    .and_then(|s| s.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("missing return_base64 in response"))?;
-                let decoded = general_purpose::STANDARD.decode(ret_b64)?;
-                let decoded_str = String::from_utf8_lossy(&decoded).into_owned();
-                let fuel = v.get("fuel").cloned().unwrap_or(serde_json::json!(null));
-                let out = serde_json::json!({
-                    "return": decoded_str,
-                    "fuel": fuel,
+            
+            if estimate {
+                let body = serde_json::json!({
+                    "program_id": program_id,
+                    "input_base64": general_purpose::STANDARD.encode(&data),
                 });
-                println!("{}", serde_json::to_string(&out)?);
+                let client = reqwest::Client::new();
+                let endpoint = normalize_rpc_endpoint(&rpc);
+                let res = client
+                    .post(format!("{endpoint}/estimate-fuel"))
+                    .json(&body)
+                    .send()
+                    .await?;
+                let status = res.status();
+                let text = res.text().await?;
+                if !status.is_success() {
+                    return Err(anyhow::anyhow!(text));
+                }
+                
+                if json {
+                    println!("{}", text);
+                } else {
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
+                    let estimated_fuel = v.get("estimated_fuel")
+                        .and_then(|f| f.as_u64())
+                        .ok_or_else(|| anyhow::anyhow!("missing estimated_fuel"))?;
+                    let confidence = v.get("confidence")
+                        .and_then(|c| c.as_f64())
+                        .unwrap_or(0.0);
+                    let samples = v.get("based_on_samples")
+                        .and_then(|s| s.as_u64())
+                        .unwrap_or(0);
+                    let exec_time = v.get("estimated_execution_time_ms")
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                    
+                    println!("Estimated Fuel: {}", estimated_fuel);
+                    println!("Confidence: {:.1}%", confidence * 100.0);
+                    println!("Based on {} historical sample(s)", samples);
+                    println!("Estimated Execution Time: {} ms", exec_time);
+                }
             } else {
-                let v: serde_json::Value = serde_json::from_str(&text)?;
-                let ret = v
-                    .get("return_base64")
-                    .and_then(|s| s.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("missing return_base64 in response"))?;
-                let decoded = general_purpose::STANDARD.decode(ret)?;
-                println!("{}", String::from_utf8_lossy(&decoded));
+                let body = serde_json::json!({
+                    "program_id": program_id,
+                    "input_base64": general_purpose::STANDARD.encode(&data),
+                });
+                let client = reqwest::Client::new();
+                let endpoint = normalize_rpc_endpoint(&rpc);
+                let res = client
+                    .post(format!("{endpoint}/execute"))
+                    .json(&body)
+                    .send()
+                    .await?;
+                let status = res.status();
+                let text = res.text().await?;
+                if !status.is_success() {
+                    return Err(anyhow::anyhow!(text));
+                }
+                if json {
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
+                    let ret_b64 = v
+                        .get("return_base64")
+                        .and_then(|s| s.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("missing return_base64 in response"))?;
+                    let decoded = general_purpose::STANDARD.decode(ret_b64)?;
+                    let decoded_str = String::from_utf8_lossy(&decoded).into_owned();
+                    let fuel = v.get("fuel").cloned().unwrap_or(serde_json::json!(null));
+                    let out = serde_json::json!({
+                        "return": decoded_str,
+                        "fuel": fuel,
+                    });
+                    println!("{}", serde_json::to_string(&out)?);
+                } else {
+                    let v: serde_json::Value = serde_json::from_str(&text)?;
+                    let ret = v
+                        .get("return_base64")
+                        .and_then(|s| s.as_str())
+                        .ok_or_else(|| anyhow::anyhow!("missing return_base64 in response"))?;
+                    let decoded = general_purpose::STANDARD.decode(ret)?;
+                    println!("{}", String::from_utf8_lossy(&decoded));
+                }
             }
         }
         Commands::GetBlob { rpc, id, out } => {

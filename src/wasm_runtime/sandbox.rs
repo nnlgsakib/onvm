@@ -1,5 +1,5 @@
 use super::runtime::{ExecutionConfig, ExecutionEngine};
-use crate::execution::manifest::{AllowedImports, RuntimeConfig};
+use crate::wasm_runtime::manifest::{AllowedImports, RuntimeConfig};
 use crate::storage::StateStore;
 use crate::types::ProgramId;
 use anyhow::{anyhow, Context, Result};
@@ -121,7 +121,7 @@ impl SandboxedExecutor {
     pub fn new(
         unified_store: Arc<crate::storage::UnifiedStore>,
         state_store: Arc<StateStore>,
-        execution_adapter: Arc<crate::execution::ExecutionAdapter>,
+        execution_adapter: Arc<crate::wasm_runtime::ExecutionAdapter>,
         validator: SandboxValidator,
     ) -> Result<Self> {
         let config = ExecutionConfig {

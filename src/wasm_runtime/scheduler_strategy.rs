@@ -235,7 +235,7 @@ impl NodeSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::health::{NodeCapacity, ResourceUsage};
+    use crate::wasm_runtime::health::{NodeCapacity, ResourceUsage};
 
     #[test]
     fn test_capacity_based_selection() {

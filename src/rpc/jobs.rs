@@ -1,4 +1,4 @@
-use crate::execution::{Job, JobId, JobScheduler, JobStatus, JobStore};
+use crate::wasm_runtime::{Job, JobId, JobScheduler, JobStatus, JobStore};
 use crate::types::{BlobId, ProgramId};
 use anyhow::Result;
 use axum::extract::{Path, State};
@@ -339,11 +339,11 @@ fn job_status_to_string(status: &JobStatus) -> String {
     }
 }
 
-fn log_level_to_string(level: &crate::execution::LogLevel) -> String {
+fn log_level_to_string(level: &crate::wasm_runtime::LogLevel) -> String {
     match level {
-        crate::execution::LogLevel::Debug => "debug".to_string(),
-        crate::execution::LogLevel::Info => "info".to_string(),
-        crate::execution::LogLevel::Warn => "warn".to_string(),
-        crate::execution::LogLevel::Error => "error".to_string(),
+        crate::wasm_runtime::LogLevel::Debug => "debug".to_string(),
+        crate::wasm_runtime::LogLevel::Info => "info".to_string(),
+        crate::wasm_runtime::LogLevel::Warn => "warn".to_string(),
+        crate::wasm_runtime::LogLevel::Error => "error".to_string(),
     }
 }

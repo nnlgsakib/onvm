@@ -1,5 +1,5 @@
 use crate::crypto::keys::NodeKeys;
-use crate::execution::{ExecutionAdapter, ExecutionOutcome, ExecutionPool};
+use crate::wasm_runtime::{ExecutionAdapter, ExecutionOutcome, ExecutionPool};
 use crate::network::{NetworkEvent, NetworkHandle, NetworkMessage};
 use crate::qeue_manager::AsyncQueue;
 use crate::storage::{StateStore, UnifiedStore, BlobIndex, DagStore, ProgramIndex};

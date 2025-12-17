@@ -1,5 +1,5 @@
 use anyhow::Result;
-use onvm::execution::{
+use onvm::wasm_runtime::{
     ExecutionConfig, ExecutionEngine, Job, JobExecutor, JobScheduler, JobStatus, JobStore,
     ProgramStore, SandboxValidator,
 };

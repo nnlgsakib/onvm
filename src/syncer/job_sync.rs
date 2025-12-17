@@ -1,4 +1,4 @@
-use crate::execution::{FailureReason, Job, JobStore};
+use crate::wasm_runtime::{FailureReason, Job, JobStore};
 use crate::network::{NetworkHandle, NetworkMessage};
 use crate::types::ProgramId;
 use anyhow::Result;
@@ -63,13 +63,13 @@ impl From<&Job> for JobDescriptor {
             input_blob_id: job.input_blob_id.clone(),
             output_blob_id: job.output_blob_id.clone(),
             status: match job.status {
-                crate::execution::JobStatus::Pending => JobStatusDescriptor::Pending,
-                crate::execution::JobStatus::Running => JobStatusDescriptor::Running,
-                crate::execution::JobStatus::Completed => JobStatusDescriptor::Completed,
-                crate::execution::JobStatus::Failed => JobStatusDescriptor::Failed,
-                crate::execution::JobStatus::Cancelled => JobStatusDescriptor::Cancelled,
-                crate::execution::JobStatus::TimedOut => JobStatusDescriptor::TimedOut,
-                crate::execution::JobStatus::Expired => JobStatusDescriptor::Expired,
+                crate::wasm_runtime::JobStatus::Pending => JobStatusDescriptor::Pending,
+                crate::wasm_runtime::JobStatus::Running => JobStatusDescriptor::Running,
+                crate::wasm_runtime::JobStatus::Completed => JobStatusDescriptor::Completed,
+                crate::wasm_runtime::JobStatus::Failed => JobStatusDescriptor::Failed,
+                crate::wasm_runtime::JobStatus::Cancelled => JobStatusDescriptor::Cancelled,
+                crate::wasm_runtime::JobStatus::TimedOut => JobStatusDescriptor::TimedOut,
+                crate::wasm_runtime::JobStatus::Expired => JobStatusDescriptor::Expired,
             },
             fuel_consumed: job.fuel_consumed,
             created_at: job.created_at,
@@ -160,20 +160,20 @@ impl JobSyncManager {
     }
 
     pub async fn handle_job_broadcast(&self, broadcast: JobBroadcast) -> Result<()> {
-        let job_id = crate::execution::JobId::from_bytes(broadcast.job.id);
+        let job_id = crate::wasm_runtime::JobId::from_bytes(broadcast.job.id);
 
         if self.job_store.get(&job_id)?.is_some() {
             return Ok(());
         }
 
         let status = match broadcast.job.status {
-            JobStatusDescriptor::Pending => crate::execution::JobStatus::Pending,
-            JobStatusDescriptor::Running => crate::execution::JobStatus::Running,
-            JobStatusDescriptor::Completed => crate::execution::JobStatus::Completed,
-            JobStatusDescriptor::Failed => crate::execution::JobStatus::Failed,
-            JobStatusDescriptor::Cancelled => crate::execution::JobStatus::Cancelled,
-            JobStatusDescriptor::TimedOut => crate::execution::JobStatus::TimedOut,
-            JobStatusDescriptor::Expired => crate::execution::JobStatus::Expired,
+            JobStatusDescriptor::Pending => crate::wasm_runtime::JobStatus::Pending,
+            JobStatusDescriptor::Running => crate::wasm_runtime::JobStatus::Running,
+            JobStatusDescriptor::Completed => crate::wasm_runtime::JobStatus::Completed,
+            JobStatusDescriptor::Failed => crate::wasm_runtime::JobStatus::Failed,
+            JobStatusDescriptor::Cancelled => crate::wasm_runtime::JobStatus::Cancelled,
+            JobStatusDescriptor::TimedOut => crate::wasm_runtime::JobStatus::TimedOut,
+            JobStatusDescriptor::Expired => crate::wasm_runtime::JobStatus::Expired,
         };
 
         let failure_reason = broadcast.job.failure_reason.map(|r| match r {

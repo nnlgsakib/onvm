@@ -89,7 +89,9 @@ impl JobExecutor {
         let input_data = match &job.input_blob_id {
             Some(blob_id) => {
                 let object_id = blob_id.to_object_id();
-                self.unified_store.get_object(&object_id).context("loading input blob")?
+                self.unified_store
+                    .get_object(&object_id)
+                    .context("loading input blob")?
             }
             None => Vec::new(),
         };
@@ -114,9 +116,9 @@ impl JobExecutor {
                     .unified_store
                     .put_object(
                         &outcome.return_data,
-                        ObjectType::Blob {
-                            mime_type: Some("application/octet-stream".to_string()),
-                        },
+                        ObjectType::blob_with_random_salt(Some(
+                            "application/octet-stream".to_string(),
+                        )),
                         crate::types::NodeId::from_public_key(&[0u8; 32]),
                     )
                     .context("storing output blob")?;

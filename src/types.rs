@@ -1,4 +1,6 @@
 use crate::crypto::hashing::hash_bytes;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
@@ -44,6 +46,8 @@ pub struct Object {
 pub enum ObjectType {
     Blob {
         mime_type: Option<String>,
+        #[serde(default = "default_blob_salt")]
+        upload_salt: [u8; 32],
     },
     WasmProgram {
         entrypoint: String,
@@ -53,6 +57,25 @@ pub enum ObjectType {
         blob_refs: Vec<ObjectId>,
         deploy_salt: Vec<u8>,
     },
+}
+
+impl ObjectType {
+    pub fn blob_with_random_salt(mime_type: Option<String>) -> Self {
+        Self::Blob {
+            mime_type,
+            upload_salt: generate_blob_salt(),
+        }
+    }
+}
+
+fn generate_blob_salt() -> [u8; 32] {
+    let mut salt = [0u8; 32];
+    OsRng.fill_bytes(&mut salt);
+    salt
+}
+
+fn default_blob_salt() -> [u8; 32] {
+    [0u8; 32]
 }
 
 /// Manifest defining ordered chunk list
@@ -172,10 +195,7 @@ impl Manifest {
     }
 
     pub fn total_size(&self) -> u64 {
-        self.chunks
-            .iter()
-            .map(|c| c.size as u64)
-            .sum()
+        self.chunks.iter().map(|c| c.size as u64).sum()
     }
 }
 

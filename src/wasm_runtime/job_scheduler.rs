@@ -243,10 +243,8 @@ impl JobScheduler {
                 job.status = JobStatus::Expired;
                 job.completed_at = Some(now);
                 job.failure_reason = Some(FailureReason::Timeout);
-                job.error_message = Some(format!(
-                    "Job expired (TTL: {}ms)",
-                    job.ttl_ms.unwrap_or(0)
-                ));
+                job.error_message =
+                    Some(format!("Job expired (TTL: {}ms)", job.ttl_ms.unwrap_or(0)));
                 job.add_log(LogLevel::Warn, "Job expired before execution".to_string());
                 self.job_store.update(&job)?;
             }

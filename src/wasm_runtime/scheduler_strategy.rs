@@ -36,9 +36,7 @@ impl NodeSelector {
         }
 
         match strategy {
-            SchedulingStrategy::CapacityBased => {
-                Self::select_by_capacity(peers, local_health)
-            }
+            SchedulingStrategy::CapacityBased => Self::select_by_capacity(peers, local_health),
             SchedulingStrategy::HealthBased => Self::select_by_health(peers, local_health),
             SchedulingStrategy::RoundRobin => Self::select_round_robin(peers, local_health),
         }
@@ -67,11 +65,7 @@ impl NodeSelector {
         if let Some(health) = local_health {
             if health.status != HealthStatus::Unavailable {
                 let local_score = Self::calculate_local_capacity_score(health);
-                candidates.push((
-                    PeerId::random(),
-                    local_score,
-                    "local node",
-                ));
+                candidates.push((PeerId::random(), local_score, "local node"));
             }
         }
 
@@ -110,11 +104,7 @@ impl NodeSelector {
         if let Some(health) = local_health {
             let local_score = Self::calculate_local_health_score(health);
             if local_score > 0.0 {
-                candidates.push((
-                    PeerId::random(),
-                    local_score,
-                    "local node",
-                ));
+                candidates.push((PeerId::random(), local_score, "local node"));
             }
         }
 
@@ -152,10 +142,9 @@ impl NodeSelector {
 
     fn calculate_capacity_score(caps: &NodeCapabilities) -> f64 {
         let cpu_available = 1.0 - (caps.cpu_usage_percent / 100.0) as f64;
-        let mem_available =
-            (caps.memory_available_gb as f64) / (caps.memory_gb.max(1) as f64);
-        let job_capacity = 1.0
-            - ((caps.current_job_count as f64) / (caps.max_concurrent_jobs.max(1) as f64));
+        let mem_available = (caps.memory_available_gb as f64) / (caps.memory_gb.max(1) as f64);
+        let job_capacity =
+            1.0 - ((caps.current_job_count as f64) / (caps.max_concurrent_jobs.max(1) as f64));
 
         (cpu_available * 0.3) + (mem_available * 0.3) + (job_capacity * 0.4)
     }
@@ -178,8 +167,7 @@ impl NodeSelector {
             0.1
         };
 
-        let job_ratio =
-            (caps.current_job_count as f64) / (caps.max_concurrent_jobs.max(1) as f64);
+        let job_ratio = (caps.current_job_count as f64) / (caps.max_concurrent_jobs.max(1) as f64);
         let job_health = if job_ratio < 0.7 {
             1.0
         } else if job_ratio < 0.9 {
@@ -332,8 +320,7 @@ mod tests {
             version: "0.1.0".to_string(),
         };
 
-        let result =
-            NodeSelector::select_node(SchedulingStrategy::HealthBased, &[], Some(&health));
+        let result = NodeSelector::select_node(SchedulingStrategy::HealthBased, &[], Some(&health));
 
         assert!(result.is_ok());
         let selection = result.unwrap();

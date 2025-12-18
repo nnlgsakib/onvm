@@ -1,9 +1,11 @@
 use crate::consensus::{BlobSyncMode, DagConfig, DagEngine};
 use crate::crypto::keys::NodeKeys;
-use crate::wasm_runtime::{ExecutionAdapter, ExecutionEngine, ExecutionPool, FuelEstimator};
-use crate::network::{ChunkDistributor, NetworkConfig, NetworkHandle, NetworkService, NetworkStreams};
+use crate::network::{
+    ChunkDistributor, NetworkConfig, NetworkHandle, NetworkService, NetworkStreams,
+};
 use crate::storage::UnifiedStore;
 use crate::syncer::SyncMan;
+use crate::wasm_runtime::{ExecutionAdapter, ExecutionEngine, ExecutionPool, FuelEstimator};
 use anyhow::{Context, Result};
 use libp2p::multiaddr::Protocol;
 use libp2p::Multiaddr;
@@ -45,16 +47,16 @@ impl Node {
 
         let db = sled::open(db_path).context("opening sled db")?;
         let identity = Arc::new(config.identity);
-        
+
         let unified_store = Arc::new(UnifiedStore::new(db.clone())?);
-        
+
         let state_store = Arc::new(crate::storage::StateStore::new(
             db.clone(),
             "contract_state",
         )?);
-        
+
         let execution_adapter = Arc::new(ExecutionAdapter::new(unified_store.clone()));
-        
+
         let exec = Arc::new(ExecutionEngine::new(
             unified_store.clone(),
             state_store.clone(),
@@ -62,7 +64,7 @@ impl Node {
             crate::wasm_runtime::ExecutionConfig::default(),
         )?);
         let scheduler = Arc::new(ExecutionPool::new(exec.clone(), None));
-        
+
         let fuel_estimator = Arc::new(FuelEstimator::new(
             unified_store.clone(),
             state_store.clone(),
@@ -99,7 +101,7 @@ impl Node {
             handle: network,
             events,
         } = streams;
-        
+
         let chunk_distributor = Arc::new(ChunkDistributor::new(
             unified_store.clone(),
             network.clone(),
@@ -118,10 +120,10 @@ impl Node {
                 blob_sync_mode: config.blob_sync_mode.clone(),
             },
         )?;
-        
+
         consensus.set_chunk_distributor(chunk_distributor.clone());
         let consensus = Arc::new(consensus);
-        
+
         if matches!(config.blob_sync_mode, BlobSyncMode::FullData) {
             consensus.start_fetch_workers(5).await;
         }

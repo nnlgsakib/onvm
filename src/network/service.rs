@@ -49,12 +49,22 @@ pub enum NetworkMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransferRequest {
     Program(ProgramId),
-    ProgramChunk { id: ProgramId, chunk_idx: usize },
+    ProgramChunk {
+        id: ProgramId,
+        chunk_idx: usize,
+    },
     Blob(BlobId),
-    BlobChunk { id: BlobId, chunk_idx: u32 },
+    BlobChunk {
+        id: BlobId,
+        chunk_idx: u32,
+    },
     Execution([u8; 32]),
     PushProgram(ProgramBroadcast),
-    PushProgramChunk { id: ProgramId, chunk_idx: usize, chunk_data: Vec<u8> },
+    PushProgramChunk {
+        id: ProgramId,
+        chunk_idx: usize,
+        chunk_data: Vec<u8>,
+    },
     PushBlob(BlobBroadcast),
     PushExecution(ExecutionBroadcast),
     Sync(SyncSnapshot),
@@ -290,7 +300,7 @@ pub struct NetworkConfig {
     pub heartbeat: Duration,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum ProviderKind {
     Program,
     Blob,
@@ -353,15 +363,15 @@ impl NetworkService {
 
         let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
         let store = MemoryStore::new(peer_id);
-        
+
         let mut kad_config = libp2p::kad::Config::default();
         kad_config
             .set_provider_record_ttl(Some(Duration::from_secs(3600)))
             .set_provider_publication_interval(Some(Duration::from_secs(600)));
-        
+
         let mut kademlia = Kademlia::with_config(peer_id, store, kad_config);
         kademlia.set_mode(Some(libp2p::kad::Mode::Server));
-        
+
         let transfer_protocol = StreamProtocol::new("/onvm/transfer/1.0.0");
         let transfer_config = libp2p::request_response::Config::default()
             .with_request_timeout(Duration::from_secs(60))
@@ -466,10 +476,10 @@ impl NetworkService {
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 tracing::info!("connected to peer {} at {:?}", peer_id, endpoint.get_remote_address());
                                 peers_clone.write().await.insert(peer_id);
-                                
+
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
                                 let _ = swarm.behaviour_mut().kademlia.bootstrap();
-                                
+
                                 let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
                             }
                             SwarmEvent::ConnectionClosed { peer_id, .. } => {

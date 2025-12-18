@@ -8,16 +8,16 @@ use crate::node::Node;
 use crate::types::{BlobId, ProgramId};
 use anyhow::Result;
 use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::http::Method;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use axum::http::Method;
-use tower_http::cors::{CorsLayer, Any};
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 // Permit large blob uploads; adjust if hosting constraints change.
@@ -102,7 +102,9 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
 
     let job_store = Arc::new(crate::wasm_runtime::JobStore::new(db.clone())?);
 
-    let health_reporter = Arc::new(crate::wasm_runtime::HealthReporter::new_with_db(Some(db.clone())));
+    let health_reporter = Arc::new(crate::wasm_runtime::HealthReporter::new_with_db(Some(
+        db.clone(),
+    )));
 
     let mut job_executor = crate::wasm_runtime::JobExecutor::new(
         node.execution.clone(),
@@ -112,11 +114,8 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
     )?;
     job_executor.set_consensus(node.consensus.clone());
 
-    let mut job_scheduler = crate::wasm_runtime::JobScheduler::new(
-        Arc::new(job_executor),
-        job_store.clone(),
-        10,
-    );
+    let mut job_scheduler =
+        crate::wasm_runtime::JobScheduler::new(Arc::new(job_executor), job_store.clone(), 10);
     job_scheduler.set_health_reporter(health_reporter.clone());
 
     let job_ctx = Arc::new(JobRpcContext {
@@ -151,7 +150,13 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers(Any)
         .allow_credentials(false);
 
@@ -216,7 +221,7 @@ async fn upload_blob(
         .unified_store
         .put_object(
             &data,
-            crate::types::ObjectType::Blob { mime_type: mime },
+            crate::types::ObjectType::blob_with_random_salt(mime),
             ctx.node.identity.node_id.clone(),
         )
         .map_err(internal_err)?;
@@ -311,22 +316,29 @@ async fn program_info(
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, String)> {
     let id = parse_program_id(&id_hex).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
     let object_id = id.to_object_id();
-    let object = ctx.node.unified_store.get_object_metadata(&object_id).map_err(internal_err)?;
+    let object = ctx
+        .node
+        .unified_store
+        .get_object_metadata(&object_id)
+        .map_err(internal_err)?;
     match object {
-        Some(obj) => {
-            match &obj.object_type {
-                crate::types::ObjectType::WasmProgram { entrypoint, blob_refs, .. } => {
-                    Ok(Json(serde_json::json!({
-                        "id": hex::encode(obj.id.0),
-                        "publisher": hex::encode(obj.publisher.0),
-                        "size": obj.total_size,
-                        "entrypoint": entrypoint,
-                        "blob_refs": blob_refs.iter().map(|b| hex::encode(b.0)).collect::<Vec<_>>(),
-                    })))
-                }
-                _ => Err((axum::http::StatusCode::BAD_REQUEST, "not a WASM program".to_string())),
-            }
-        }
+        Some(obj) => match &obj.object_type {
+            crate::types::ObjectType::WasmProgram {
+                entrypoint,
+                blob_refs,
+                ..
+            } => Ok(Json(serde_json::json!({
+                "id": hex::encode(obj.id.0),
+                "publisher": hex::encode(obj.publisher.0),
+                "size": obj.total_size,
+                "entrypoint": entrypoint,
+                "blob_refs": blob_refs.iter().map(|b| hex::encode(b.0)).collect::<Vec<_>>(),
+            }))),
+            _ => Err((
+                axum::http::StatusCode::BAD_REQUEST,
+                "not a WASM program".to_string(),
+            )),
+        },
         None => Err((axum::http::StatusCode::NOT_FOUND, "not found".to_string())),
     }
 }
@@ -340,7 +352,7 @@ async fn execute_program(
     let input = general_purpose::STANDARD
         .decode(req.input_base64)
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
-    
+
     let start_time = std::time::Instant::now();
     let result = ctx
         .node
@@ -349,14 +361,18 @@ async fn execute_program(
         .await
         .map_err(internal_err)?;
     let execution_time_ms = start_time.elapsed().as_millis() as u64;
-    
-    let _ = ctx.node.fuel_estimator.record_execution(
-        &program_id,
-        input.len(),
-        result.fuel_consumed,
-        execution_time_ms,
-    ).await;
-    
+
+    let _ = ctx
+        .node
+        .fuel_estimator
+        .record_execution(
+            &program_id,
+            input.len(),
+            result.fuel_consumed,
+            execution_time_ms,
+        )
+        .await;
+
     Ok(Json(ExecuteResponse {
         return_base64: general_purpose::STANDARD.encode(result.return_data),
         fuel: result.fuel_consumed,
@@ -372,14 +388,14 @@ async fn estimate_fuel(
     let input = general_purpose::STANDARD
         .decode(req.input_base64)
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
-    
+
     let estimate = ctx
         .node
         .fuel_estimator
         .estimate_fuel(&program_id, &input)
         .await
         .map_err(internal_err)?;
-    
+
     Ok(Json(EstimateFuelResponse {
         estimated_fuel: estimate.estimated_fuel,
         confidence: estimate.confidence,
@@ -395,22 +411,31 @@ async fn get_fuel_profile(
 ) -> Result<Json<FuelProfileResponse>, (axum::http::StatusCode, String)> {
     let program_id =
         parse_program_id(&program_id_hex).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
-    
+
     let profile = ctx
         .node
         .fuel_estimator
         .get_profile(&program_id)
         .await
-        .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "no profile found".to_string()))?;
-    
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                "no profile found".to_string(),
+            )
+        })?;
+
     Ok(Json(FuelProfileResponse {
         program_id: program_id_hex,
-        samples: profile.samples.iter().map(|s| FuelSampleResponse {
-            input_size: s.input_size,
-            fuel_consumed: s.fuel_consumed,
-            execution_time_ms: s.execution_time_ms,
-            timestamp: s.timestamp,
-        }).collect(),
+        samples: profile
+            .samples
+            .iter()
+            .map(|s| FuelSampleResponse {
+                input_size: s.input_size,
+                fuel_consumed: s.fuel_consumed,
+                execution_time_ms: s.execution_time_ms,
+                timestamp: s.timestamp,
+            })
+            .collect(),
         average_fuel_per_byte: profile.average_fuel_per_byte,
         base_fuel_cost: profile.base_fuel_cost,
     }))

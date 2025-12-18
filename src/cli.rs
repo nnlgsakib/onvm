@@ -140,11 +140,7 @@ pub enum Commands {
             help = "Print raw JSON response instead of base64-decoded stdout"
         )]
         json: bool,
-        #[arg(
-            short = 'e',
-            long,
-            help = "Estimate fuel cost without executing"
-        )]
+        #[arg(short = 'e', long, help = "Estimate fuel cost without executing")]
         estimate: bool,
     },
     /// Fetch a blob
@@ -412,7 +408,7 @@ pub async fn run() -> Result<()> {
             } else {
                 Vec::new()
             };
-            
+
             if estimate {
                 let body = serde_json::json!({
                     "program_id": program_id,
@@ -430,24 +426,25 @@ pub async fn run() -> Result<()> {
                 if !status.is_success() {
                     return Err(anyhow::anyhow!(text));
                 }
-                
+
                 if json {
                     println!("{}", text);
                 } else {
                     let v: serde_json::Value = serde_json::from_str(&text)?;
-                    let estimated_fuel = v.get("estimated_fuel")
+                    let estimated_fuel = v
+                        .get("estimated_fuel")
                         .and_then(|f| f.as_u64())
                         .ok_or_else(|| anyhow::anyhow!("missing estimated_fuel"))?;
-                    let confidence = v.get("confidence")
-                        .and_then(|c| c.as_f64())
-                        .unwrap_or(0.0);
-                    let samples = v.get("based_on_samples")
+                    let confidence = v.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
+                    let samples = v
+                        .get("based_on_samples")
                         .and_then(|s| s.as_u64())
                         .unwrap_or(0);
-                    let exec_time = v.get("estimated_execution_time_ms")
+                    let exec_time = v
+                        .get("estimated_execution_time_ms")
                         .and_then(|t| t.as_u64())
                         .unwrap_or(0);
-                    
+
                     println!("Estimated Fuel: {}", estimated_fuel);
                     println!("Confidence: {:.1}%", confidence * 100.0);
                     println!("Based on {} historical sample(s)", samples);

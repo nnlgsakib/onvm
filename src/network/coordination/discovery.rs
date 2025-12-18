@@ -6,7 +6,6 @@
 /// - Capability tracking per peer
 /// - Peer scoring based on reliability and performance
 /// - Peer caching for quick reconnection
-
 use crate::network::coordination::capability::NodeCapabilities;
 use anyhow::Result;
 use libp2p::PeerId;
@@ -127,7 +126,9 @@ impl PeerScore {
     }
 
     fn recalculate_overall(&mut self) {
-        self.overall = (self.reliability * 0.4 + self.latency_score * 0.3 + self.capability_score * 0.3).min(100.0);
+        self.overall =
+            (self.reliability * 0.4 + self.latency_score * 0.3 + self.capability_score * 0.3)
+                .min(100.0);
     }
 }
 
@@ -160,15 +161,26 @@ impl PeerDiscovery {
             return;
         }
 
-        let peer_info = self.peers.entry(peer_id).or_insert_with(|| PeerInfo::new(peer_id));
+        let peer_info = self
+            .peers
+            .entry(peer_id)
+            .or_insert_with(|| PeerInfo::new(peer_id));
         peer_info.on_connected();
-        tracing::debug!("peer connected: {} (score: {:.2})", peer_id, peer_info.score.overall);
+        tracing::debug!(
+            "peer connected: {} (score: {:.2})",
+            peer_id,
+            peer_info.score.overall
+        );
     }
 
     pub fn on_peer_disconnected(&mut self, peer_id: PeerId) {
         if let Some(peer_info) = self.peers.get_mut(&peer_id) {
             peer_info.on_disconnected();
-            tracing::debug!("peer disconnected: {} (uptime: {:.1}%)", peer_id, peer_info.uptime_percentage());
+            tracing::debug!(
+                "peer disconnected: {} (uptime: {:.1}%)",
+                peer_id,
+                peer_info.uptime_percentage()
+            );
         }
     }
 
@@ -177,7 +189,10 @@ impl PeerDiscovery {
         peer_id: PeerId,
         capabilities: NodeCapabilities,
     ) -> Result<()> {
-        let peer_info = self.peers.entry(peer_id).or_insert_with(|| PeerInfo::new(peer_id));
+        let peer_info = self
+            .peers
+            .entry(peer_id)
+            .or_insert_with(|| PeerInfo::new(peer_id));
         peer_info.score.update_capabilities(&capabilities);
         peer_info.capabilities = Some(capabilities.clone());
         peer_info.update_last_seen();
@@ -217,7 +232,10 @@ impl PeerDiscovery {
         peers
     }
 
-    pub fn get_peers_with_capability(&self, filter: impl Fn(&NodeCapabilities) -> bool) -> Vec<&PeerInfo> {
+    pub fn get_peers_with_capability(
+        &self,
+        filter: impl Fn(&NodeCapabilities) -> bool,
+    ) -> Vec<&PeerInfo> {
         self.peers
             .values()
             .filter(|p| {

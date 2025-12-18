@@ -154,7 +154,11 @@ impl Job {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
-            JobStatus::Completed | JobStatus::Cancelled | JobStatus::Failed | JobStatus::TimedOut | JobStatus::Expired
+            JobStatus::Completed
+                | JobStatus::Cancelled
+                | JobStatus::Failed
+                | JobStatus::TimedOut
+                | JobStatus::Expired
         ) && !self.can_retry()
     }
 

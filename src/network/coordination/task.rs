@@ -4,7 +4,6 @@
 /// - Broadcasting node capabilities
 /// - Cleaning up stale peers
 /// - Updating peer scores
-
 use crate::network::coordination::CoordinationManager;
 use crate::network::NetworkHandle;
 use std::sync::Arc;

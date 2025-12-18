@@ -1,3 +1,4 @@
+mod execution_adapter;
 mod execution_pool;
 mod fuel_estimator;
 mod health;
@@ -9,9 +10,9 @@ mod manifest;
 mod runtime;
 mod sandbox;
 mod scheduler_strategy;
-mod execution_adapter;
 
 pub use crate::storage::StateStore;
+pub use execution_adapter::ExecutionAdapter;
 pub use execution_pool::ExecutionPool;
 pub use fuel_estimator::{FuelEstimate, FuelEstimator, FuelProfile, FuelSample};
 pub use health::{
@@ -28,4 +29,3 @@ pub use manifest::{
 pub use runtime::{ExecutionConfig, ExecutionEngine, ExecutionOutcome};
 pub use sandbox::{SandboxValidator, SandboxedExecutor};
 pub use scheduler_strategy::{NodeSelection, NodeSelector, SchedulingStrategy};
-pub use execution_adapter::ExecutionAdapter;

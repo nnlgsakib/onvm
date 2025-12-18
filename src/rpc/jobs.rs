@@ -1,5 +1,5 @@
-use crate::wasm_runtime::{Job, JobId, JobScheduler, JobStatus, JobStore};
 use crate::types::{BlobId, ProgramId};
+use crate::wasm_runtime::{Job, JobId, JobScheduler, JobStatus, JobStore};
 use anyhow::Result;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -125,9 +125,9 @@ async fn submit_job(
             .unified_store
             .put_object(
                 &data,
-                crate::types::ObjectType::Blob {
-                    mime_type: Some("application/octet-stream".to_string()),
-                },
+                crate::types::ObjectType::blob_with_random_salt(Some(
+                    "application/octet-stream".to_string(),
+                )),
                 crate::types::NodeId::from_public_key(&[0u8; 32]),
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

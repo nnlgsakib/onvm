@@ -1,7 +1,7 @@
 use super::runtime::{ExecutionConfig, ExecutionEngine};
-use crate::wasm_runtime::manifest::{AllowedImports, RuntimeConfig};
 use crate::storage::StateStore;
 use crate::types::ProgramId;
+use crate::wasm_runtime::manifest::{AllowedImports, RuntimeConfig};
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use wasmtime::Module;

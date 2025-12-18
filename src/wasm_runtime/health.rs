@@ -1,8 +1,8 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
-use anyhow::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeHealth {
@@ -90,7 +90,8 @@ impl HealthReporter {
             total_fuel_consumed: std::sync::atomic::AtomicU64::new(fuel),
             execution_times: Arc::new(Mutex::new(times)),
             system_info: Arc::new(Mutex::new(System::new_with_specifics(
-                RefreshKind::new().with_processes(ProcessRefreshKind::new().with_cpu().with_memory()),
+                RefreshKind::new()
+                    .with_processes(ProcessRefreshKind::new().with_cpu().with_memory()),
             ))),
             process_pid: pid,
             db,
@@ -130,10 +131,14 @@ impl HealthReporter {
         let health_reporter = if let Some(ref db) = self.db {
             Some((
                 db.clone(),
-                self.total_jobs_completed.load(std::sync::atomic::Ordering::Relaxed),
-                self.total_jobs_failed.load(std::sync::atomic::Ordering::Relaxed),
-                self.total_jobs_cancelled.load(std::sync::atomic::Ordering::Relaxed),
-                self.total_fuel_consumed.load(std::sync::atomic::Ordering::Relaxed),
+                self.total_jobs_completed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.total_jobs_failed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.total_jobs_cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.total_fuel_consumed
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 self.execution_times.lock().unwrap().clone(),
             ))
         } else {
@@ -142,7 +147,9 @@ impl HealthReporter {
 
         if let Some((db, completed, failed, cancelled, fuel_total, times)) = health_reporter {
             tokio::spawn(async move {
-                if let Err(e) = Self::persist_metrics_async(db, completed, failed, cancelled, fuel_total, times) {
+                if let Err(e) =
+                    Self::persist_metrics_async(db, completed, failed, cancelled, fuel_total, times)
+                {
                     tracing::warn!("failed to persist metrics: {e:?}");
                 }
             });
@@ -178,10 +185,14 @@ impl HealthReporter {
         let health_reporter = if let Some(ref db) = self.db {
             Some((
                 db.clone(),
-                self.total_jobs_completed.load(std::sync::atomic::Ordering::Relaxed),
-                self.total_jobs_failed.load(std::sync::atomic::Ordering::Relaxed),
-                self.total_jobs_cancelled.load(std::sync::atomic::Ordering::Relaxed),
-                self.total_fuel_consumed.load(std::sync::atomic::Ordering::Relaxed),
+                self.total_jobs_completed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.total_jobs_failed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.total_jobs_cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.total_fuel_consumed
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 self.execution_times.lock().unwrap().clone(),
             ))
         } else {
@@ -190,7 +201,9 @@ impl HealthReporter {
 
         if let Some((db, completed, failed, cancelled, fuel_total, times)) = health_reporter {
             tokio::spawn(async move {
-                if let Err(e) = Self::persist_metrics_async(db, completed, failed, cancelled, fuel_total, times) {
+                if let Err(e) =
+                    Self::persist_metrics_async(db, completed, failed, cancelled, fuel_total, times)
+                {
                     tracing::warn!("failed to persist metrics: {e:?}");
                 }
             });
@@ -204,10 +217,14 @@ impl HealthReporter {
         let health_reporter = if let Some(ref db) = self.db {
             Some((
                 db.clone(),
-                self.total_jobs_completed.load(std::sync::atomic::Ordering::Relaxed),
-                self.total_jobs_failed.load(std::sync::atomic::Ordering::Relaxed),
-                self.total_jobs_cancelled.load(std::sync::atomic::Ordering::Relaxed),
-                self.total_fuel_consumed.load(std::sync::atomic::Ordering::Relaxed),
+                self.total_jobs_completed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.total_jobs_failed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.total_jobs_cancelled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                self.total_fuel_consumed
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 self.execution_times.lock().unwrap().clone(),
             ))
         } else {
@@ -216,7 +233,9 @@ impl HealthReporter {
 
         if let Some((db, completed, failed, cancelled, fuel_total, times)) = health_reporter {
             tokio::spawn(async move {
-                if let Err(e) = Self::persist_metrics_async(db, completed, failed, cancelled, fuel_total, times) {
+                if let Err(e) =
+                    Self::persist_metrics_async(db, completed, failed, cancelled, fuel_total, times)
+                {
                     tracing::warn!("failed to persist metrics: {e:?}");
                 }
             });

@@ -6,7 +6,6 @@
 /// - Peer reputation scores
 /// - Geographic/latency optimization
 /// - Round-robin fairness
-
 use crate::network::coordination::capability::{JobRequirements, NodeCapabilities};
 use anyhow::{anyhow, Result};
 use libp2p::PeerId;
@@ -68,9 +67,9 @@ impl PeerLoad {
 
             let capability_bonus = if caps.has_gpu { 10.0 } else { 0.0 };
 
-            self.selection_score =
-                (capacity_score * 0.5 + memory_score * 0.3 + capability_bonus - load_penalty)
-                    .max(0.0);
+            self.selection_score = (capacity_score * 0.5 + memory_score * 0.3 + capability_bonus
+                - load_penalty)
+                .max(0.0);
         } else {
             self.selection_score = 0.0;
         }
@@ -176,9 +175,7 @@ impl LoadBalancer {
 
         let selection = match self.strategy {
             BalancingStrategy::BestScore => self.select_best_score(&candidates),
-            BalancingStrategy::RoundRobin => {
-                self.select_round_robin_from_data(&candidate_data)
-            }
+            BalancingStrategy::RoundRobin => self.select_round_robin_from_data(&candidate_data),
             BalancingStrategy::LeastLoad => self.select_least_load(&candidates),
             BalancingStrategy::CapabilityMatch => {
                 if let Some(reqs) = requirements {
@@ -232,7 +229,10 @@ impl LoadBalancer {
             })
     }
 
-    fn select_round_robin_from_data(&mut self, candidate_data: &[(PeerId, f64)]) -> Option<PeerSelection> {
+    fn select_round_robin_from_data(
+        &mut self,
+        candidate_data: &[(PeerId, f64)],
+    ) -> Option<PeerSelection> {
         if candidate_data.is_empty() {
             return None;
         }

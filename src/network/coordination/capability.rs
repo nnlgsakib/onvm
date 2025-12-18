@@ -8,10 +8,9 @@
 /// - Storage capacity
 /// - Network bandwidth
 /// - Special features (AI/ML optimized, high-memory, etc.)
-
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
-use sysinfo::{System, RefreshKind, MemoryRefreshKind};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 /// Node capabilities that can be advertised to the network
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -46,7 +45,7 @@ pub enum Specialization {
 impl NodeCapabilities {
     pub fn detect_system() -> Self {
         let mut sys = System::new_with_specifics(
-            RefreshKind::new().with_memory(MemoryRefreshKind::everything())
+            RefreshKind::new().with_memory(MemoryRefreshKind::everything()),
         );
         sys.refresh_memory();
 
@@ -89,7 +88,7 @@ impl NodeCapabilities {
 
     pub fn update_runtime_metrics(&mut self, current_jobs: u32) {
         let mut sys = System::new_with_specifics(
-            RefreshKind::new().with_memory(MemoryRefreshKind::everything())
+            RefreshKind::new().with_memory(MemoryRefreshKind::everything()),
         );
         sys.refresh_memory();
 
@@ -112,7 +111,9 @@ impl NodeCapabilities {
         if self.max_concurrent_jobs == 0 {
             return 0.0;
         }
-        let available = self.max_concurrent_jobs.saturating_sub(self.current_job_count);
+        let available = self
+            .max_concurrent_jobs
+            .saturating_sub(self.current_job_count);
         (available as f32 / self.max_concurrent_jobs as f32) * 100.0
     }
 

@@ -1,10 +1,10 @@
 use crate::crypto::keys::NodeKeys;
-use crate::wasm_runtime::{ExecutionAdapter, ExecutionOutcome, ExecutionPool};
 use crate::network::{NetworkEvent, NetworkHandle, NetworkMessage};
 use crate::qeue_manager::AsyncQueue;
-use crate::storage::{StateStore, UnifiedStore, BlobIndex, DagStore, ProgramIndex};
+use crate::storage::{BlobIndex, DagStore, ProgramIndex, StateStore, UnifiedStore};
 use crate::syncer::sync::SyncState;
 use crate::types::{BlobId, ComputeOp, NodeId, Object, ObjectId, ProgramId};
+use crate::wasm_runtime::{ExecutionAdapter, ExecutionOutcome, ExecutionPool};
 use anyhow::{anyhow, Context, Result};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
@@ -121,25 +121,33 @@ impl DagEngine {
 
     pub async fn ingest_local_object(&self, object: Object, _data: Vec<u8>) -> Result<()> {
         self.network.provide(&object.id.0);
-        
-        let object_meta_msg = crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadata(object.clone());
+
+        let object_meta_msg =
+            crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadata(
+                object.clone(),
+            );
         let meta_network_msg = NetworkMessage::UnifiedProtocol(object_meta_msg);
-        
+
         let _ = self.network.publisher.send(meta_network_msg);
-        
+
         let announcement = crate::network::unified_protocol::ObjectAnnouncement::from_object(
             &object,
-            &self.network.peer_id
+            &self.network.peer_id,
         );
-        
-        let unified_msg = crate::network::unified_protocol::UnifiedProtocolMessage::ObjectAnnouncement(announcement);
+
+        let unified_msg =
+            crate::network::unified_protocol::UnifiedProtocolMessage::ObjectAnnouncement(
+                announcement,
+            );
         let msg = NetworkMessage::UnifiedProtocol(unified_msg);
-        
-        self.network.publisher.send(msg)
+
+        self.network
+            .publisher
+            .send(msg)
             .map_err(|_| anyhow!("failed to announce object"))?;
-        
+
         tracing::info!("announced object {} to DHT and gossipsub", object.id);
-        
+
         Ok(())
     }
 
@@ -151,14 +159,24 @@ impl DagEngine {
         self.ingest_local_object(object, data).await
     }
 
-    pub async fn submit_execution(&self, program_id: &ProgramId, input: &[u8]) -> Result<ExecutionOutcome> {
+    pub async fn submit_execution(
+        &self,
+        program_id: &ProgramId,
+        input: &[u8],
+    ) -> Result<ExecutionOutcome> {
         let object_id = program_id.to_object_id();
-        
+
         if !self.unified_store.is_complete(&object_id)? {
-            tracing::info!("program {} not available locally, attempting to fetch from network", program_id);
-            
+            tracing::info!(
+                "program {} not available locally, attempting to fetch from network",
+                program_id
+            );
+
             if let Some(ref distributor) = self.chunk_distributor {
-                match distributor.fetch_object(&object_id).await {
+                match distributor
+                    .fetch_object(&object_id, crate::network::ProviderKind::Program)
+                    .await
+                {
                     Ok(data) => {
                         tracing::info!(
                             "successfully fetched program {} from network ({} bytes)",
@@ -174,49 +192,62 @@ impl DagEngine {
                     }
                 }
             } else {
-                return Err(anyhow!("program not available and chunk distributor not initialized"));
+                return Err(anyhow!(
+                    "program not available and chunk distributor not initialized"
+                ));
             }
-            
+
             if !self.unified_store.is_complete(&object_id)? {
-                return Err(anyhow!("program fetch completed but object is still incomplete"));
+                return Err(anyhow!(
+                    "program fetch completed but object is still incomplete"
+                ));
             }
         }
-        
+
         let has_state = {
             let versions = self.program_state_versions.read().await;
             versions.contains_key(program_id)
         };
-        
+
         if !has_state {
-            let in_progress = self.state_sync_in_progress.read().await.contains(program_id);
-            
+            let in_progress = self
+                .state_sync_in_progress
+                .read()
+                .await
+                .contains(program_id);
+
             if !in_progress {
-                self.state_sync_in_progress.write().await.insert(program_id.clone());
-                
+                self.state_sync_in_progress
+                    .write()
+                    .await
+                    .insert(program_id.clone());
+
                 let state_store = Arc::clone(&self.state_store);
                 let network = self.network.clone();
                 let peers = Arc::clone(&self.peers);
                 let versions = Arc::clone(&self.program_state_versions);
                 let in_progress = Arc::clone(&self.state_sync_in_progress);
                 let pid = program_id.clone();
-                
+
                 tokio::spawn(async move {
                     if let Err(e) = Self::background_state_sync_static(
                         &state_store,
                         &network,
                         &peers,
                         &versions,
-                        &pid
-                    ).await {
+                        &pid,
+                    )
+                    .await
+                    {
                         tracing::debug!("background state sync failed for {}: {}", pid, e);
                     }
                     in_progress.write().await.remove(&pid);
                 });
             }
         }
-        
+
         let outcome = self.scheduler.execute(program_id, input).await?;
-        
+
         if !outcome.state_writes.is_empty() {
             let new_version = {
                 let mut versions = self.program_state_versions.write().await;
@@ -224,7 +255,7 @@ impl DagEngine {
                 *version += 1;
                 *version
             };
-            
+
             let sync_msg = crate::network::StateSyncMessage {
                 program_id: program_id.clone(),
                 state_writes: outcome.state_writes.clone(),
@@ -235,10 +266,10 @@ impl DagEngine {
                     .unwrap()
                     .as_millis() as u64,
             };
-            
+
             let msg = NetworkMessage::StateSync(sync_msg);
             let _ = self.network.publisher.send(msg);
-            
+
             tracing::debug!(
                 "broadcasted {} state writes for program {} (version {})",
                 outcome.state_writes.len(),
@@ -246,7 +277,7 @@ impl DagEngine {
                 new_version
             );
         }
-        
+
         Ok(outcome)
     }
 
@@ -258,39 +289,66 @@ impl DagEngine {
         program_id: &ProgramId,
     ) -> Result<()> {
         let peer_list: Vec<_> = peers.read().await.iter().copied().collect();
-        
+
         if peer_list.is_empty() {
             return Err(anyhow!("no peers available"));
         }
-        
+
         for peer in peer_list.iter().take(3) {
             let req = crate::network::StateRequest {
                 program_id: program_id.clone(),
             };
-            
-            network.request_transfer(
-                *peer,
-                crate::network::TransferRequest::StateRequest(req),
-            );
-            
+
+            network.request_transfer(*peer, crate::network::TransferRequest::StateRequest(req));
+
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            
+
             let state_count = state_store.get_all_scoped(&program_id.0)?.len();
             if state_count > 0 {
                 versions.write().await.insert(program_id.clone(), 1);
-                tracing::info!("background sync: fetched {} state entries for program {}", state_count, program_id);
+                tracing::info!(
+                    "background sync: fetched {} state entries for program {}",
+                    state_count,
+                    program_id
+                );
                 return Ok(());
             }
         }
-        
+
         versions.write().await.insert(program_id.clone(), 0);
-        tracing::debug!("background sync: no state found for program {}, marked as initialized", program_id);
+        tracing::debug!(
+            "background sync: no state found for program {}, marked as initialized",
+            program_id
+        );
         Ok(())
     }
 
     pub async fn fetch_blob(&self, blob_id: &BlobId) -> Result<Vec<u8>> {
         let object_id = blob_id.to_object_id();
-        self.unified_store.get_object(&object_id)
+        if self.unified_store.is_complete(&object_id)? {
+            return self.unified_store.get_object(&object_id);
+        }
+
+        if let Some(ref distributor) = self.chunk_distributor {
+            tracing::info!(
+                "blob {} not available locally, attempting to fetch from network",
+                blob_id
+            );
+
+            distributor
+                .fetch_object(&object_id, crate::network::ProviderKind::Blob)
+                .await
+                .context("network blob fetch failed")?;
+
+            return self
+                .unified_store
+                .get_object(&object_id)
+                .context("blob fetch completed but still unavailable");
+        }
+
+        Err(anyhow!(
+            "blob not available locally and no chunk distributor configured"
+        ))
     }
 
     pub async fn run(self: Arc<Self>, mut events: mpsc::UnboundedReceiver<NetworkEvent>) {
@@ -320,16 +378,16 @@ impl DagEngine {
 
     async fn periodic_dht_announce(&self) -> Result<()> {
         let objects = self.unified_store.list_objects()?;
-        
+
         tracing::info!("announcing {} objects to DHT", objects.len());
-        
+
         for object in objects {
             if self.unified_store.is_complete(&object.id).unwrap_or(false) {
                 self.network.provide(&object.id.0);
                 tracing::debug!("announced object {} to DHT", object.id);
             }
         }
-        
+
         Ok(())
     }
 
@@ -370,36 +428,37 @@ impl DagEngine {
             let mut object_id_bytes = [0u8; 32];
             object_id_bytes.copy_from_slice(&key);
             let object_id = ObjectId(object_id_bytes);
-            
+
             if peers.is_empty() {
                 tracing::warn!("DHT query for {} returned 0 providers", object_id);
                 return Ok(());
             }
-            
+
             tracing::info!(
                 "DHT found {} providers for object {}: {:?}",
                 peers.len(),
                 object_id,
                 peers.iter().map(|p| p.to_string()).collect::<Vec<_>>()
             );
-            
+
             if let Some(ref distributor) = self.chunk_distributor {
                 let mut provider_map = distributor.provider_map.write().await;
-                let entry = provider_map
-                    .entry(object_id)
-                    .or_insert_with(HashSet::new);
-                    
+                let entry = provider_map.entry(object_id).or_insert_with(HashSet::new);
+
                 for peer in peers {
                     entry.insert(peer);
                 }
-                
+
                 tracing::info!("added {} providers for object {}", entry.len(), object_id);
             }
         }
         Ok(())
     }
 
-    async fn handle_transfer_response(&self, response: crate::network::TransferResponse) -> Result<()> {
+    async fn handle_transfer_response(
+        &self,
+        response: crate::network::TransferResponse,
+    ) -> Result<()> {
         match response {
             crate::network::TransferResponse::Unified(unified_resp) => {
                 use crate::network::unified_protocol::*;
@@ -435,14 +494,19 @@ impl DagEngine {
                     state_resp.program_id,
                     state_resp.state_entries.len()
                 );
-                
+
                 for (key, value) in &state_resp.state_entries {
-                    let _ = self.state_store.set_scoped(&state_resp.program_id.0, key, value);
+                    let _ = self
+                        .state_store
+                        .set_scoped(&state_resp.program_id.0, key, value);
                 }
-                
+
                 let local_root = self.state_store.root_scoped(&state_resp.program_id.0)?;
                 if local_root == state_resp.state_root {
-                    tracing::info!("state sync successful, root matches: {}", hex::encode(local_root));
+                    tracing::info!(
+                        "state sync successful, root matches: {}",
+                        hex::encode(local_root)
+                    );
                 } else {
                     tracing::warn!(
                         "state root mismatch: expected {}, got {}",
@@ -475,27 +539,31 @@ impl DagEngine {
         if sync_msg.executor_node == self.identity.node_id {
             return Ok(());
         }
-        
+
         tracing::debug!(
             "received state sync for program {} with {} writes from node {}",
             sync_msg.program_id,
             sync_msg.state_writes.len(),
             sync_msg.executor_node
         );
-        
+
         for write in &sync_msg.state_writes {
             self.state_store
                 .set_scoped(&sync_msg.program_id.0, &write.key, &write.value)
                 .context("applying remote state write")?;
         }
-        
+
         let mut versions = self.program_state_versions.write().await;
         let version = versions.entry(sync_msg.program_id.clone()).or_insert(0);
         *version += 1;
-        
+
         let local_root = self.state_store.root_scoped(&sync_msg.program_id.0)?;
         if local_root == sync_msg.state_root {
-            tracing::debug!("state sync successful for program {} (version {})", sync_msg.program_id, version);
+            tracing::debug!(
+                "state sync successful for program {} (version {})",
+                sync_msg.program_id,
+                version
+            );
         } else {
             tracing::warn!(
                 "state root mismatch for program {}: expected {}, got {}",
@@ -504,28 +572,38 @@ impl DagEngine {
                 hex::encode(local_root)
             );
         }
-        
+
         Ok(())
     }
 
-    async fn handle_unified_protocol(&self, msg: crate::network::unified_protocol::UnifiedProtocolMessage) -> Result<()> {
+    async fn handle_unified_protocol(
+        &self,
+        msg: crate::network::unified_protocol::UnifiedProtocolMessage,
+    ) -> Result<()> {
         match msg {
-            crate::network::unified_protocol::UnifiedProtocolMessage::ObjectAnnouncement(announcement) => {
+            crate::network::unified_protocol::UnifiedProtocolMessage::ObjectAnnouncement(
+                announcement,
+            ) => {
                 tracing::info!(
                     "received object announcement: {} ({} bytes, {} chunks)",
                     announcement.object_id,
                     announcement.total_size,
                     announcement.chunk_count
                 );
-                
+
                 if let Some(ref distributor) = self.chunk_distributor {
                     let _ = distributor.handle_announcement(announcement.clone()).await;
                 }
             }
             crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadata(object) => {
-                let already_have = self.unified_store.get_object_metadata(&object.id).ok().flatten().is_some();
+                let already_have = self
+                    .unified_store
+                    .get_object_metadata(&object.id)
+                    .ok()
+                    .flatten()
+                    .is_some();
                 let is_complete = self.unified_store.is_complete(&object.id).unwrap_or(false);
-                
+
                 if !already_have {
                     tracing::info!("received new object metadata: {}", object.id);
                     if let Err(e) = self.unified_store.store_object(&object) {
@@ -536,17 +614,24 @@ impl DagEngine {
                 } else {
                     tracing::debug!("already have metadata for object {}", object.id);
                 }
-                
+
                 if !is_complete && !already_have {
                     if let Some(ref distributor) = self.chunk_distributor {
                         tracing::info!("object {} not complete, triggering fetch", object.id);
-                        
+
                         let distributor = distributor.clone();
                         let object_id = object.id;
                         tokio::spawn(async move {
-                            match distributor.fetch_object(&object_id).await {
+                            match distributor
+                                .fetch_object(&object_id, crate::network::ProviderKind::Program)
+                                .await
+                            {
                                 Ok(data) => {
-                                    tracing::info!("successfully fetched object {} ({} bytes)", object_id, data.len());
+                                    tracing::info!(
+                                        "successfully fetched object {} ({} bytes)",
+                                        object_id,
+                                        data.len()
+                                    );
                                 }
                                 Err(e) => {
                                     tracing::warn!("failed to fetch object {}: {}", object_id, e);
@@ -558,18 +643,27 @@ impl DagEngine {
                     tracing::debug!("object {} already complete locally", object.id);
                 }
             }
-            crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadataRequest(req) => {
+            crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadataRequest(
+                req,
+            ) => {
                 tracing::debug!("received metadata request for object {}", req.object_id);
-                
+
                 if let Ok(Some(object)) = self.unified_store.get_object_metadata(&req.object_id) {
-                    if self.unified_store.is_complete(&req.object_id).unwrap_or(false) {
+                    if self
+                        .unified_store
+                        .is_complete(&req.object_id)
+                        .unwrap_or(false)
+                    {
                         tracing::info!("responding with metadata for {}", req.object_id);
-                        
+
                         let response_msg = crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadata(object);
                         let network_msg = NetworkMessage::UnifiedProtocol(response_msg);
                         let _ = self.network.publisher.send(network_msg);
                     } else {
-                        tracing::debug!("have metadata for {} but object incomplete", req.object_id);
+                        tracing::debug!(
+                            "have metadata for {} but object incomplete",
+                            req.object_id
+                        );
                     }
                 } else {
                     tracing::debug!("don't have metadata for {}", req.object_id);
@@ -577,21 +671,37 @@ impl DagEngine {
             }
             crate::network::unified_protocol::UnifiedProtocolMessage::ManifestRequest(req) => {
                 tracing::debug!("received manifest request for object {}", req.object_id);
-                
-                if let Ok(Some(manifest)) = self.unified_store.get_manifest_by_object(&req.object_id) {
+
+                if let Ok(Some(manifest)) =
+                    self.unified_store.get_manifest_by_object(&req.object_id)
+                {
                     tracing::info!("responding with manifest for {}", req.object_id);
-                    
-                    let response_msg = crate::network::unified_protocol::UnifiedProtocolMessage::ManifestResponse(manifest);
+
+                    let response_msg =
+                        crate::network::unified_protocol::UnifiedProtocolMessage::ManifestResponse(
+                            manifest,
+                        );
                     let network_msg = NetworkMessage::UnifiedProtocol(response_msg);
                     let _ = self.network.publisher.send(network_msg);
                 } else {
                     tracing::debug!("don't have manifest for {}", req.object_id);
                 }
             }
-            crate::network::unified_protocol::UnifiedProtocolMessage::ManifestResponse(manifest) => {
-                tracing::info!("received manifest response for object {}", manifest.object_id);
-                
-                if self.unified_store.get_manifest_by_object(&manifest.object_id).ok().flatten().is_none() {
+            crate::network::unified_protocol::UnifiedProtocolMessage::ManifestResponse(
+                manifest,
+            ) => {
+                tracing::info!(
+                    "received manifest response for object {}",
+                    manifest.object_id
+                );
+
+                if self
+                    .unified_store
+                    .get_manifest_by_object(&manifest.object_id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
                     let _ = self.unified_store.store_manifest(&manifest);
                     tracing::info!("stored manifest for {}", manifest.object_id);
                 }
@@ -609,10 +719,8 @@ impl DagEngine {
         match req {
             crate::network::TransferRequest::Unified(unified_req) => {
                 let response = self.handle_unified_request(unified_req).await?;
-                self.network.respond_transfer(
-                    channel,
-                    crate::network::TransferResponse::Unified(response),
-                );
+                self.network
+                    .respond_transfer(channel, crate::network::TransferResponse::Unified(response));
             }
             crate::network::TransferRequest::StateRequest(state_req) => {
                 let response = self.handle_state_request(state_req).await?;
@@ -623,26 +731,27 @@ impl DagEngine {
             }
             _ => {
                 tracing::debug!("received non-unified transfer request from {}", peer_id);
-                self.network.respond_transfer(
-                    channel,
-                    crate::network::TransferResponse::Ack,
-                );
+                self.network
+                    .respond_transfer(channel, crate::network::TransferResponse::Ack);
             }
         }
         Ok(())
     }
 
-    async fn handle_state_request(&self, req: crate::network::StateRequest) -> Result<crate::network::StateResponse> {
+    async fn handle_state_request(
+        &self,
+        req: crate::network::StateRequest,
+    ) -> Result<crate::network::StateResponse> {
         let state_entries = self.state_store.get_all_scoped(&req.program_id.0)?;
         let state_root = self.state_store.root_scoped(&req.program_id.0)?;
-        
+
         tracing::info!(
             "responding to state request for program {} ({} entries, root: {})",
             req.program_id,
             state_entries.len(),
             hex::encode(state_root)
         );
-        
+
         Ok(crate::network::StateResponse {
             program_id: req.program_id,
             state_root,
@@ -655,7 +764,7 @@ impl DagEngine {
         req: crate::network::unified_protocol::UnifiedRequest,
     ) -> Result<crate::network::unified_protocol::UnifiedResponse> {
         use crate::network::unified_protocol::*;
-        
+
         match req {
             UnifiedRequest::GetChunk(chunk_req) => {
                 let chunk_data = self.unified_store.get_chunk(&chunk_req.chunk_id)?;
@@ -665,28 +774,49 @@ impl DagEngine {
                 }))
             }
             UnifiedRequest::GetManifest(manifest_req) => {
-                let manifest = self.unified_store.get_manifest_by_object(&manifest_req.object_id)?;
+                let manifest = self
+                    .unified_store
+                    .get_manifest_by_object(&manifest_req.object_id)?;
                 Ok(UnifiedResponse::Manifest(ManifestResponse { manifest }))
             }
             UnifiedRequest::GetChunks(batch_req) => {
-                let chunks: Vec<_> = batch_req.chunk_ids
+                let chunks: Vec<_> = batch_req
+                    .chunk_ids
                     .iter()
                     .map(|cid| {
-                        let data = self.unified_store.get_chunk(cid).ok().flatten().map(|c| c.data);
+                        let data = self
+                            .unified_store
+                            .get_chunk(cid)
+                            .ok()
+                            .flatten()
+                            .map(|c| c.data);
                         (*cid, data)
                     })
                     .collect();
                 Ok(UnifiedResponse::Chunks(BatchChunkResponse { chunks }))
             }
             UnifiedRequest::GetObjectAvailability(avail_req) => {
-                let has_object = self.unified_store.is_complete(&avail_req.object_id).unwrap_or(false);
-                let manifest = self.unified_store.get_manifest_by_object(&avail_req.object_id).ok().flatten();
+                let has_object = self
+                    .unified_store
+                    .is_complete(&avail_req.object_id)
+                    .unwrap_or(false);
+                let manifest = self
+                    .unified_store
+                    .get_manifest_by_object(&avail_req.object_id)
+                    .ok()
+                    .flatten();
                 let has_manifest = manifest.is_some();
-                let metadata = self.unified_store.get_object_metadata(&avail_req.object_id).ok().flatten();
-                
+                let metadata = self
+                    .unified_store
+                    .get_object_metadata(&avail_req.object_id)
+                    .ok()
+                    .flatten();
+
                 let (available_chunks, missing_chunks) = if let Some(ref m) = manifest {
                     let missing = self.unified_store.get_missing_chunks(m).unwrap_or_default();
-                    let available: Vec<_> = m.chunks.iter()
+                    let available: Vec<_> = m
+                        .chunks
+                        .iter()
                         .filter(|c| !missing.contains(&c.chunk_id))
                         .map(|c| c.chunk_id)
                         .collect();
@@ -694,18 +824,24 @@ impl DagEngine {
                 } else {
                     (Vec::new(), Vec::new())
                 };
-                
-                Ok(UnifiedResponse::ObjectAvailability(ObjectAvailabilityResponse {
-                    object_id: avail_req.object_id,
-                    has_object,
-                    has_manifest,
-                    available_chunks,
-                    missing_chunks,
-                    metadata,
-                }))
+
+                Ok(UnifiedResponse::ObjectAvailability(
+                    ObjectAvailabilityResponse {
+                        object_id: avail_req.object_id,
+                        has_object,
+                        has_manifest,
+                        available_chunks,
+                        missing_chunks,
+                        metadata,
+                    },
+                ))
             }
             UnifiedRequest::GetObjectMetadata(metadata_req) => {
-                let metadata = self.unified_store.get_object_metadata(&metadata_req.object_id).ok().flatten();
+                let metadata = self
+                    .unified_store
+                    .get_object_metadata(&metadata_req.object_id)
+                    .ok()
+                    .flatten();
                 Ok(UnifiedResponse::ObjectMetadata(ObjectMetadataResponse {
                     object_id: metadata_req.object_id,
                     metadata,
@@ -718,8 +854,7 @@ impl DagEngine {
         Ok(())
     }
 
-    pub async fn start_fetch_workers(&self, _worker_count: usize) {
-    }
+    pub async fn start_fetch_workers(&self, _worker_count: usize) {}
 
     pub async fn peer_count(&self) -> usize {
         self.peers.read().await.len()

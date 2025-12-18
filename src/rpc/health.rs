@@ -44,7 +44,10 @@ async fn readiness(
         .reporter
         .get_health(running_count, queue_depth, ctx.max_concurrent);
 
-    if matches!(health.status, crate::wasm_runtime::HealthStatus::Unavailable) {
+    if matches!(
+        health.status,
+        crate::wasm_runtime::HealthStatus::Unavailable
+    ) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 

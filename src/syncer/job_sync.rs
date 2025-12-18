@@ -1,6 +1,6 @@
-use crate::wasm_runtime::{FailureReason, Job, JobStore};
 use crate::network::{NetworkHandle, NetworkMessage};
 use crate::types::ProgramId;
+use crate::wasm_runtime::{FailureReason, Job, JobStore};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

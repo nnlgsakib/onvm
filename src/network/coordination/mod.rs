@@ -4,7 +4,6 @@
 /// - Peer discovery: Enhanced discovery with scoring and caching
 /// - Capability broadcasting: Advertise node capabilities (CPU, GPU, memory)
 /// - Load balancing: Intelligent peer selection based on capabilities and load
-
 pub mod capability;
 pub mod discovery;
 pub mod load_balancer;
@@ -30,8 +29,7 @@ pub struct CoordinationManager {
 impl CoordinationManager {
     pub fn new(local_peer_id: PeerId, capabilities: NodeCapabilities) -> Self {
         let peer_discovery = Arc::new(RwLock::new(PeerDiscovery::new(local_peer_id)));
-        let capability_advertiser =
-            Arc::new(RwLock::new(CapabilityAdvertiser::new(capabilities)));
+        let capability_advertiser = Arc::new(RwLock::new(CapabilityAdvertiser::new(capabilities)));
         let load_balancer = Arc::new(RwLock::new(LoadBalancer::new()));
 
         Self {
@@ -44,9 +42,10 @@ impl CoordinationManager {
     pub fn with_cache(mut self, cache_dir: std::path::PathBuf) -> Self {
         let peer_cache_path = cache_dir.join("peers.bin");
         let discovery = Arc::new(RwLock::new(
-            PeerDiscovery::new(*futures::executor::block_on(async {
-                self.peer_discovery.read().await
-            }).local_peer_id())
+            PeerDiscovery::new(
+                *futures::executor::block_on(async { self.peer_discovery.read().await })
+                    .local_peer_id(),
+            )
             .with_cache(peer_cache_path),
         ));
         self.peer_discovery = discovery;
@@ -54,10 +53,7 @@ impl CoordinationManager {
     }
 
     pub async fn on_peer_connected(&self, peer_id: PeerId) -> Result<()> {
-        self.peer_discovery
-            .write()
-            .await
-            .on_peer_connected(peer_id);
+        self.peer_discovery.write().await.on_peer_connected(peer_id);
         Ok(())
     }
 
@@ -66,7 +62,10 @@ impl CoordinationManager {
             .write()
             .await
             .on_peer_disconnected(peer_id);
-        self.load_balancer.write().await.on_peer_disconnected(peer_id);
+        self.load_balancer
+            .write()
+            .await
+            .on_peer_disconnected(peer_id);
         Ok(())
     }
 

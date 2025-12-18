@@ -1,4 +1,6 @@
-use crate::types::{Chunk, ChunkDescriptor, ChunkId, Manifest, ManifestId, Object, ObjectId, ObjectType};
+use crate::types::{
+    Chunk, ChunkDescriptor, ChunkId, Manifest, ManifestId, Object, ObjectId, ObjectType,
+};
 use anyhow::{anyhow, Result};
 use fastcdc::v2020::FastCDC;
 use sled::Db;
@@ -30,14 +32,15 @@ impl UnifiedStore {
         }
 
         let chunks = chunk_data(data);
-        
+
         let content_hash = ObjectId::new(data);
-        
+
         let type_hash = {
-            let type_bytes = bincode::serde::encode_to_vec(&object_type, bincode::config::standard())?;
+            let type_bytes =
+                bincode::serde::encode_to_vec(&object_type, bincode::config::standard())?;
             blake3::hash(&type_bytes)
         };
-        
+
         let mut combined = Vec::new();
         combined.extend_from_slice(&content_hash.0);
         combined.extend_from_slice(type_hash.as_bytes());
@@ -271,9 +274,7 @@ mod tests {
 
         let object = store.put_object(
             &test_data,
-            ObjectType::Blob {
-                mime_type: Some("application/octet-stream".to_string()),
-            },
+            ObjectType::blob_with_random_salt(Some("application/octet-stream".to_string())),
             publisher,
         )?;
 

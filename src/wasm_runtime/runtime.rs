@@ -1,6 +1,6 @@
-use crate::wasm_runtime::ExecutionAdapter;
 use crate::storage::{StateStore, UnifiedStore};
 use crate::types::{ObjectId, ProgramId, StateWrite};
+use crate::wasm_runtime::ExecutionAdapter;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -99,20 +99,17 @@ impl ExecutionEngine {
 
     pub fn execute(&self, program_id: &ProgramId, input: &[u8]) -> Result<ExecutionOutcome> {
         let object_id = program_id.to_object_id();
-        
-        let wasm = self.execution_adapter
+
+        let wasm = self
+            .execution_adapter
             .load_wasm_by_object_id(&object_id)
             .with_context(|| format!("load program {program_id}"))?;
-        
-        let entrypoint = self.execution_adapter
-            .get_entrypoint(&object_id)?;
-        
+
+        let entrypoint = self.execution_adapter.get_entrypoint(&object_id)?;
+
         let module = self.get_or_compile_module(&object_id, &wasm)?;
 
-        let wasi = WasiCtxBuilder::new()
-            .inherit_stdio()
-            .inherit_env()?
-            .build();
+        let wasi = WasiCtxBuilder::new().inherit_stdio().inherit_env()?.build();
         let ctx = ExecutionContext {
             unified_store: self.unified_store.clone(),
             state_store: self.state_store.clone(),
@@ -133,8 +130,7 @@ impl ExecutionEngine {
         let entry_multi =
             instance.get_typed_func::<(i32, i32), (i32, i32)>(&mut store, &entrypoint);
         let entry_packed = instance.get_typed_func::<(i32, i32), i64>(&mut store, &entrypoint);
-        let entry_sret =
-            instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, &entrypoint);
+        let entry_sret = instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, &entrypoint);
         let entry = match (entry_multi, entry_packed, entry_sret) {
             (Ok(f), _, _) => EntryPoint::Multi(f),
             (_, Ok(f), _) => EntryPoint::Packed(f),

@@ -209,9 +209,13 @@ impl UnifiedStore {
         let mut objects = Vec::new();
         for entry in tree.iter() {
             let (_, v) = entry?;
-            let (object, _): (Object, _) =
-                bincode::serde::decode_from_slice(&v, bincode::config::standard())?;
-            objects.push(object);
+            match bincode::serde::decode_from_slice::<Object, _>(&v, bincode::config::standard()) {
+                Ok((object, _)) => objects.push(object),
+                Err(e) => {
+                    tracing::warn!("skipping malformed object record: {}", e);
+                    continue;
+                }
+            }
         }
         Ok(objects)
     }

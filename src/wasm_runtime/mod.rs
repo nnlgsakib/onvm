@@ -2,6 +2,7 @@ mod execution_adapter;
 mod execution_pool;
 mod fuel_estimator;
 mod health;
+mod host_apis;
 mod job;
 mod job_executor;
 mod job_resources;

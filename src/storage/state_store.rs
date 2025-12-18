@@ -51,6 +51,13 @@ impl StateStore {
         }
         Ok(pairs)
     }
+
+    pub fn delete_scoped(&self, ns: &[u8], key: &[u8]) -> Result<()> {
+        let tree = self.db.open_tree(self.tree_name)?;
+        tree.remove(prefixed(ns, key))?;
+        tree.flush()?;
+        Ok(())
+    }
 }
 
 fn prefixed(ns: &[u8], key: &[u8]) -> Vec<u8> {

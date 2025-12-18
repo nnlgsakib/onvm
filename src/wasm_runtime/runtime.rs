@@ -1,7 +1,8 @@
 use crate::storage::{StateStore, UnifiedStore};
 use crate::types::{ObjectId, ProgramId, StateWrite};
 use crate::wasm_runtime::host_apis::{
-    attach_blob_host_functions, attach_state_host_functions, ExecutionContext,
+    attach_blob_host_functions, attach_crypto_host_functions, attach_state_host_functions,
+    ExecutionContext,
 };
 use crate::wasm_runtime::ExecutionAdapter;
 use anyhow::{Context, Result};
@@ -116,6 +117,7 @@ impl ExecutionEngine {
         store.set_fuel(self.max_fuel)?;
         let mut linker = Linker::new(&self.engine);
         attach_blob_host_functions(&mut linker)?;
+        attach_crypto_host_functions(&mut linker)?;
         attach_state_host_functions(&mut linker)?;
         wasmtime_wasi::add_to_linker(&mut linker, |cx: &mut ExecutionContext| &mut cx.wasi)?;
         let instance = linker.instantiate(&mut store, &module)?;

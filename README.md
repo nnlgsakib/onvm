@@ -48,6 +48,38 @@ CLI → RPC → Node → Consensus (DAG) → Network (gossip)
 3. **Execute**: client POSTs program_id + input → ExecutionEngine (fuel-metered wasm) → StateStore → DAG node → gossip
 4. **Submit Job**: client POSTs job request → JobScheduler → JobExecutor → BlobStore (output) → gossip to peers
 
+### Blob & Program Lifecycle Flow
+
+```mermaid
+flowchart TD
+  subgraph Upload[Blob Upload]
+    U1[Client: POST /blobs] --> U2[RPC server]
+    U2 --> U3[UnifiedStore: chunk + manifest]
+    U3 --> U4[Consensus: ingest local object]
+    U4 --> U5[Network gossip + DHT provide]
+  end
+
+  subgraph Deploy[Program Deploy]
+    D1[Client: POST /programs] --> D2[RPC server]
+    D2 --> D3[UnifiedStore: store wasm object]
+    D3 --> D4[Consensus: ingest program]
+    D4 --> D5[Network gossip + DHT provide]
+  end
+
+  subgraph Execute[Execute / Job]
+    E1[Client: POST /execute or /jobs] --> E2[RPC server]
+    E2 --> E3[Consensus: ensure program blob present]
+    E3 --> E4[Runtime: Wasm execution\nfuel limits + host APIs]
+    E4 --> E5[StateStore updates + output blob]
+    E5 --> E6[Consensus: execution DAG node]
+    E6 --> E7[Network gossip + availability ads]
+  end
+
+  U5 -. blobs requested .-> NFetch[Peers fetch manifests/chunks via req/resp]
+  D5 -. programs requested .-> NFetch
+  E7 --> Clients[Clients can GET blobs/programs from local or peers]
+```
+
 ---
 
 ## Building & Running

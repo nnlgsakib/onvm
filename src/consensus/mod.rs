@@ -540,6 +540,17 @@ impl DagEngine {
             return Ok(());
         }
 
+        // Ignore state sync for programs we do not have locally.
+        let program_obj = sync_msg.program_id.to_object_id();
+        if !self.unified_store.is_complete(&program_obj)? {
+            tracing::debug!(
+                "ignoring state sync for unknown program {} (object {} not present)",
+                sync_msg.program_id,
+                program_obj
+            );
+            return Ok(());
+        }
+
         tracing::debug!(
             "received state sync for program {} with {} writes from node {}",
             sync_msg.program_id,

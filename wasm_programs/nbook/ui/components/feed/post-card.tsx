@@ -18,6 +18,7 @@ interface PostCardProps {
 }
 
 export function PostCard({ post, onUpdate }: PostCardProps) {
+  const [localPost, setLocalPost] = useState<Post>(post)
   const [isLiking, setIsLiking] = useState(false)
   const [bookmarked, setBookmarked] = useState(false)
   const [attachments, setAttachments] = useState<Record<string, string>>({})
@@ -27,17 +28,20 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
   const [isCommenting, setIsCommenting] = useState(false)
   const currentUser = getCurrentUsername()
   const { toast } = useToast()
+  const [sharing, setSharing] = useState(false)
+  const [shareOpen, setShareOpen] = useState(false)
+  const shareUrl = useMemo(() => {
+    const base = typeof window !== "undefined" ? window.location.origin : ""
+    return `${base}/feed?post=${encodeURIComponent(localPost?.id ?? "")}`
+  }, [localPost?.id])
 
   const handleLike = async () => {
     if (isLiking) return
 
     setIsLiking(true)
     try {
-      await likePost(post.id)
-
-      if (onUpdate) {
-        onUpdate()
-      }
+      const updated = await likePost(localPost.id)
+      setLocalPost(updated)
     } catch (error) {
       console.error("[v0] Like error:", error)
       toast({
@@ -71,10 +75,10 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
   useEffect(() => {
     let cancelled = false
     const load = async () => {
-      if (!post?.attachments?.length) return
+      if (!localPost?.attachments?.length) return
       const next: Record<string, string> = {}
       const errs: Record<string, string> = {}
-      for (const att of post.attachments) {
+      for (const att of localPost.attachments) {
         try {
           const { blob, contentType } = await fetchBlob(att.blob_id_hex)
           if (cancelled) return
@@ -94,16 +98,20 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
       Object.values(attachments).forEach((u) => URL.revokeObjectURL(u.split("|")[0]))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [post?.id, post?.attachments])
+  }, [localPost?.id, localPost?.attachments])
+
+  useEffect(() => {
+    setLocalPost(post)
+  }, [post])
 
   const handleComment = async () => {
     if (!commentText.trim()) return
     setIsCommenting(true)
     try {
-      await commentOnPost(post.id, commentText.trim())
+      const updated = await commentOnPost(localPost.id, commentText.trim())
+      setLocalPost(updated)
       setCommentText("")
       setShowCommentBox(false)
-      onUpdate?.()
     } catch (e) {
       toast({
         title: "Failed to comment",
@@ -116,7 +124,8 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
   }
 
   return (
-    <Card className="border-x-0 border-t-0 border-b border-border/50 rounded-none bg-transparent hover:bg-card/30 transition-colors group">
+    <>
+    <Card className="border border-border/40 rounded-2xl bg-card/70 backdrop-blur-md hover:-translate-y-1 hover:shadow-lg transition-all group">
       <div className="p-4">
             <div className="flex items-start gap-3">
               <Avatar className="w-10 h-10 border-2 border-transparent group-hover:border-primary/20 transition-colors">
@@ -129,13 +138,13 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
               <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Link
-                  href={`/profile?user=${encodeURIComponent(post?.author ?? "")}`}
+                  href={`/profile?user=${encodeURIComponent(localPost?.author ?? "")}`}
                   className="font-semibold hover:text-primary transition-colors cursor-pointer"
                 >
-                  {post?.author ?? "unknown"}
+                  {localPost?.author ?? "unknown"}
                 </Link>
                 <span className="text-sm text-muted-foreground">
-                  · {formatTimestamp(post?.createdAt ?? 0)}
+                  · {formatTimestamp(localPost?.createdAt ?? 0)}
                 </span>
               </div>
               <Button size="sm" variant="ghost" className="opacity-0 group-hover:opacity-100 transition-opacity">
@@ -147,9 +156,9 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
               {post?.text ?? ""}
             </p>
 
-            {post?.attachments?.length ? (
+            {localPost?.attachments?.length ? (
               <div className="mt-3 space-y-3">
-                {post.attachments.map((att) => {
+                {localPost.attachments.map((att) => {
                   const stored = attachments[att.blob_id_hex]
                   const url = stored ? stored.split("|")[0] : undefined
                   const ct = stored ? stored.split("|")[1] : ""
@@ -207,7 +216,7 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
                 className="gap-2 text-muted-foreground hover:text-red-500 hover:bg-red-500/10 transition-all hover:scale-110"
               >
                 <Heart className="w-4 h-4" />
-                <span className="text-sm">{post?.likes ?? 0}</span>
+                <span className="text-sm">{localPost?.likes ?? 0}</span>
               </Button>
 
               <Button
@@ -217,24 +226,25 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
                 className="gap-2 text-muted-foreground hover:text-primary hover:bg-primary/10 transition-all hover:scale-110"
               >
                 <MessageCircle className="w-4 h-4" />
-                <span className="text-sm">{post?.comments?.length ?? 0}</span>
+                <span className="text-sm">{localPost?.comments?.length ?? 0}</span>
               </Button>
 
               <Button
                 size="sm"
                 variant="ghost"
+                onClick={() => setShareOpen(true)}
                 className="gap-2 text-muted-foreground hover:text-accent hover:bg-accent/10 transition-all hover:scale-110"
               >
                 <Share className="w-4 h-4" />
               </Button>
 
-              {currentUser && currentUser === post?.author && (
+              {currentUser && currentUser === localPost?.author && (
                 <Button
                   size="sm"
                   variant="ghost"
                   onClick={async () => {
                     try {
-                      await deletePost(post.id)
+                      await deletePost(localPost.id)
                       toast({ title: "Post deleted" })
                       onUpdate?.()
                     } catch (e) {
@@ -292,9 +302,9 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
               </div>
             )}
 
-            {post?.comments?.length ? (
+            {localPost?.comments?.length ? (
               <div className="mt-4 space-y-2">
-                {post.comments.map((c) => (
+                {localPost.comments.map((c) => (
                   <div key={c.id} className="text-sm border-t border-border/40 pt-2">
                     <span className="font-semibold">{c.author}</span>:{" "}
                     <span className="text-muted-foreground">{c.text}</span>
@@ -306,5 +316,65 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
         </div>
       </div>
     </Card>
+    {shareOpen && (
+      <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center px-4">
+        <div className="bg-background rounded-lg shadow-lg max-w-sm w-full p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold">Share post</h3>
+            <Button variant="ghost" size="sm" onClick={() => setShareOpen(false)}>
+              Close
+            </Button>
+          </div>
+          <div className="space-y-2">
+              <Button
+                variant="outline"
+                className="w-full justify-start gap-2"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(shareUrl)
+                    toast({ title: "Link copied" })
+                  } catch (e) {
+                    toast({
+                    title: "Copy failed",
+                    description: e instanceof Error ? e.message : "Please try again.",
+                    variant: "destructive",
+                  })
+                }
+              }}
+            >
+              Copy link
+            </Button>
+              <Button
+                variant="outline"
+                className="w-full justify-start gap-2"
+                disabled={sharing}
+                onClick={async () => {
+                  setSharing(true)
+                  try {
+                    await navigator.share({
+                      title: "Check this post",
+                      text: localPost?.text,
+                    url: shareUrl,
+                  })
+                } catch (e) {
+                  if (!(e instanceof Error && e.name === "AbortError")) {
+                    toast({
+                      title: "Share failed",
+                      description: e instanceof Error ? e.message : "Please try again.",
+                      variant: "destructive",
+                    })
+                  }
+                } finally {
+                  setSharing(false)
+                }
+              }}
+            >
+              Share via device...
+            </Button>
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   )
 }

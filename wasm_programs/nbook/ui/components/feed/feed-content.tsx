@@ -1,11 +1,12 @@
 "use client"
 
 import { useState, useEffect, useMemo } from "react"
+import { useSearchParams } from "next/navigation"
 import { PostCard } from "./post-card"
 import { CreatePostBox } from "./create-post-box"
 import { Button } from "@/components/ui/button"
 import { Sparkles, Loader2 } from "lucide-react"
-import { getFeed } from "@/lib/api"
+import { getFeed, getPost } from "@/lib/api"
 import type { Post } from "@/lib/onvm-client"
 import { useToast } from "@/hooks/use-toast"
 import { getSession } from "@/lib/auth"
@@ -25,8 +26,30 @@ export function FeedContent({ initialTab = "following", fixedDiscover = false, t
   const [isLoading, setIsLoading] = useState(true)
   const [unauthenticated, setUnauthenticated] = useState(false)
   const { toast } = useToast()
+  const searchParams = useSearchParams()
+  const focusedPostId = searchParams.get("post")
 
   const loadFeed = async () => {
+    // If a specific post is requested, fetch it directly (no session required)
+    if (focusedPostId) {
+      setIsLoading(true)
+      setUnauthenticated(false)
+      try {
+        const p = await getPost(focusedPostId)
+        setPosts(p ? [p] : [])
+      } catch (error) {
+        console.error("[v0] Feed load error:", error)
+        toast({
+          title: "Failed to load post",
+          description: error instanceof Error ? error.message : "Please try again.",
+          variant: "destructive",
+        })
+        setPosts([])
+      } finally {
+        setIsLoading(false)
+      }
+      return
+    }
     const session = getSession()
     if (!session?.session) {
       setUnauthenticated(true)
@@ -56,7 +79,7 @@ export function FeedContent({ initialTab = "following", fixedDiscover = false, t
       return
     }
     loadFeed()
-  }, [activeTab, fixedDiscover])
+  }, [activeTab, fixedDiscover, focusedPostId])
 
   const headerTitle = useMemo(() => {
     if (title) return title
@@ -71,9 +94,9 @@ export function FeedContent({ initialTab = "following", fixedDiscover = false, t
           {!hideToggle && (
             <Button
               size="sm"
-              variant="ghost"
-              className={`gap-2 ${
-                activeTab === "discover" ? "text-primary" : "text-muted-foreground"
+              variant="outline"
+              className={`gap-2 rounded-full ${
+                activeTab === "discover" ? "border-primary text-primary" : "text-muted-foreground"
               } hover:text-primary transition-colors`}
               onClick={() => setActiveTab(activeTab === "following" ? "discover" : "following")}
             >

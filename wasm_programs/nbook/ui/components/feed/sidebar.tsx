@@ -28,9 +28,9 @@ export function Sidebar() {
   ]
 
   return (
-    <div className="flex flex-col h-full p-4">
+    <div className="flex flex-col h-full p-4 space-y-4">
       {/* Logo */}
-      <Link href="/feed" className="flex items-center gap-3 mb-8 p-2 group">
+      <Link href="/feed" className="flex items-center gap-3 p-2 group rounded-xl hover:bg-secondary/40 transition">
         <div className="relative">
           <div className="absolute inset-0 bg-primary/30 blur-lg group-hover:bg-primary/50 transition-all" />
           <div className="relative flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-br from-primary to-accent">
@@ -50,14 +50,14 @@ export function Sidebar() {
       </Link>
 
       {/* Navigation */}
-      <nav className="flex-1 space-y-1">
+      <nav className="flex-1 space-y-2">
         {navItems.map((item) => {
           const Icon = item.icon
           return (
             <Link key={item.href} href={item.href}>
               <Button
                 variant="ghost"
-                className={`w-full justify-start gap-3 h-12 transition-all duration-200 ${
+                className={`w-full justify-start gap-3 h-11 rounded-xl transition-all duration-200 ${
                   item.active
                     ? "bg-primary/10 text-primary hover:bg-primary/20"
                     : "hover:bg-secondary/50 text-muted-foreground hover:text-foreground"

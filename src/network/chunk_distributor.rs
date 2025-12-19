@@ -70,6 +70,14 @@ impl ChunkDistributor {
             }
         };
 
+        // Try manifest and missing chunks before hitting the network for providers.
+        if let Some(manifest) = self.store.get_manifest_by_object(object_id)? {
+            let missing_chunks = self.store.get_missing_chunks(&manifest)?;
+            if missing_chunks.is_empty() {
+                return self.store.get_object(object_id);
+            }
+        }
+
         self.ensure_providers_for_object(object_id, provider_kind)
             .await;
 

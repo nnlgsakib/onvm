@@ -33,9 +33,14 @@ pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext
                 Ok(oid) => oid,
                 Err(code) => return code,
             };
-            match caller.data().unified_store.is_complete(&object_id) {
-                Ok(true) => 1,
-                Ok(false) => 0,
+            // Treat a blob as existing if we have a manifest; completeness may depend on sync.
+            match caller
+                .data()
+                .unified_store
+                .get_manifest_by_object(&object_id)
+            {
+                Ok(Some(_)) => 1,
+                Ok(None) => 0,
                 Err(_) => -6,
             }
         },
@@ -53,12 +58,19 @@ pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext
                 Ok(oid) => oid,
                 Err(code) => return code as i64,
             };
-            let meta = match caller.data().unified_store.get_object_metadata(&object_id) {
-                Ok(Some(m)) => m,
-                Ok(None) => return -1,
-                Err(_) => return -2,
-            };
-            meta.total_size as i64
+            if let Ok(Some(meta)) = caller.data().unified_store.get_object_metadata(&object_id) {
+                return meta.total_size as i64;
+            }
+            // Fallback to manifest if metadata not yet cached.
+            match caller
+                .data()
+                .unified_store
+                .get_manifest_by_object(&object_id)
+            {
+                Ok(Some(m)) => m.total_size() as i64,
+                Ok(None) => -1,
+                Err(_) => -2,
+            }
         },
     )?;
 
@@ -648,8 +660,16 @@ fn read_object_id(
     if memory.read(caller, id_ptr as usize, &mut id_buf).is_err() {
         return Err(-2);
     }
-    let id_hex = String::from_utf8(id_buf).map_err(|_| -3)?;
-    let id_bytes = hex::decode(id_hex.trim()).map_err(|_| -4)?;
+
+    // Accept either raw 32-byte object IDs or 64-char hex strings.
+    let id_bytes = if id_buf.len() == 32 {
+        id_buf
+    } else {
+        let id_hex = String::from_utf8(id_buf).map_err(|_| -3)?;
+        let decoded = hex::decode(id_hex.trim()).map_err(|_| -4)?;
+        decoded
+    };
+
     if id_bytes.len() != 32 {
         return Err(-5);
     }

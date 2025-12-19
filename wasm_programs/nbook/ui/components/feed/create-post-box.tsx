@@ -83,7 +83,7 @@ export function CreatePostBox({ onPostCreated }: CreatePostBoxProps) {
   return (
     <div className="p-4">
       <div className="flex gap-3">
-        <Avatar className="w-10 h-10 border-2 border-primary/20">
+        <Avatar className="w-10 h-10 border-2 border-primary/20 shrink-0">
           <AvatarFallback className="bg-gradient-to-br from-primary to-accent text-primary-foreground">
             {getInitials(username)}
           </AvatarFallback>

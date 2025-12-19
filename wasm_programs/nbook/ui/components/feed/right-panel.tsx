@@ -66,12 +66,15 @@ export function RightPanel() {
             src={`${process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8081"}/blobs/${user.avatarBlobId}`}
             alt={user.username}
             className="w-full h-full object-cover rounded-full"
+            onError={(e) => {
+              const target = e.currentTarget
+              target.style.display = "none"
+            }}
           />
-        ) : (
-          <AvatarFallback className="bg-gradient-to-br from-primary/20 to-accent/20">
-            {(user.displayName || user.username || "NB").substring(0, 2).toUpperCase()}
-          </AvatarFallback>
-        )}
+        ) : null}
+        <AvatarFallback className="bg-gradient-to-br from-primary/20 to-accent/20">
+          {(user.displayName || user.username || "NB").substring(0, 2).toUpperCase()}
+        </AvatarFallback>
       </Avatar>
       <div className="flex-1 min-w-0">
         <div className="text-sm font-medium truncate group-hover:text-primary transition-colors">

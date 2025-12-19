@@ -87,7 +87,7 @@ export function FeedContent({ initialTab = "following", fixedDiscover = false, t
   }, [fixedDiscover, title])
 
   return (
-    <div className="max-w-2xl mx-auto">
+    <div className="w-full max-w-2xl mx-auto px-2 sm:px-0">
       <div className="sticky top-0 z-40 bg-background/80 backdrop-blur-xl border-b border-border/50">
         <div className="flex items-center justify-between p-4">
           <h1 className="text-2xl font-bold">{headerTitle}</h1>

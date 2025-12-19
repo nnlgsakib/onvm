@@ -125,17 +125,28 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
 
   return (
     <>
-    <Card className="border border-border/40 rounded-2xl bg-card/70 backdrop-blur-md hover:-translate-y-1 hover:shadow-lg transition-all group">
+    <Card className="border border-border/40 rounded-2xl bg-card/70 backdrop-blur-md hover:-translate-y-1 hover:shadow-lg transition-all group w-full">
       <div className="p-4">
             <div className="flex items-start gap-3">
-              <Avatar className="w-10 h-10 border-2 border-transparent group-hover:border-primary/20 transition-colors">
-                <AvatarFallback className="bg-gradient-to-br from-primary/20 to-accent/20">
-                  {initials}
-                </AvatarFallback>
-              </Avatar>
+        <Avatar className="w-10 h-10 border-2 border-transparent group-hover:border-primary/20 transition-colors">
+          {localPost.avatarBlobId ? (
+            <img
+              src={`${process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8081"}/blobs/${localPost.avatarBlobId}`}
+              alt={localPost.author}
+              className="w-full h-full object-cover rounded-full"
+              onError={(e) => {
+                const target = e.currentTarget
+                target.style.display = "none"
+              }}
+            />
+          ) : null}
+          <AvatarFallback className="bg-gradient-to-br from-primary/20 to-accent/20">
+            {initials}
+          </AvatarFallback>
+        </Avatar>
 
           <div className="flex-1 min-w-0">
-              <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
               <div className="flex items-center gap-2">
                 <Link
                   href={`/profile?user=${encodeURIComponent(localPost?.author ?? "")}`}
@@ -152,7 +163,7 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
               </Button>
             </div>
 
-            <p className="mt-2 text-foreground leading-relaxed whitespace-pre-wrap">
+            <p className="mt-2 text-foreground leading-relaxed whitespace-pre-wrap break-words">
               {post?.text ?? ""}
             </p>
 
@@ -163,10 +174,34 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
                   const url = stored ? stored.split("|")[0] : undefined
                   const ct = stored ? stored.split("|")[1] : ""
                   const err = attachmentErrors[att.blob_id_hex]
+                  const shortId =
+                    att.blob_id_hex.length > 16
+                      ? `${att.blob_id_hex.slice(0, 8)}…${att.blob_id_hex.slice(-6)}`
+                      : att.blob_id_hex
                   return (
                     <div key={att.blob_id_hex} className="rounded-md border border-border/60 p-2">
-                      <div className="text-xs text-muted-foreground mb-1">
-                        {att.blob_id_hex} ({Math.round(att.size / 1024)} KB)
+                      <div className="text-xs text-muted-foreground mb-1 flex items-center gap-2 flex-wrap">
+                        <span className="font-mono break-all">{shortId}</span>
+                        <span>({Math.round(att.size / 1024)} KB)</span>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 px-2 text-xs"
+                          onClick={async () => {
+                            try {
+                              await navigator.clipboard.writeText(att.blob_id_hex)
+                              toast({ title: "Attachment ID copied" })
+                            } catch {
+                              toast({
+                                title: "Copy failed",
+                                description: "Could not copy attachment id.",
+                                variant: "destructive",
+                              })
+                            }
+                          }}
+                        >
+                          Copy
+                        </Button>
                       </div>
                       {err ? (
                         <div className="text-xs text-destructive">Failed to load: {err}</div>

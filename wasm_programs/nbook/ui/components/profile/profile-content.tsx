@@ -125,7 +125,7 @@ export function ProfileContent() {
   const initials = (profile.username || "NB").substring(0, 2).toUpperCase()
 
   return (
-    <div className="max-w-2xl mx-auto">
+    <div className="w-full max-w-2xl mx-auto px-2 sm:px-0">
       <div className="sticky top-0 z-40 bg-background/80 backdrop-blur-xl border-b border-border/50">
         <div className="p-4">
           <div className="flex items-center justify-between">
@@ -408,12 +408,15 @@ export function ProfileContent() {
                             src={`${process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8081"}/blobs/${u.avatarBlobId}`}
                             alt={u.username}
                             className="w-full h-full object-cover rounded-full"
+                            onError={(e) => {
+                              const target = e.currentTarget
+                              target.style.display = "none"
+                            }}
                           />
-                        ) : (
-                          <AvatarFallback className="bg-gradient-to-br from-primary/20 to-accent/20">
-                            {(u.displayName || u.username || "NB").substring(0, 2).toUpperCase()}
-                          </AvatarFallback>
-                        )}
+                        ) : null}
+                        <AvatarFallback className="bg-gradient-to-br from-primary/20 to-accent/20">
+                          {(u.displayName || u.username || "NB").substring(0, 2).toUpperCase()}
+                        </AvatarFallback>
                       </Avatar>
                       <a href={`/profile?user=${encodeURIComponent(u.username)}`} className="text-sm font-medium hover:text-primary">
                         {u.displayName || u.username}

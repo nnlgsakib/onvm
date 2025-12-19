@@ -27,7 +27,7 @@ export function FeedLayout({ children }: { children: React.ReactNode }) {
 
       {/* Mobile/Tablet Layout */}
       <div className="lg:hidden">
-        <main className="pb-16">{children}</main>
+        <main className="pb-20 px-2">{children}</main>
         <MobileNav />
       </div>
     </div>

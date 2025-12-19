@@ -7,16 +7,23 @@ import { Button } from "@/components/ui/button"
 import { Home, Compass, User, Settings, LogOut, Plus } from "lucide-react"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { getSession, logout } from "@/lib/auth"
+import { getProfile } from "@/lib/api"
 
 export function Sidebar() {
   const pathname = usePathname()
   const [username, setUsername] = useState<string | null>(null)
   const [hasSession, setHasSession] = useState(false)
+  const [avatarId, setAvatarId] = useState<string | null>(null)
 
   useEffect(() => {
     const session = getSession()
     setUsername(session?.username ?? null)
     setHasSession(Boolean(session))
+    if (session?.username) {
+      getProfile(session.username)
+        .then((p) => setAvatarId(p.avatarBlobId || null))
+        .catch(() => setAvatarId(null))
+    }
   }, [])
 
   const navItems = [
@@ -75,9 +82,17 @@ export function Sidebar() {
       <div className="pt-4 border-t border-border/50 mt-auto">
         <Link href={hasSession ? "/profile" : "/login"} className="flex items-center gap-3 p-2 rounded-xl hover:bg-secondary/50 transition-colors group">
           <Avatar className="w-10 h-10 border-2 border-primary/20 group-hover:border-primary/40 transition-colors">
-            <AvatarFallback className="bg-gradient-to-br from-primary to-accent text-primary-foreground">
-              {(username || "NB").substring(0, 2).toUpperCase()}
-            </AvatarFallback>
+            {avatarId ? (
+              <img
+                src={`${process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8081"}/blobs/${avatarId}`}
+                alt={username || "avatar"}
+                className="w-full h-full object-cover rounded-full"
+              />
+            ) : (
+              <AvatarFallback className="bg-gradient-to-br from-primary to-accent text-primary-foreground">
+                {(username || "NB").substring(0, 2).toUpperCase()}
+              </AvatarFallback>
+            )}
           </Avatar>
           <div className="flex-1 min-w-0">
             <div className="text-sm font-medium truncate">{username || "Guest"}</div>

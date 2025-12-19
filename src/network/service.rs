@@ -2,6 +2,7 @@ use crate::crypto::keys::NodeKeys;
 use crate::types::{BlobId, BlobMetadata, ComputeOp, ProgramId, ProgramMetadata};
 use anyhow::{anyhow, Context, Result};
 use blake3;
+use ed25519_dalek::{PublicKey as EdPublicKey, Signature as EdSignature};
 use futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic as Topic};
 use libp2p::identity as libp2p_identity;
@@ -12,14 +13,92 @@ use libp2p::kad::{
 use libp2p::mdns;
 use libp2p::noise;
 use libp2p::request_response::{cbor, ProtocolSupport, ResponseChannel};
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::yamux;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
+use rand::rngs::OsRng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
+fn sign_network_message(keys: &NodeKeys, msg: &NetworkMessage) -> Result<SignedNetworkMessage> {
+    let payload =
+        bincode::serde::encode_to_vec(msg, bincode::config::standard()).context("encode msg")?;
+    let signature = keys.sign(&payload).to_bytes();
+    Ok(SignedNetworkMessage {
+        payload,
+        publisher: keys.node_id.clone(),
+        public_key: keys.keypair.public.to_bytes(),
+        signature: signature.to_vec(),
+    })
+}
+
+fn verify_signed_message(env: &SignedNetworkMessage) -> Result<NetworkMessage> {
+    let pubkey =
+        EdPublicKey::from_bytes(&env.public_key).map_err(|e| anyhow!("pubkey parse: {e}"))?;
+    let expected_node = crate::types::NodeId::from_public_key(pubkey.as_bytes());
+    if expected_node != env.publisher {
+        return Err(anyhow!("publisher mismatch"));
+    }
+    let sig = EdSignature::from_bytes(&env.signature).map_err(|e| anyhow!("sig parse: {e}"))?;
+    pubkey
+        .verify_strict(&env.payload, &sig)
+        .map_err(|_| anyhow!("signature invalid"))?;
+    let msg: NetworkMessage =
+        bincode::serde::decode_from_slice(&env.payload, bincode::config::standard())
+            .map_err(|e| anyhow!("decode payload: {e}"))?
+            .0;
+    Ok(msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn sign_verify_roundtrip() -> Result<()> {
+        let mut rng = OsRng;
+        let kp = ed25519_dalek::Keypair::generate(&mut rng);
+        let nk = NodeKeys::from_keypair(
+            ed25519_dalek::Keypair::from_bytes(&kp.to_bytes()).unwrap(),
+            std::path::PathBuf::new(),
+        );
+        let msg = NetworkMessage::Inventory(DagInventory {
+            programs: vec![[1u8; 32]],
+            program_bloom: None,
+            blobs: Vec::new(),
+            executions: Vec::new(),
+        });
+
+        let signed = sign_network_message(&nk, &msg)?;
+        let verified = verify_signed_message(&signed)?;
+        assert!(matches!(verified, NetworkMessage::Inventory(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn detect_tampered_signature() {
+        let mut rng = OsRng;
+        let kp = ed25519_dalek::Keypair::generate(&mut rng);
+        let nk = NodeKeys::from_keypair(
+            ed25519_dalek::Keypair::from_bytes(&kp.to_bytes()).unwrap(),
+            std::path::PathBuf::new(),
+        );
+        let msg = NetworkMessage::Inventory(DagInventory {
+            programs: vec![[2u8; 32]],
+            program_bloom: None,
+            blobs: Vec::new(),
+            executions: Vec::new(),
+        });
+        let mut signed = sign_network_message(&nk, &msg).unwrap();
+        signed.payload[0] ^= 0xFF;
+        assert!(verify_signed_message(&signed).is_err());
+    }
+}
 
 pub const TOPIC_BLOBS: &str = "onvm-blobs";
 pub const TOPIC_PROGRAMS: &str = "onvm-programs";
@@ -43,6 +122,14 @@ pub enum NetworkMessage {
     Capability(crate::network::coordination::NodeCapabilities),
     UnifiedProtocol(crate::network::unified_protocol::UnifiedProtocolMessage),
     StateSync(StateSyncMessage),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedNetworkMessage {
+    pub payload: Vec<u8>,
+    pub publisher: crate::types::NodeId,
+    pub public_key: [u8; 32],
+    pub signature: Vec<u8>,
 }
 
 /// Direct transfer request/response messages used by request-response protocols.
@@ -175,6 +262,8 @@ pub struct BlobRequest {
 pub struct BloomFilter {
     pub bits: Vec<u8>,
     pub k: u8,
+    #[serde(default = "default_bloom_salt")]
+    pub salt: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,16 +273,19 @@ pub struct ProgramSyncRequest {
 
 impl BloomFilter {
     pub fn new(size_bytes: usize, k: u8) -> Self {
+        let mut salt = [0u8; 32];
+        OsRng.fill_bytes(&mut salt);
         Self {
             bits: vec![0u8; size_bytes],
             k,
+            salt,
         }
     }
 
     pub fn insert(&mut self, data: &[u8]) {
         for i in 0..self.k {
-            let mut key = [0u8; 32];
-            key[0] = i;
+            let mut key = self.salt;
+            key[0] ^= i;
             let hash = blake3::keyed_hash(&key, data);
             self.set_bit(hash.as_bytes());
         }
@@ -201,8 +293,8 @@ impl BloomFilter {
 
     pub fn contains(&self, data: &[u8]) -> bool {
         for i in 0..self.k {
-            let mut key = [0u8; 32];
-            key[0] = i;
+            let mut key = self.salt;
+            key[0] ^= i;
             let hash = blake3::keyed_hash(&key, data);
             if !self.get_bit(hash.as_bytes()) {
                 return false;
@@ -234,6 +326,10 @@ impl BloomFilter {
         }
         bloom
     }
+}
+
+fn default_bloom_salt() -> [u8; 32] {
+    [0u8; 32]
 }
 
 #[derive(Debug)]
@@ -298,6 +394,12 @@ pub struct NetworkStreams {
 pub struct NetworkConfig {
     pub listen_addr: Multiaddr,
     pub heartbeat: Duration,
+    pub enable_mdns: bool,
+    pub require_encryption: bool,
+    pub max_inbound_connections: usize,
+    pub max_inbound_streams: usize,
+    pub max_gossip_bytes: usize,
+    pub bootnodes: Vec<Multiaddr>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -326,7 +428,7 @@ struct TransferResponseJob {
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     gossipsub: gossipsub::Behaviour,
-    mdns: mdns::tokio::Behaviour,
+    mdns: Toggle<mdns::tokio::Behaviour>,
     kademlia: Kademlia<MemoryStore>,
     transfer: cbor::Behaviour<TransferRequest, TransferResponse>,
 }
@@ -342,6 +444,12 @@ impl NetworkService {
         let local_key = libp2p_identity::Keypair::from(ed_kp);
         let peer_id = PeerId::from(local_key.public());
 
+        if !config.require_encryption {
+            tracing::warn!(
+                "require_encryption=false is insecure; ONVM will still enforce noise/tls transports"
+            );
+        }
+
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .validation_mode(gossipsub::ValidationMode::Strict)
             .message_id_fn(|m: &gossipsub::Message| {
@@ -349,6 +457,7 @@ impl NetworkService {
                 gossipsub::MessageId::from(hash.as_bytes().to_vec())
             })
             .heartbeat_interval(config.heartbeat)
+            .max_transmit_size(config.max_gossip_bytes)
             .build()
             .context("building gossipsub config")?;
         let mut gossipsub = gossipsub::Behaviour::new(
@@ -361,7 +470,14 @@ impl NetworkService {
         gossipsub.subscribe(&Topic::new(TOPIC_PROGRAMS))?;
         gossipsub.subscribe(&Topic::new(TOPIC_BLOCKS))?;
 
-        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
+        let mdns = if config.enable_mdns {
+            Toggle::from(Some(mdns::tokio::Behaviour::new(
+                mdns::Config::default(),
+                peer_id,
+            )?))
+        } else {
+            Toggle::from(None)
+        };
         let store = MemoryStore::new(peer_id);
 
         let mut kad_config = libp2p::kad::Config::default();
@@ -375,7 +491,7 @@ impl NetworkService {
         let transfer_protocol = StreamProtocol::new("/onvm/transfer/1.0.0");
         let transfer_config = libp2p::request_response::Config::default()
             .with_request_timeout(Duration::from_secs(60))
-            .with_max_concurrent_streams(256);
+            .with_max_concurrent_streams(config.max_inbound_streams);
         let transfer = cbor::Behaviour::new(
             std::iter::once((transfer_protocol, ProtocolSupport::Full)),
             transfer_config,
@@ -405,6 +521,17 @@ impl NetworkService {
             .listen_on(config.listen_addr.clone())
             .context("listen_on")?;
 
+        for addr in &config.bootnodes {
+            match swarm.dial(addr.clone()) {
+                Ok(_) => {
+                    tracing::info!("dialing bootnode {}", addr);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to dial bootnode {}: {}", addr, e);
+                }
+            }
+        }
+
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (publish_tx, mut publish_rx) = mpsc::unbounded_channel();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
@@ -418,6 +545,7 @@ impl NetworkService {
 
         let peers_shared = Arc::new(RwLock::new(HashSet::new()));
         let peers_clone = Arc::clone(&peers_shared);
+        let signing_keys = identity.clone();
 
         tokio::spawn(async move {
             loop {
@@ -431,9 +559,24 @@ impl NetworkService {
                                     ..
                                 } = ev
                                 {
-                                    if let Ok(msg) = serde_json::from_slice::<NetworkMessage>(&message.data) {
-                                        tracing::info!("inbound {:?} from {}", describe_msg(&msg), propagation_source);
-                                        let _ = event_tx.send(NetworkEvent::Inbound(propagation_source, msg));
+                                    match bincode::serde::decode_from_slice::<SignedNetworkMessage, _>(
+                                        &message.data,
+                                        bincode::config::standard(),
+                                    ) {
+                                        Ok((env, _)) => {
+                                            match verify_signed_message(&env) {
+                                                Ok(msg) => {
+                                                    tracing::info!("inbound {:?} from {}", describe_msg(&msg), propagation_source);
+                                                    let _ = event_tx.send(NetworkEvent::Inbound(propagation_source, msg));
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!("dropping unsigned/invalid gossip from {}: {}", propagation_source, e);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("failed to decode signed gossip: {}", e);
+                                        }
                                     }
                                 }
                             }
@@ -551,11 +694,26 @@ impl NetworkService {
                             | NetworkMessage::UnifiedProtocol(_)
                             | NetworkMessage::StateSync(_) => Topic::new(TOPIC_BLOCKS),
                         };
-                        let data = match serde_json::to_vec(&msg) {
-                            Ok(d) => d,
-                            Err(_) => continue,
+                        let envelope = match sign_network_message(&signing_keys, &msg) {
+                            Ok(env) => env,
+                            Err(e) => {
+                                tracing::warn!("failed to sign message: {}", e);
+                                continue;
+                            }
                         };
-                        let msg_id = gossipsub::MessageId::from(blake3::hash(&data).as_bytes().to_vec());
+                        let data = match bincode::serde::encode_to_vec(
+                            &envelope,
+                            bincode::config::standard(),
+                        ) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::warn!("failed to encode signed message: {}", e);
+                                continue;
+                            }
+                        };
+                        let msg_id = gossipsub::MessageId::from(
+                            blake3::hash(&data).as_bytes().to_vec(),
+                        );
                         if recent_ids.contains(&msg_id) {
                             continue;
                         }

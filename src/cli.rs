@@ -7,6 +7,7 @@ use futures::{StreamExt, TryStreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use libp2p::Multiaddr;
 use reqwest::Body;
+use rpassword::prompt_password;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +27,44 @@ fn normalize_rpc_endpoint(raw: &str) -> String {
     }
 }
 
+fn parse_bootnode_str(raw: &str) -> Option<Multiaddr> {
+    if let Ok(ma) = raw.parse() {
+        return Some(ma);
+    }
+
+    if !raw.contains("/p2p/") {
+        if let Some((prefix, peer)) = raw.rsplit_once('/') {
+            if peer.len() >= 40 {
+                let candidate = format!("{}/p2p/{}", prefix, peer);
+                if let Ok(ma) = candidate.parse() {
+                    return Some(ma);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn prompt_for_passphrase() -> Result<String> {
+    let pass = prompt_password("Identity passphrase: ").context("reading passphrase")?;
+    if pass.is_empty() {
+        return Err(anyhow::anyhow!("passphrase cannot be empty"));
+    }
+    let confirm = prompt_password("Confirm passphrase: ").context("reading passphrase")?;
+    if pass != confirm {
+        return Err(anyhow::anyhow!("passphrases do not match"));
+    }
+    Ok(pass)
+}
+
+fn prompt_for_passphrase_once() -> Result<String> {
+    let pass = prompt_password("Identity passphrase: ").context("reading passphrase")?;
+    if pass.is_empty() {
+        return Err(anyhow::anyhow!("passphrase cannot be empty"));
+    }
+    Ok(pass)
+}
+
 #[derive(Parser)]
 #[command(author, version, about = "ONVM CLI powered by RPC")]
 pub struct Cli {
@@ -39,6 +78,32 @@ pub enum Commands {
     Init {
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
+        #[arg(long, help = "Encrypt identity key with this passphrase")]
+        identity_passphrase: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Permit plaintext identity storage (insecure)"
+        )]
+        allow_plaintext_identity: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Enable mDNS in generated config"
+        )]
+        enable_mdns: bool,
+        #[arg(long, help = "Override min peers in generated config")]
+        min_peers: Option<usize>,
+        #[arg(long, help = "Override max gossip bytes in generated config")]
+        max_gossip_bytes: Option<usize>,
+        #[arg(long, help = "Override max inbound connections in generated config")]
+        max_inbound_connections: Option<usize>,
+        #[arg(long, help = "Override max inbound streams in generated config")]
+        max_inbound_streams: Option<usize>,
+        #[arg(long, help = "Disable required encryption in generated config")]
+        allow_insecure_transport: bool,
+        #[arg(long, help = "Set genesis state root (hex) in generated config")]
+        genesis_state_root: Option<String>,
     },
     /// Run a full ONVM node (network + consensus + RPC)
     RunNode {
@@ -52,6 +117,29 @@ pub enum Commands {
         min_peers: usize,
         #[arg(long, default_value = "full", value_parser = ["full", "metadata"], help = "Blob sync mode: full data replication or metadata-only")]
         blob_sync_mode: String,
+        #[arg(
+            long,
+            default_value = "config.toml",
+            help = "Path to config.toml (relative to data dir)"
+        )]
+        config: String,
+        #[arg(
+            long,
+            num_args = 0..,
+            value_delimiter = ',',
+            help = "Bootstrap peer multiaddrs (comma-separated or repeated)"
+        )]
+        bootnode: Vec<String>,
+        #[arg(long, help = "Passphrase to decrypt identity key")]
+        identity_passphrase: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Permit plaintext identity storage (insecure)"
+        )]
+        allow_plaintext_identity: bool,
+        #[arg(long, help = "Development mode: enable mDNS regardless of config")]
+        dev: bool,
     },
     /// Submit a job to a running node
     SubmitJob {
@@ -168,19 +256,104 @@ pub async fn run() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { data_dir } => {
+        Commands::Init {
+            data_dir,
+            identity_passphrase,
+            allow_plaintext_identity,
+            enable_mdns,
+            min_peers,
+            max_gossip_bytes,
+            max_inbound_connections,
+            max_inbound_streams,
+            allow_insecure_transport,
+            genesis_state_root,
+        } => {
+            let identity_path = data_dir.join("identity");
             tokio::fs::create_dir_all(&data_dir).await?;
-            let keys =
-                crate::crypto::keys::NodeKeys::load_or_generate(data_dir.join("identity")).await?;
-            let cfg_path = data_dir.join("config.toml");
-            if !cfg_path.exists() {
-                crate::config::OnvmConfig::write_to(&cfg_path)?;
+
+            if identity_path.exists() {
+                println!(
+                    "Identity already exists at {}. Skipping generation.",
+                    identity_path.display()
+                );
+            } else {
+                let identity_passphrase =
+                    if identity_passphrase.is_none() && !allow_plaintext_identity {
+                        Some(prompt_for_passphrase()?)
+                    } else {
+                        identity_passphrase
+                    };
+                let keys = crate::crypto::keys::NodeKeys::load_or_generate(
+                    &identity_path,
+                    identity_passphrase.as_deref(),
+                    allow_plaintext_identity,
+                )
+                .await?;
+                println!(
+                    "Initialized identity at {}. Node ID: {}",
+                    identity_path.display(),
+                    keys.node_id
+                );
             }
-            println!(
-                "Initialized identity at {}. Node ID: {}",
-                data_dir.join("identity").display(),
-                keys.node_id
-            );
+
+            let cfg_path = data_dir.join("config.toml");
+            let overrides_present = enable_mdns
+                || min_peers.is_some()
+                || max_gossip_bytes.is_some()
+                || max_inbound_connections.is_some()
+                || max_inbound_streams.is_some()
+                || allow_insecure_transport
+                || genesis_state_root.is_some();
+
+            if !cfg_path.exists() && !overrides_present {
+                crate::config::OnvmConfig::write_to(&cfg_path)?;
+                println!("Wrote default config to {}", cfg_path.display());
+            } else if cfg_path.exists() || overrides_present {
+                let mut cfg = if cfg_path.exists() {
+                    crate::config::OnvmConfig::from_file(&cfg_path).unwrap_or_default()
+                } else {
+                    crate::config::OnvmConfig::default()
+                };
+
+                if enable_mdns {
+                    cfg.network.enable_mdns = true;
+                }
+                if let Some(v) = min_peers {
+                    cfg.network.min_peers = v;
+                }
+                if let Some(v) = max_gossip_bytes {
+                    cfg.network.max_gossip_bytes = v;
+                }
+                if let Some(v) = max_inbound_connections {
+                    cfg.network.max_inbound_connections = v;
+                }
+                if let Some(v) = max_inbound_streams {
+                    cfg.network.max_inbound_streams = v;
+                }
+                if allow_insecure_transport {
+                    cfg.network.require_encryption = false;
+                }
+                if let Some(root_hex) = genesis_state_root {
+                    if root_hex.is_empty() {
+                        cfg.genesis.state_root = None;
+                    } else if let Ok(bytes) = hex::decode(&root_hex) {
+                        if bytes.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&bytes);
+                            cfg.genesis.state_root = Some(arr);
+                        } else {
+                            println!("Ignoring genesis_state_root override: expected 32-byte hex");
+                        }
+                    } else {
+                        println!("Ignoring genesis_state_root override: invalid hex");
+                    }
+                }
+
+                let content = cfg.to_toml();
+                let text = toml::to_string_pretty(&content)?;
+                std::fs::write(&cfg_path, text)?;
+                println!("Config written to {}", cfg_path.display());
+            }
         }
         Commands::RunNode {
             data_dir,
@@ -188,7 +361,13 @@ pub async fn run() -> Result<()> {
             rpc,
             min_peers,
             blob_sync_mode,
+            config,
+            bootnode,
+            identity_passphrase,
+            allow_plaintext_identity,
+            dev,
         } => {
+            let identity_path = data_dir.join("identity");
             let listen_addr: Multiaddr = listen
                 .parse()
                 .with_context(|| format!("invalid listen multiaddr {listen}"))?;
@@ -197,9 +376,55 @@ pub async fn run() -> Result<()> {
                 .trim_start_matches("http://")
                 .trim_start_matches("https://")
                 .parse()?;
+            let identity_passphrase = if identity_passphrase.is_none() && !allow_plaintext_identity
+            {
+                Some(prompt_for_passphrase_once()?)
+            } else {
+                identity_passphrase
+            };
+            tokio::fs::create_dir_all(&data_dir).await?;
+            if !identity_path.exists() {
+                return Err(anyhow::anyhow!(
+                    "identity not found at {}; run `init` first to create one",
+                    identity_path.display()
+                ));
+            }
             let identity = Arc::new(
-                crate::crypto::keys::NodeKeys::load_or_generate(data_dir.join("identity")).await?,
+                crate::crypto::keys::NodeKeys::load_or_generate(
+                    &identity_path,
+                    identity_passphrase.as_deref(),
+                    allow_plaintext_identity,
+                )
+                .await?,
             );
+            let cfg_path = data_dir.join(&config);
+            let onvm_cfg = if cfg_path.exists() {
+                crate::config::OnvmConfig::from_file(&cfg_path).unwrap_or_else(|e| {
+                    tracing::warn!("failed to parse config.toml, using defaults: {}", e);
+                    crate::config::OnvmConfig::default()
+                })
+            } else {
+                crate::config::OnvmConfig::default()
+            };
+            let mut onvm_cfg = onvm_cfg;
+            if dev {
+                onvm_cfg.network.enable_mdns = true;
+            }
+            let bootnodes = if !bootnode.is_empty() {
+                bootnode
+            } else {
+                onvm_cfg.network.bootnodes.clone()
+            };
+            let parsed_bootnodes: Vec<Multiaddr> = bootnodes
+                .iter()
+                .filter_map(|addr| match parse_bootnode_str(addr) {
+                    Some(ma) => Some(ma),
+                    None => {
+                        tracing::warn!("skipping invalid bootnode {addr}");
+                        None
+                    }
+                })
+                .collect();
             let blob_mode = if blob_sync_mode == "metadata" {
                 crate::consensus::BlobSyncMode::MetadataOnly
             } else {
@@ -213,6 +438,14 @@ pub async fn run() -> Result<()> {
                     min_peers,
                     blob_sync_mode: blob_mode,
                     identity: (*identity).clone(),
+                    network: crate::node::NetworkSecurityConfig {
+                        enable_mdns: onvm_cfg.network.enable_mdns,
+                        require_encryption: onvm_cfg.network.require_encryption,
+                        max_inbound_connections: onvm_cfg.network.max_inbound_connections,
+                        max_inbound_streams: onvm_cfg.network.max_inbound_streams,
+                        max_gossip_bytes: onvm_cfg.network.max_gossip_bytes,
+                    },
+                    bootnodes: parsed_bootnodes,
                 })
                 .await?,
             );

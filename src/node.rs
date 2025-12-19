@@ -20,6 +20,17 @@ pub struct NodeConfig {
     pub min_peers: usize,
     pub blob_sync_mode: BlobSyncMode,
     pub identity: NodeKeys,
+    pub network: NetworkSecurityConfig,
+    pub bootnodes: Vec<Multiaddr>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkSecurityConfig {
+    pub enable_mdns: bool,
+    pub require_encryption: bool,
+    pub max_inbound_connections: usize,
+    pub max_inbound_streams: usize,
+    pub max_gossip_bytes: usize,
 }
 
 pub struct Node {
@@ -77,6 +88,12 @@ impl Node {
                 NetworkConfig {
                     listen_addr: listen_addr.clone(),
                     heartbeat: std::time::Duration::from_secs(1),
+                    enable_mdns: config.network.enable_mdns,
+                    require_encryption: config.network.require_encryption,
+                    max_inbound_connections: config.network.max_inbound_connections,
+                    max_inbound_streams: config.network.max_inbound_streams,
+                    max_gossip_bytes: config.network.max_gossip_bytes,
+                    bootnodes: config.bootnodes.clone(),
                 },
             )
             .await

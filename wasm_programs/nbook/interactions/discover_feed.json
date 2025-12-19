@@ -1,0 +1,6 @@
+{
+  "op": "feed",
+  "session": "REPLACE_WITH_SESSION",
+  "limit": 20,
+  "discover": true
+}

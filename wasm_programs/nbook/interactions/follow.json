@@ -1,0 +1,5 @@
+{
+  "op": "follow",
+  "session": "REPLACE_WITH_SESSION",
+  "target": "bob"
+}

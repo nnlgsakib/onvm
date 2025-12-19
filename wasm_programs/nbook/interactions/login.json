@@ -1,0 +1,5 @@
+{
+  "op": "login",
+  "username": "alice",
+  "password": "password123"
+}

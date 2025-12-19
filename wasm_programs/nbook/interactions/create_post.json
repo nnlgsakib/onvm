@@ -1,0 +1,8 @@
+{
+  "op": "create_post",
+  "session": "REPLACE_WITH_SESSION",
+  "text": "Hello NBook! Check out my first post.",
+  "attachments": [
+    "REPLACE_WITH_BLOB_ID"
+  ]
+}

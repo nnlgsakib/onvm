@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod consensus;
 pub mod crypto;
+pub mod merkle;
 pub mod network;
 pub mod node;
 pub mod qeue_manager;

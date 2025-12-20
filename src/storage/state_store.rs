@@ -1,4 +1,4 @@
-use crate::crypto::hashing::hash_bytes;
+use crate::merkle::merkle_root;
 use anyhow::Result;
 use sled::Db;
 
@@ -65,35 +65,4 @@ fn prefixed(ns: &[u8], key: &[u8]) -> Vec<u8> {
     out.extend_from_slice(ns);
     out.extend_from_slice(key);
     out
-}
-
-fn hash_pair(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
-    hash_bytes([a.as_slice(), b.as_slice()].concat().as_slice())
-}
-
-fn merkle_root(pairs: &[(Vec<u8>, Vec<u8>)]) -> [u8; 32] {
-    if pairs.is_empty() {
-        return hash_bytes(b"onvm-empty-root");
-    }
-    let mut leaves: Vec<[u8; 32]> = pairs
-        .iter()
-        .map(|(k, v)| hash_pair(hash_bytes(k), hash_bytes(v)))
-        .collect();
-    leaves.sort(); // deterministic ordering
-    reduce(leaves)
-}
-
-fn reduce(mut nodes: Vec<[u8; 32]>) -> [u8; 32] {
-    while nodes.len() > 1 {
-        if nodes.len() % 2 == 1 {
-            let last = *nodes.last().unwrap();
-            nodes.push(last);
-        }
-        let mut next = Vec::with_capacity(nodes.len() / 2);
-        for chunk in nodes.chunks(2) {
-            next.push(hash_pair(chunk[0], chunk[1]));
-        }
-        nodes = next;
-    }
-    nodes[0]
 }

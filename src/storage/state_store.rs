@@ -39,6 +39,16 @@ impl StateStore {
         Ok(merkle_root(&pairs))
     }
 
+    pub fn sparse_root_scoped(&self, ns: &[u8]) -> Result<[u8; 32]> {
+        let pairs = self.get_all_scoped(ns)?;
+        Ok(crate::merkle::sparse_merkle_root(&pairs))
+    }
+
+    pub fn prove_scoped(&self, ns: &[u8], key: &[u8]) -> Result<([u8; 32], Vec<[u8; 32]>)> {
+        let pairs = self.get_all_scoped(ns)?;
+        Ok(crate::merkle::sparse_merkle_proof(&pairs, key))
+    }
+
     pub fn get_all_scoped(&self, ns: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let tree = self.db.open_tree(self.tree_name)?;
         let mut pairs = Vec::new();

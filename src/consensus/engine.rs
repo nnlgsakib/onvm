@@ -1,10 +1,10 @@
 use super::types::DagConfig;
-use crate::crypto::keys::NodeKeys;
+use crate::crypto::{bls::BlsSecretKey, keys::NodeKeys};
 use crate::network::NetworkHandle;
 use crate::qeue_manager::AsyncQueue;
-use crate::storage::{BlobIndex, DagStore, ProgramIndex, StateStore, UnifiedStore};
+use crate::storage::{BlobIndex, DagStore, ProgramCatalog, ProgramIndex, StateStore, UnifiedStore};
 use crate::syncer::sync::SyncState;
-use crate::types::{ObjectId, ProgramId};
+use crate::types::{AggregatedReceipt, CommitteeCertificate, ObjectId, ProgramId};
 use crate::wasm_runtime::{ExecutionAdapter, ExecutionPool};
 use anyhow::Result;
 use sled::Db;
@@ -42,6 +42,9 @@ pub struct DagEngine {
     pub(super) chunk_distributor: Option<Arc<crate::network::ChunkDistributor>>,
     pub(super) program_state_versions: Arc<RwLock<HashMap<ProgramId, u64>>>,
     pub(super) state_sync_in_progress: Arc<RwLock<HashSet<ProgramId>>>,
+    pub(super) program_catalog: Arc<ProgramCatalog>,
+    pub(super) bls_secret: BlsSecretKey,
+    pub(super) bls_public: crate::crypto::bls::BlsPublicKey,
 }
 
 impl DagEngine {
@@ -54,6 +57,9 @@ impl DagEngine {
         identity: Arc<NodeKeys>,
         network: NetworkHandle,
         config: DagConfig,
+        program_catalog: Arc<ProgramCatalog>,
+        bls_secret: BlsSecretKey,
+        bls_public: crate::crypto::bls::BlsPublicKey,
     ) -> Result<Self> {
         Ok(Self {
             blob_index: BlobIndex::new(&db)?,
@@ -74,6 +80,9 @@ impl DagEngine {
             chunk_distributor: None,
             program_state_versions: Arc::new(RwLock::new(HashMap::new())),
             state_sync_in_progress: Arc::new(RwLock::new(HashSet::new())),
+            program_catalog,
+            bls_secret,
+            bls_public,
         })
     }
 
@@ -105,5 +114,15 @@ impl DagEngine {
 
     pub async fn set_job_sync(&self, job_sync: Arc<crate::syncer::JobSyncManager>) {
         *self.job_sync.write().await = Some(job_sync);
+    }
+
+    pub async fn ingest_aggregated_receipt(
+        &self,
+        receipt: AggregatedReceipt,
+        committee: CommitteeCertificate,
+    ) -> Result<()> {
+        crate::consensus::ReceiptVerifier::verify_aggregated_receipt(&receipt, &committee)?;
+        self.program_catalog.store_aggregated_receipt(&receipt)?;
+        Ok(())
     }
 }

@@ -17,7 +17,7 @@ pub use service::{
     TOPIC_BLOBS, TOPIC_BLOCKS, TOPIC_PROGRAMS,
 };
 pub use unified_protocol::{
-    BatchChunkRequest, BatchChunkResponse, ChunkRequest, ChunkResponse, ManifestRequest,
-    ManifestResponse, ObjectAnnouncement, ObjectAvailabilityRequest, ObjectAvailabilityResponse,
-    UnifiedProtocolMessage, UnifiedRequest, UnifiedResponse,
+    AggregatedReceiptBundle, BatchChunkRequest, BatchChunkResponse, ChunkRequest, ChunkResponse,
+    ManifestRequest, ManifestResponse, ObjectAnnouncement, ObjectAvailabilityRequest,
+    ObjectAvailabilityResponse, UnifiedProtocolMessage, UnifiedRequest, UnifiedResponse,
 };

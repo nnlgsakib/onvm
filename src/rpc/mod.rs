@@ -7,7 +7,7 @@ pub use jobs::{job_routes, JobRpcContext};
 use crate::node::Node;
 use crate::types::{BlobId, ProgramId};
 use anyhow::Result;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::Method;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -95,6 +95,57 @@ struct FuelSampleResponse {
     timestamp: u64,
 }
 
+#[derive(Serialize)]
+struct CatalogEntryResponse {
+    program_id: String,
+    version: u64,
+    initial_state_root: String,
+    dag_parent: Option<String>,
+    code_manifest: Option<String>,
+    timestamp_ms: u64,
+}
+
+#[derive(Serialize)]
+struct AggregatedReceiptResponse {
+    program_id: String,
+    state_root_in: String,
+    state_root_out: String,
+    write_digest: String,
+    gas_used: u64,
+    signer_bitmap: String,
+    committee_epoch: u64,
+    receipt_id: String,
+}
+
+#[derive(Serialize)]
+struct CommitteeResponse {
+    program_id: String,
+    epoch: u64,
+    aggregate_public_key: String,
+    members: Vec<CommitteeMemberResponse>,
+    threshold: u32,
+}
+
+#[derive(Serialize)]
+struct CommitteeMemberResponse {
+    node: String,
+    weight: u64,
+    bls_public_key: String,
+}
+
+#[derive(Serialize)]
+struct StateRootResponse {
+    program_id: String,
+    root: String,
+    proof: Option<Vec<String>>,
+    value_hex: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StateProofQuery {
+    key: Option<String>,
+}
+
 pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
     let ctx = RpcContext { node: node.clone() };
 
@@ -166,6 +217,10 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
         .route("/blobs/:id", get(fetch_blob))
         .route("/programs", post(deploy_program))
         .route("/programs/:id", get(program_info))
+        .route("/programs/:id/receipts", get(program_receipts))
+        .route("/programs/:id/committee", get(program_committee))
+        .route("/programs/:id/state-root", get(program_state_root))
+        .route("/program-catalog", get(list_program_catalog))
         .route("/execute", post(execute_program))
         .route("/estimate-fuel", post(estimate_fuel))
         .route("/fuel-profile/:program_id", get(get_fuel_profile))
@@ -341,6 +396,124 @@ async fn program_info(
         },
         None => Err((axum::http::StatusCode::NOT_FOUND, "not found".to_string())),
     }
+}
+
+async fn list_program_catalog(
+    State(ctx): State<RpcContext>,
+) -> Result<Json<Vec<CatalogEntryResponse>>, (axum::http::StatusCode, String)> {
+    let manifests = ctx
+        .node
+        .program_catalog
+        .list_manifests()
+        .map_err(internal_err)?;
+    let entries = manifests
+        .into_iter()
+        .map(|m| CatalogEntryResponse {
+            program_id: hex::encode(m.program_id.0),
+            version: m.version,
+            initial_state_root: hex::encode(m.initial_state_root),
+            dag_parent: m.dag_parent.map(hex::encode),
+            code_manifest: m.code_manifest.map(|id| hex::encode(id.0)),
+            timestamp_ms: m.timestamp_ms,
+        })
+        .collect();
+    Ok(Json(entries))
+}
+
+async fn program_receipts(
+    State(ctx): State<RpcContext>,
+    Path(id_hex): Path<String>,
+) -> Result<Json<Vec<AggregatedReceiptResponse>>, (axum::http::StatusCode, String)> {
+    let program_id =
+        parse_program_id(&id_hex).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    let receipts = ctx
+        .node
+        .program_catalog
+        .receipts_for_program(&program_id)
+        .map_err(internal_err)?;
+    let mapped = receipts
+        .into_iter()
+        .map(|r| AggregatedReceiptResponse {
+            program_id: hex::encode(r.receipt.program_id.0),
+            state_root_in: hex::encode(r.receipt.state_root_in),
+            state_root_out: hex::encode(r.receipt.state_root_out),
+            write_digest: hex::encode(r.receipt.write_digest),
+            gas_used: r.receipt.gas_used,
+            signer_bitmap: hex::encode(r.signer_bitmap),
+            committee_epoch: r.committee_epoch,
+            receipt_id: hex::encode(r.receipt.id()),
+        })
+        .collect();
+    Ok(Json(mapped))
+}
+
+async fn program_committee(
+    State(ctx): State<RpcContext>,
+    Path(id_hex): Path<String>,
+) -> Result<Json<CommitteeResponse>, (axum::http::StatusCode, String)> {
+    let program_id =
+        parse_program_id(&id_hex).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+
+    let resp = CommitteeResponse {
+        program_id: hex::encode(program_id.0),
+        epoch: 0,
+        aggregate_public_key: hex::encode(ctx.node.bls_public.0),
+        threshold: 1,
+        members: vec![CommitteeMemberResponse {
+            node: hex::encode(ctx.node.identity.node_id.0),
+            weight: 1,
+            bls_public_key: hex::encode(ctx.node.bls_public.0),
+        }],
+    };
+    Ok(Json(resp))
+}
+
+async fn program_state_root(
+    State(ctx): State<RpcContext>,
+    Path(id_hex): Path<String>,
+    Query(query): Query<StateProofQuery>,
+) -> Result<Json<StateRootResponse>, (axum::http::StatusCode, String)> {
+    let program_id =
+        parse_program_id(&id_hex).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
+    let root = ctx
+        .node
+        .state_store
+        .sparse_root_scoped(&program_id.0)
+        .map_err(internal_err)?;
+
+    let (proof, value_hex) = if let Some(key_hex) = query.key {
+        let key_bytes = hex::decode(&key_hex)
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+        let (computed_root, proof) = ctx
+            .node
+            .state_store
+            .prove_scoped(&program_id.0, &key_bytes)
+            .map_err(internal_err)?;
+        let value = ctx
+            .node
+            .state_store
+            .get_scoped(&program_id.0, &key_bytes)
+            .map_err(internal_err)?;
+        let proof_hex = proof.iter().map(|p| hex::encode(p)).collect();
+        let value_hex = value.map(hex::encode);
+        // ensure roots align
+        if computed_root != root {
+            return Err((
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "state root mismatch during proof generation".to_string(),
+            ));
+        }
+        (Some(proof_hex), value_hex)
+    } else {
+        (None, None)
+    };
+
+    Ok(Json(StateRootResponse {
+        program_id: hex::encode(program_id.0),
+        root: hex::encode(root),
+        proof,
+        value_hex,
+    }))
 }
 
 async fn execute_program(

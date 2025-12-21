@@ -9,10 +9,12 @@
 ONVM nodes form a self-organizing network where participants:
 - **Store** content-addressed blobs (data, programs) with chunked, merkle-verified integrity
 - **Deploy** WebAssembly programs with versioned, deterministic execution
-- **Execute** computations against isolated per-program state stores
+- **Execute** computations against isolated per-program state stores, producing state roots
+- **Verify** execution results via aggregated BLS receipts without re-running the WASM
+- **Catalog** all known programs/manifests and sync initial state across the network
 - **Schedule** asynchronous jobs with retry logic, timeout enforcement, and fuel metering
 - **Replicate** operations through a directed acyclic graph (DAG) consensus protocol
-- **Synchronize** state, programs, blobs, and jobs across peers using gossip and Kademlia DHT
+- **Synchronize** state, programs, blobs, receipts, and jobs across peers using gossip and Kademlia DHT
 
 Each operation (blob publish, program deploy, execution, job completion) is embedded in a DAG node, gossiped to peers, and eventually converges network-wide, ensuring eventual consistency without centralized coordination.
 
@@ -26,12 +28,12 @@ Each operation (blob publish, program deploy, execution, job completion) is embe
 |--------|---------|
 | **`src/node.rs`** | Top-level orchestrator that wires together networking, consensus, execution, and storage |
 | **`src/network/`** | libp2p-based P2P stack (gossipsub, Kademlia, mDNS, request-response) |
-| **`src/consensus/`** | DAG engine for operation ordering, replication, and peer synchronization |
+| **`src/consensus/`** | DAG engine for operation ordering, replication, receipt validation, and peer synchronization |
 | **`src/execution/`** | Wasmtime-based runtime with host functions, job scheduler, and executor |
-| **`src/storage/`** | BlobStore (chunked + merkle roots) and StateStore (program-scoped KV) |
+| **`src/storage/`** | BlobStore (chunked + merkle roots), ProgramCatalog (manifests/receipts), and StateStore (program-scoped KV) |
 | **`src/rpc/`** | Axum-based HTTP API for blob upload, program deployment, execution, and job management |
 | **`src/syncer/`** | Job synchronization manager for cross-node job and blob replication |
-| **`src/crypto/`** | Ed25519 identity keys and Blake3 hashing |
+| **`src/crypto/`** | Ed25519 identity keys, BLS aggregate signatures (min_sig), Blake3 hashing |
 
 ### Data Flow
 
@@ -80,6 +82,17 @@ flowchart TD
   E7 --> Clients[Clients can GET blobs/programs from local or peers]
 ```
 
+### Program Catalog & Sync
+- **Manifests**: Every deploy emits a signed `ProgramManifest` (id, version, entrypoints, wasm env hash, code manifest, initial state root). Manifests are gossiped and persisted in the `ProgramCatalog`.
+- **Initial state**: Nodes sync manifests and initial state roots; code is fetched lazily on demand. Catalog endpoints/CLI: `GET /program-catalog`, `cargo run -- program-catalog`.
+- **Bootstrap**: New nodes fetch the catalog snapshot, then pull missing manifests/state; listening logs include the peer ID to simplify copy/paste of multiaddrs.
+- **State commitments**: State roots use sparse Merkle trees; nodes can build/verify proofs for individual keys to validate partial syncs.
+
+### Verifiable Execution & Receipts
+- **Deterministic execution**: Wasm runs with a fixed host ABI and fuel metering. Executions produce `ExecutionReceipt` (inputs hash, gas, state_root_in/out, write digest).
+- **Aggregate verification**: A committee re-executes, signs the receipt hash with BLS, and publishes an `AggregatedReceipt` (aggregate sig + signer bitmap). Other nodes verify without re-executing.
+- **Catalog storage**: Receipts are stored per program; query with `GET /programs/:id/receipts` or `cargo run -- program-receipts --id <program-id>`.
+
 ---
 
 ## Building & Running
@@ -108,7 +121,7 @@ cargo run -- run-node \
   --min-peers 1 \
   --blob-sync-mode full
 ```
-- `--listen`: P2P multiaddr (will auto-increment port on conflict)
+- `--listen`: P2P multiaddr (will auto-increment port on conflict). Logs now include the peer ID with the p2p suffix, e.g. `/ip4/192.168.1.100/tcp/37000/p2p/<peerid>`.
 - `--rpc`: HTTP API bind address (`:8080` shorthand supported)
 - `--min-peers`: minimum connected peers before accepting executions
 - `--blob-sync-mode`: `full` (replicate data) or `metadata` (index only)
@@ -162,6 +175,17 @@ cargo run -- program-info \
   --id <program-id>
 ```
 Returns JSON metadata (publisher, entrypoint, blob_refs, size).
+
+### Program Catalog & Receipts
+- List known program manifests (network-synced catalog):
+```bash
+cargo run -- program-catalog --rpc :8080
+```
+- Fetch aggregated execution receipts for a program:
+```bash
+cargo run -- program-receipts --rpc :8080 --id <program-id>
+```
+The catalog tracks program manifests, initial state roots, and aggregate BLS-verified execution receipts.
 
 ---
 
@@ -361,11 +385,11 @@ Override by editing `./data/config.toml` after `init`.
 
 ## Networking
 
-- **Gossipsub**: Topic-based pub/sub for blobs, programs, and DAG operations
+- **Gossipsub**: Topic-based pub/sub for blobs, programs, manifests, receipts, and DAG operations
 - **Kademlia DHT**: Provider records for content discovery
 - **mDNS**: Local peer discovery (auto-dials LAN nodes)
-- **Request-Response**: Direct blob/program/execution transfer between peers
-- **Multiaddr**: `/ip4/0.0.0.0/tcp/37000` or custom (auto-increments on bind conflict)
+- **Request-Response**: Direct blob/program/state/receipt transfer between peers
+- **Multiaddr**: `/ip4/0.0.0.0/tcp/37000/p2p/<peerid>` or custom (auto-increments on bind conflict)
 
 ---
 
@@ -373,9 +397,11 @@ Override by editing `./data/config.toml` after `init`.
 
 - **Identity**: Ed25519 keypair stored in `./data/identity` (never commit)
 - **Hashing**: Blake3 for content IDs, merkle roots, and DAG node IDs
+- **Receipts**: BLS aggregate signatures over execution receipts; manifests are signed by deployers
+- **State proofs**: Sparse Merkle proofs for program state keys/values
 - **Sandboxing**: Wasmtime fuel metering (default 50M instructions/exec), configurable timeouts, memory limits
 - **WASM Threading**: Full std library support including threading and sync primitives (wasm_threads enabled)
-- **Determinism**: Programs must be reproducible; avoid randomness in committed blobs
+- **Determinism**: Programs must be reproducible; avoid randomness in committed blobs; wasm env hash recorded in manifests
 - **Job Isolation**: Each job executes in a separate WASM instance with enforced resource limits
 
 ---
@@ -386,8 +412,10 @@ Override by editing `./data/config.toml` after `init`.
 - [x] Cross-node job and blob synchronization
 - [x] Health monitoring and metrics endpoints
 - [x] WASM threading and std library support
-- [ ] Byzantine fault tolerance (signature verification, quorum thresholds)
-- [ ] Advanced state sync (snapshot transfer, incremental merkle proofs)
+- [x] Program catalog with signed manifests and initial state roots
+- [x] Aggregated BLS receipt verification for executions
+- [ ] Advanced state sync (chunked initial state, SMT proofs)
+- [ ] Committee sampling / staking integration
 - [ ] Persistent execution scheduler (async task queue across node restarts)
 - [ ] Program versioning and upgrade paths
 - [ ] Gas/fuel economics for resource metering

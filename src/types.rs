@@ -1,3 +1,4 @@
+use crate::crypto::bls::{BlsPublicKey, BlsSignature};
 use crate::crypto::hashing::hash_bytes;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -28,6 +29,102 @@ pub struct BlockId(pub [u8; 32]);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct NodeId(pub [u8; 32]);
+
+pub type StateRoot = [u8; 32];
+pub type StateDeltaRoot = [u8; 32];
+pub type WasmEnvHash = [u8; 32];
+pub type ReceiptId = [u8; 32];
+
+/// Strongly-typed manifest for programs with network-wide availability data
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramManifest {
+    pub program_id: ProgramId,
+    pub version: u64,
+    pub deployer: NodeId,
+    pub wasm_env_hash: WasmEnvHash,
+    pub code_manifest: Option<ManifestId>,
+    pub metadata_hash: [u8; 32],
+    pub entrypoints: Vec<String>,
+    pub initial_state_root: StateRoot,
+    pub dag_parent: Option<StateRoot>,
+    pub timestamp_ms: u64,
+    pub signature: Vec<u8>,
+}
+
+/// Announcement broadcast so peers can sync manifests and initial state
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProgramAnnouncement {
+    pub manifest: ProgramManifest,
+    pub chunk_roots: Vec<ChunkId>,
+    pub initial_state_chunks: Vec<ChunkId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StateCommitment {
+    pub program_id: ProgramId,
+    pub height: u64,
+    pub root: StateRoot,
+    pub parent: Option<StateRoot>,
+    pub state_delta_root: Option<StateDeltaRoot>,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionCall {
+    pub entrypoint: String,
+    pub calldata: Vec<u8>,
+    pub request_id: [u8; 32],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionReceipt {
+    pub program_id: ProgramId,
+    pub state_root_in: StateRoot,
+    pub call: ExecutionCall,
+    pub inputs_hash: [u8; 32],
+    pub gas_used: u64,
+    pub state_root_out: StateRoot,
+    pub write_digest: StateDeltaRoot,
+    pub events_hash: [u8; 32],
+    pub wasm_code_hash: Option<[u8; 32]>,
+    pub wasm_env_hash: WasmEnvHash,
+    pub nonce: u64,
+    pub executor: NodeId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AggregatedReceipt {
+    pub receipt: ExecutionReceipt,
+    pub committee_epoch: u64,
+    pub signer_bitmap: Vec<u8>,
+    pub aggregate_signature: BlsSignature,
+    pub aggregate_public_key: BlsPublicKey,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitteeMember {
+    pub node: NodeId,
+    pub weight: u64,
+    pub bls_public_key: BlsPublicKey,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommitteeCertificate {
+    pub program_id: ProgramId,
+    pub epoch: u64,
+    pub members: Vec<CommitteeMember>,
+    pub threshold: u32,
+    pub aggregate_public_key: BlsPublicKey,
+    pub signature: Option<BlsSignature>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StateProof {
+    pub state_root: StateRoot,
+    pub keys: Vec<Vec<u8>>,
+    pub values: Vec<Vec<u8>>,
+    pub proof_hashes: Vec<[u8; 32]>,
+}
 
 /// Unified object representing both WASM programs and blobs
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,6 +356,38 @@ impl NodeId {
         let mut out = [0u8; 32];
         out.copy_from_slice(&pk[..32]);
         Self(out)
+    }
+}
+
+impl ProgramManifest {
+    pub fn digest(&self) -> [u8; 32] {
+        let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .expect("program manifest encoding should never fail");
+        hash_bytes(&encoded)
+    }
+}
+
+impl StateCommitment {
+    pub fn digest(&self) -> [u8; 32] {
+        let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .expect("state commitment encoding should never fail");
+        hash_bytes(&encoded)
+    }
+}
+
+impl ExecutionReceipt {
+    pub fn id(&self) -> ReceiptId {
+        let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .expect("execution receipt encoding should never fail");
+        hash_bytes(&encoded)
+    }
+}
+
+impl AggregatedReceipt {
+    pub fn digest(&self) -> [u8; 32] {
+        let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .expect("aggregated receipt encoding should never fail");
+        hash_bytes(&encoded)
     }
 }
 

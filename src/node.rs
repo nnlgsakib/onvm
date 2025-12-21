@@ -3,7 +3,7 @@ use crate::crypto::keys::NodeKeys;
 use crate::network::{
     ChunkDistributor, NetworkConfig, NetworkHandle, NetworkService, NetworkStreams,
 };
-use crate::storage::UnifiedStore;
+use crate::storage::{ProgramCatalog, UnifiedStore};
 use crate::syncer::SyncMan;
 use crate::wasm_runtime::{ExecutionAdapter, ExecutionEngine, ExecutionPool, FuelEstimator};
 use anyhow::{Context, Result};
@@ -36,6 +36,7 @@ pub struct NetworkSecurityConfig {
 pub struct Node {
     pub identity: Arc<NodeKeys>,
     pub unified_store: Arc<UnifiedStore>,
+    pub state_store: Arc<crate::storage::StateStore>,
     pub execution_adapter: Arc<ExecutionAdapter>,
     pub chunk_distributor: Arc<ChunkDistributor>,
     pub execution: Arc<ExecutionEngine>,
@@ -43,6 +44,9 @@ pub struct Node {
     pub consensus: Arc<DagEngine>,
     pub fuel_estimator: Arc<FuelEstimator>,
     pub network: NetworkHandle,
+    pub program_catalog: Arc<ProgramCatalog>,
+    pub bls_public: crate::crypto::bls::BlsPublicKey,
+    pub bls_secret: crate::crypto::bls::BlsSecretKey,
     pub db: sled::Db,
     #[allow(dead_code)]
     background: JoinHandle<()>,
@@ -60,11 +64,14 @@ impl Node {
         let identity = Arc::new(config.identity);
 
         let unified_store = Arc::new(UnifiedStore::new(db.clone())?);
+        let program_catalog = Arc::new(ProgramCatalog::new(db.clone())?);
 
         let state_store = Arc::new(crate::storage::StateStore::new(
             db.clone(),
             "contract_state",
         )?);
+
+        let (bls_secret, bls_public) = crate::crypto::bls::generate_keypair()?;
 
         let execution_adapter = Arc::new(ExecutionAdapter::new(unified_store.clone()));
 
@@ -136,6 +143,9 @@ impl Node {
                 min_peers: config.min_peers,
                 blob_sync_mode: config.blob_sync_mode.clone(),
             },
+            program_catalog.clone(),
+            bls_secret.clone(),
+            bls_public.clone(),
         )?;
 
         consensus.set_chunk_distributor(chunk_distributor.clone());
@@ -165,6 +175,7 @@ impl Node {
         Ok(Self {
             identity,
             unified_store,
+            state_store,
             execution_adapter,
             chunk_distributor,
             execution: exec,
@@ -172,6 +183,9 @@ impl Node {
             consensus,
             fuel_estimator,
             network,
+            program_catalog,
+            bls_public,
+            bls_secret,
             db,
             background: consensus_task,
             sync_task,

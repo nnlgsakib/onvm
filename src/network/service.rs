@@ -613,8 +613,10 @@ impl NetworkService {
                                 }
                             },
                             SwarmEvent::NewListenAddr { address, .. } => {
-                                tracing::info!("listening on {}", address);
-                                let _ = event_tx.send(NetworkEvent::Listening(address));
+                                let mut addr_with_peer = address.clone();
+                                addr_with_peer.push(libp2p::multiaddr::Protocol::P2p(peer_id.into()));
+                                tracing::info!("listening on {}", addr_with_peer);
+                                let _ = event_tx.send(NetworkEvent::Listening(addr_with_peer));
                             }
                             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 tracing::info!("connected to peer {} at {:?}", peer_id, endpoint.get_remote_address());

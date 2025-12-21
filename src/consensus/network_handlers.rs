@@ -356,6 +356,39 @@ impl DagEngine {
                     tracing::debug!("don't have manifest for {}", req.object_id);
                 }
             }
+            crate::network::unified_protocol::UnifiedProtocolMessage::ProgramAnnouncement(
+                announce,
+            ) => {
+                tracing::info!(
+                    "received program manifest for {} (version {})",
+                    announce.manifest.program_id,
+                    announce.manifest.version
+                );
+                if let Err(e) = self.program_catalog.verify_initial_sync(&announce.manifest) {
+                    tracing::warn!(
+                        "manifest conflict for program {}: {}",
+                        announce.manifest.program_id,
+                        e
+                    );
+                    return Ok(());
+                }
+                if let Err(e) = self.program_catalog.store_manifest(&announce.manifest) {
+                    tracing::warn!("failed to store program manifest: {}", e);
+                }
+            }
+            crate::network::unified_protocol::UnifiedProtocolMessage::AggregatedReceipt(bundle) => {
+                tracing::debug!(
+                    "received aggregated receipt for program {} epoch {}",
+                    bundle.receipt.receipt.program_id,
+                    bundle.receipt.committee_epoch
+                );
+                if let Err(e) = self
+                    .ingest_aggregated_receipt(bundle.receipt, bundle.committee)
+                    .await
+                {
+                    tracing::warn!("failed to ingest aggregated receipt: {}", e);
+                }
+            }
             crate::network::unified_protocol::UnifiedProtocolMessage::ManifestResponse(
                 manifest,
             ) => {

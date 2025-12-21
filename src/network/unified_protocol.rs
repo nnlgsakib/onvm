@@ -1,4 +1,7 @@
-use crate::types::{ChunkId, Manifest, ManifestId, Object, ObjectId};
+use crate::types::{
+    AggregatedReceipt, ChunkId, CommitteeCertificate, Manifest, ManifestId, Object, ObjectId,
+    ProgramAnnouncement,
+};
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +82,12 @@ pub struct ObjectMetadataResponse {
     pub metadata: Option<Object>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregatedReceiptBundle {
+    pub receipt: AggregatedReceipt,
+    pub committee: CommitteeCertificate,
+}
+
 /// Unified protocol message for gossipsub
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UnifiedProtocolMessage {
@@ -87,6 +96,8 @@ pub enum UnifiedProtocolMessage {
     ObjectMetadataRequest(ObjectMetadataRequest),
     ManifestRequest(ManifestRequest),
     ManifestResponse(Manifest),
+    ProgramAnnouncement(ProgramAnnouncement),
+    AggregatedReceipt(AggregatedReceiptBundle),
 }
 
 /// Unified request-response protocol

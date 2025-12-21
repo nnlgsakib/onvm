@@ -177,6 +177,18 @@ pub enum Commands {
         #[arg(long)]
         out: PathBuf,
     },
+    /// List known program manifests
+    ProgramCatalog {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+    },
+    /// Show receipts for a program
+    ProgramReceipts {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
+        rpc: String,
+        #[arg(long)]
+        id: String,
+    },
     /// Cancel a job
     CancelJob {
         #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
@@ -759,6 +771,32 @@ pub async fn run() -> Result<()> {
                 pb.finish_and_clear();
             }
             println!("blob saved to {}", out.display());
+        }
+        Commands::ProgramCatalog { rpc } => {
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .get(format!("{endpoint}/program-catalog"))
+                .send()
+                .await?;
+            if res.status().is_success() {
+                println!("{}", res.text().await?);
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
+        }
+        Commands::ProgramReceipts { rpc, id } => {
+            let client = reqwest::Client::new();
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let res = client
+                .get(format!("{endpoint}/programs/{id}/receipts"))
+                .send()
+                .await?;
+            if res.status().is_success() {
+                println!("{}", res.text().await?);
+            } else {
+                return Err(anyhow::anyhow!(res.text().await?));
+            }
         }
         Commands::ProgramInfo { rpc, id } => {
             let client = reqwest::Client::new();

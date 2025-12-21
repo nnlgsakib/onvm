@@ -1,20 +1,25 @@
+pub mod auth;
+mod auth_store;
 mod health;
 mod jobs;
 
 pub use health::{health_routes, HealthRpcContext};
 pub use jobs::{job_routes, JobRpcContext};
 
+use crate::config::RpcAuthConfig;
 use crate::node::Node;
 use crate::types::{BlobId, ProgramId};
 use anyhow::Result;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::Method;
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tower_http::cors::{Any, CorsLayer};
@@ -32,6 +37,8 @@ pub struct RpcServer {
 #[derive(Clone)]
 pub struct RpcContext {
     pub node: Arc<Node>,
+    pub data_dir: PathBuf,
+    pub rpc_auth: RpcAuthConfig,
 }
 
 #[derive(Serialize)]
@@ -146,8 +153,32 @@ struct StateProofQuery {
     key: Option<String>,
 }
 
-pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
-    let ctx = RpcContext { node: node.clone() };
+#[derive(Deserialize)]
+struct CreateProjectRequest {
+    identity_passphrase: String,
+    project_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CreateProjectResponse {
+    project_id: String,
+    project_secret: String,
+}
+
+pub async fn start_rpc(
+    node: Arc<Node>,
+    addr: SocketAddr,
+    rpc_auth: RpcAuthConfig,
+    data_dir: PathBuf,
+    identity_passphrase: Option<String>,
+) -> Result<RpcServer> {
+    let auth_state =
+        auth::AuthState::from_config(&rpc_auth, &data_dir, identity_passphrase.as_deref())?;
+    let ctx = RpcContext {
+        node: node.clone(),
+        data_dir: data_dir.clone(),
+        rpc_auth: rpc_auth.clone(),
+    };
 
     let db = node.db.clone();
 
@@ -211,7 +242,9 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
         .allow_headers(Any)
         .allow_credentials(false);
 
-    let app = Router::new()
+    let public = Router::new().route("/rpc-auth/projects", post(create_project));
+
+    let protected = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/blobs", post(upload_blob))
         .route("/blobs/:id", get(fetch_blob))
@@ -224,8 +257,21 @@ pub async fn start_rpc(node: Arc<Node>, addr: SocketAddr) -> Result<RpcServer> {
         .route("/execute", post(execute_program))
         .route("/estimate-fuel", post(estimate_fuel))
         .route("/fuel-profile/:program_id", get(get_fuel_profile))
-        .merge(job_routes().with_state(job_ctx))
-        .merge(health_routes().with_state(health_ctx))
+        .merge(job_routes().with_state(job_ctx.clone()))
+        .merge(health_routes().with_state(health_ctx.clone()))
+        .with_state(ctx.clone());
+
+    let protected = if let Some(state) = auth_state {
+        info!("RPC auth enabled for project {}", state.config.project_id);
+        protected.layer(from_fn_with_state(state, auth::verify_signed_request))
+    } else {
+        info!("RPC auth disabled; requests are unauthenticated");
+        protected
+    };
+
+    let app = Router::new()
+        .merge(public)
+        .merge(protected)
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_SIZE_BYTES))
         .layer(cors)
         .with_state(ctx);
@@ -575,6 +621,34 @@ async fn estimate_fuel(
         based_on_samples: estimate.based_on_samples,
         input_size_bytes: estimate.input_size_bytes,
         estimated_execution_time_ms: estimate.estimated_execution_time_ms,
+    }))
+}
+
+async fn create_project(
+    State(ctx): State<RpcContext>,
+    Json(req): Json<CreateProjectRequest>,
+) -> Result<Json<CreateProjectResponse>, (StatusCode, String)> {
+    if !ctx.rpc_auth.enable {
+        return Err((StatusCode::BAD_REQUEST, "rpc auth disabled".into()));
+    }
+    let store = crate::rpc::auth::open_store_from_config(
+        &ctx.rpc_auth,
+        &ctx.data_dir,
+        &req.identity_passphrase,
+    )
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let project_id = match req.project_id {
+        Some(id) => id,
+        None => crate::rpc::auth::generate_project_secret()
+            .map(|(id, _, _)| id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+    };
+    let secret = store
+        .ensure_project(&project_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(CreateProjectResponse {
+        project_id,
+        project_secret: hex::encode(secret),
     }))
 }
 

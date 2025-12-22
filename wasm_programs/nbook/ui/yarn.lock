@@ -1721,10 +1721,10 @@ object-assign@^4.1.1:
   resolved "https://registry.npmjs.org/object-assign/-/object-assign-4.1.1.tgz"
   integrity sha512-rJgTQnkUnH1sFw8yT6VSU3zD3sWmu6sZhIseY8VX+GRu3P6F7Fu+JNDoXfklElbLJSnc3FUQHVe4cU5hj+BcUg==
 
-onvm-sdk@0.1.5:
-  version "0.1.5"
-  resolved "https://registry.npmjs.org/onvm-sdk/-/onvm-sdk-0.1.5.tgz#43181eb6be2d5e04a7a6a8e466c3f8ac40416832"
-  integrity sha512-eahBtjvBkB99j4q79JftxuO8KDr2lumY5PbkINwuJZ4BCHAFVY34G/mWNciO3TzbeT2gOEcAOgRWh188VHilGw==
+onvm-sdk@0.1.6:
+  version "0.1.6"
+  resolved "https://registry.npmjs.org/onvm-sdk/-/onvm-sdk-0.1.6.tgz#4353a4ad5d6b54b35c161d60f303ce88d389397b"
+  integrity sha512-hV9wDNx0vwux4zf47vPlq3jj3Qt93X606ywrLcgPMdGyhgdek4VdpTLPcVk2lRFPh13s5lEGAKtBJGN+BN3IFw==
   dependencies:
     "@noble/ciphers" "^2.1.1"
     "@noble/hashes" "^2.0.1"

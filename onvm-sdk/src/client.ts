@@ -56,16 +56,32 @@ export class OnvmClient {
     }
 
     try {
+      const healthUrl = `${this.rpcUrl}/health/liveness`;
       const response = await fetch(`${this.rpcUrl}/health/liveness`, {
         method: 'GET',
         headers: { 'Content-Type': 'application/json' },
       });
 
       if (!response.ok) {
-        throw new OnvmError('Failed to detect node mode', response.status);
+        const errorText = await response.text();
+        throw new OnvmError(
+          `Failed to detect node mode: HTTP ${response.status} from ${healthUrl}`,
+          response.status,
+          errorText || response.statusText
+        );
       }
 
-      const data: LivenessResponse = await response.json();
+      let data: LivenessResponse;
+      try {
+        data = await response.json();
+      } catch (parseError) {
+        throw new OnvmError(
+          `Failed to parse node liveness response from ${healthUrl}`,
+          response.status,
+          parseError instanceof Error ? parseError.message : parseError
+        );
+      }
+
       this.detectedNodeMode = data.mode === 'dev' ? 'dev' : 'prod';
       
       if (this.detectedNodeMode === 'prod' && (!this.projectId || !this.projectSecret)) {
@@ -80,17 +96,11 @@ export class OnvmClient {
       if (error instanceof OnvmError) {
         throw error;
       }
-      console.warn('Failed to detect node mode, defaulting to prod:', error);
-      this.detectedNodeMode = 'prod';
-      
-      if (!this.projectId || !this.projectSecret) {
-        throw new OnvmError(
-          'Cannot connect to node. Assuming prod mode but projectId or projectSecret is missing.',
-          401
-        );
-      }
-      
-      return 'prod';
+      const message = error instanceof Error ? error.message : String(error);
+      throw new OnvmNetworkError(
+        `Unable to reach RPC endpoint at ${this.rpcUrl}: ${message}`,
+        message
+      );
     }
   }
 
@@ -100,9 +110,10 @@ export class OnvmClient {
     body?: any,
     customHeaders?: Record<string, string>
   ): Promise<T> {
+    const endpoint = `${this.rpcUrl}${path}`;
     const nodeMode = await this.detectNodeMode();
-    
-    const url = `${this.rpcUrl}${path}`;
+
+    const url = endpoint;
     const bodyStr = body ? JSON.stringify(body) : '';
 
     const headers: Record<string, string> = {
@@ -231,13 +242,15 @@ export class OnvmClient {
       return responseText ? JSON.parse(responseText) : ({} as T);
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
-        throw new OnvmNetworkError('Request timeout');
+        throw new OnvmNetworkError(`Request timeout while calling ${endpoint}`);
       }
       if (error instanceof OnvmError) {
         throw error;
       }
       throw new OnvmNetworkError(
-        `Network error: ${error instanceof Error ? error.message : String(error)}`,
+        `Network error calling ${endpoint}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
         error
       );
     }
@@ -275,6 +288,7 @@ export class OnvmClient {
   ): Promise<UploadBlobResponse> {
     const nodeMode = await this.detectNodeMode();
     const url = `${this.rpcUrl}/blobs`;
+    const endpoint = url;
     const headers: Record<string, string> = {};
 
     if (mimeType) {
@@ -298,11 +312,21 @@ export class OnvmClient {
       authNonce = authHeaders['x-nonce'];
     }
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: data,
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: data,
+      });
+    } catch (error) {
+      throw new OnvmNetworkError(
+        `Network error uploading blob to ${endpoint}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        error
+      );
+    }
 
     const responseText = await response.text();
 
@@ -344,6 +368,7 @@ export class OnvmClient {
   async downloadBlob(blobId: string): Promise<Buffer> {
     const nodeMode = await this.detectNodeMode();
     const url = `${this.rpcUrl}/blobs/${blobId}`;
+    const endpoint = url;
     const headers: Record<string, string> = {};
 
     let authTimestamp: number | undefined;
@@ -362,10 +387,20 @@ export class OnvmClient {
       authNonce = authHeaders['x-nonce'];
     }
 
-    const response = await fetch(url, {
-      method: 'GET',
-      headers,
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: 'GET',
+        headers,
+      });
+    } catch (error) {
+      throw new OnvmNetworkError(
+        `Network error downloading blob from ${endpoint}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        error
+      );
+    }
 
     if (!response.ok) {
       throw new OnvmError(

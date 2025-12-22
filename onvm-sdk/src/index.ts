@@ -28,4 +28,10 @@ export type {
   ProgramStateRootResponse,
   ProgramCatalogResponse,
 } from './types';
-export { OnvmError, OnvmAuthError, OnvmNetworkError } from './errors';
+export { 
+  OnvmError, 
+  OnvmAuthError, 
+  OnvmNetworkError, 
+  OnvmRateLimitError, 
+  OnvmConfigError 
+} from './errors';

@@ -1,4 +1,4 @@
-import { OnvmClient, RpcMode } from 'onvm-sdk';
+import { OnvmClient } from 'onvm-sdk';
 import type {
   IdentityRequest,
   RegisterRequest,
@@ -13,26 +13,21 @@ import type {
   StatsResponse
 } from '@/lib/types'
 
-const RPC_ENDPOINT = 'http://localhost:8080';
-const PROGRAM_ID = "4433f7464fe23a2dbf524333618a9ccd6b43ac55212b2ebe3effa9896bf7701c";
-const PROJECT_ID = "b72724722db7b33071c5e7cf5d10bc53";
-const PROJECT_SECRET = "65eb796b7044c49273d44475608b5f1aa892de2f9b2d6a10c59ac954739bacdc";
+const RPC_ENDPOINT = process.env.NEXT_PUBLIC_RPC_URL || 'http://localhost:8080';
+const PROGRAM_ID = process.env.NEXT_PUBLIC_IDENTITY_CARD_PROGRAM_ID || "fdad95913d574dd1d22c9950f37a967720b65911666224ab64119c786a4be023";
+const PROJECT_ID = process.env.NEXT_PUBLIC_PROJECT_ID || "b72724722db7b33071c5e7cf5d10bc53";
+const PROJECT_SECRET = process.env.NEXT_PUBLIC_PROJECT_SECRET || "65eb796b7044c49273d44475608b5f1aa892de2f9b2d6a10c59ac954739bacdc";
 
 export class ONVMClient {
   private client: OnvmClient;
   private programId: string;
 
   constructor() {
-    if (!PROJECT_ID || !PROJECT_SECRET) {
-      throw new Error('PROJECT_ID and PROJECT_SECRET are required for prod mode');
-    }
-
     this.client = new OnvmClient({
       rpcUrl: RPC_ENDPOINT,
       programId: PROGRAM_ID,
       projectId: PROJECT_ID,
       projectSecret: PROJECT_SECRET,
-      mode: RpcMode.Prod,
       timeout: 30000,
     });
 

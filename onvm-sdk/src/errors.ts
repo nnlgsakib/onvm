@@ -9,6 +9,18 @@ export class OnvmError extends Error {
     this.details = details;
     Object.setPrototypeOf(this, OnvmError.prototype);
   }
+
+  get isAuthError(): boolean {
+    return this.statusCode === 401 || this.statusCode === 403;
+  }
+
+  get isRateLimitError(): boolean {
+    return this.statusCode === 429;
+  }
+
+  get isNetworkError(): boolean {
+    return this.statusCode === undefined || (this.statusCode >= 500 && this.statusCode < 600);
+  }
 }
 
 export class OnvmAuthError extends OnvmError {
@@ -24,5 +36,21 @@ export class OnvmNetworkError extends OnvmError {
     super(message, undefined, details);
     this.name = 'OnvmNetworkError';
     Object.setPrototypeOf(this, OnvmNetworkError.prototype);
+  }
+}
+
+export class OnvmRateLimitError extends OnvmError {
+  constructor(message: string, details?: any) {
+    super(message, 429, details);
+    this.name = 'OnvmRateLimitError';
+    Object.setPrototypeOf(this, OnvmRateLimitError.prototype);
+  }
+}
+
+export class OnvmConfigError extends OnvmError {
+  constructor(message: string, details?: any) {
+    super(message, undefined, details);
+    this.name = 'OnvmConfigError';
+    Object.setPrototypeOf(this, OnvmConfigError.prototype);
   }
 }

@@ -18,6 +18,7 @@ export interface HealthResponse {
 
 export interface LivenessResponse {
   alive: boolean;
+  mode: string;
 }
 
 export interface ReadinessResponse {

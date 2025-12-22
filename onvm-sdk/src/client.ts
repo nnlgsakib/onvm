@@ -1,6 +1,5 @@
 import {
   OnvmClientConfig,
-  RpcMode,
   HealthResponse,
   LivenessResponse,
   ReadinessResponse,
@@ -35,25 +34,63 @@ export class OnvmClient {
   private programId?: string;
   private projectId?: string;
   private projectSecret?: string;
-  private mode: RpcMode;
   private timeout: number;
   private derivedKeys?: DerivedKeys;
+  private detectedNodeMode?: 'dev' | 'prod';
 
   constructor(config: OnvmClientConfig) {
     this.rpcUrl = config.rpcUrl.replace(/\/$/, '');
     this.programId = config.programId;
     this.projectId = config.projectId;
     this.projectSecret = config.projectSecret;
-    this.mode = config.mode ?? RpcMode.Prod;
     this.timeout = config.timeout ?? 30000;
 
-    if (this.mode === RpcMode.Prod) {
-      if (!this.projectId || !this.projectSecret) {
+    if (this.projectId && this.projectSecret) {
+      this.derivedKeys = deriveKeys(this.projectSecret);
+    }
+  }
+
+  private async detectNodeMode(): Promise<'dev' | 'prod'> {
+    if (this.detectedNodeMode) {
+      return this.detectedNodeMode;
+    }
+
+    try {
+      const response = await fetch(`${this.rpcUrl}/health/liveness`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+      if (!response.ok) {
+        throw new OnvmError('Failed to detect node mode', response.status);
+      }
+
+      const data: LivenessResponse = await response.json();
+      this.detectedNodeMode = data.mode === 'dev' ? 'dev' : 'prod';
+      
+      if (this.detectedNodeMode === 'prod' && (!this.projectId || !this.projectSecret)) {
         throw new OnvmError(
-          'projectId and projectSecret are required in prod mode'
+          'Node is running in prod mode but projectId or projectSecret is missing. Please provide valid credentials.',
+          401
         );
       }
-      this.derivedKeys = deriveKeys(this.projectSecret);
+      
+      return this.detectedNodeMode;
+    } catch (error) {
+      if (error instanceof OnvmError) {
+        throw error;
+      }
+      console.warn('Failed to detect node mode, defaulting to prod:', error);
+      this.detectedNodeMode = 'prod';
+      
+      if (!this.projectId || !this.projectSecret) {
+        throw new OnvmError(
+          'Cannot connect to node. Assuming prod mode but projectId or projectSecret is missing.',
+          401
+        );
+      }
+      
+      return 'prod';
     }
   }
 
@@ -63,6 +100,8 @@ export class OnvmClient {
     body?: any,
     customHeaders?: Record<string, string>
   ): Promise<T> {
+    const nodeMode = await this.detectNodeMode();
+    
     const url = `${this.rpcUrl}${path}`;
     const bodyStr = body ? JSON.stringify(body) : '';
 
@@ -71,11 +110,10 @@ export class OnvmClient {
       ...customHeaders,
     };
 
-    // Store auth context for response decryption
     let authTimestamp: number | undefined;
     let authNonce: string | undefined;
 
-    if (this.mode === RpcMode.Prod && this.derivedKeys && this.projectId) {
+    if (nodeMode === 'prod' && this.derivedKeys && this.projectId) {
       const authHeaders = buildAuthHeaders(
         method,
         path,
@@ -84,7 +122,6 @@ export class OnvmClient {
         this.derivedKeys.signing_key
       );
       
-      // Save for response decryption
       authTimestamp = parseInt(authHeaders['x-timestamp']);
       authNonce = authHeaders['x-nonce'];
       
@@ -106,6 +143,39 @@ export class OnvmClient {
 
       if (!response.ok) {
         const errorText = await response.text();
+        
+        if (response.status === 401) {
+          if (nodeMode === 'prod') {
+            throw new OnvmError(
+              'Authentication failed. Please check your projectId and projectSecret credentials.',
+              401,
+              errorText
+            );
+          } else {
+            throw new OnvmError(
+              'Unauthorized access.',
+              401,
+              errorText
+            );
+          }
+        }
+        
+        if (response.status === 403) {
+          throw new OnvmError(
+            'Access forbidden. Your credentials may not have permission for this operation.',
+            403,
+            errorText
+          );
+        }
+        
+        if (response.status === 429) {
+          throw new OnvmError(
+            'Rate limit exceeded. Please slow down your requests.',
+            429,
+            errorText
+          );
+        }
+        
         throw new OnvmError(
           `HTTP ${response.status}: ${errorText}`,
           response.status,
@@ -114,24 +184,8 @@ export class OnvmClient {
       }
 
       const responseText = await response.text();
-      
-      console.log('Response debug:', {
-        mode: this.mode,
-        hasDerivedKeys: !!this.derivedKeys,
-        authTimestamp,
-        authNonce,
-        responseNonce: response.headers.get('x-response-nonce'),
-        responseAead: response.headers.get('x-response-aead'),
-        responsePreview: responseText.substring(0, 50)
-      });
 
-      // Decrypt response if authenticated and encrypted
-      if (
-        this.mode === RpcMode.Prod &&
-        this.derivedKeys &&
-        authTimestamp &&
-        authNonce
-      ) {
+      if (nodeMode === 'prod' && this.derivedKeys && authTimestamp && authNonce) {
         const responseNonce = response.headers.get('x-response-nonce');
         const responseAead = response.headers.get('x-response-aead');
 
@@ -150,7 +204,6 @@ export class OnvmClient {
           return JSON.parse(decrypted);
         }
 
-        // If response looks encrypted (base64), try to decrypt without nonce header
         if (responseText.match(/^[A-Za-z0-9+/=\s]+$/)) {
           const { decryptResponse } = await import('./auth');
           const canonical = `${method} ${path}\n${authTimestamp}\n${authNonce}\n${bodyStr}`;
@@ -166,8 +219,11 @@ export class OnvmClient {
             );
             return JSON.parse(decrypted);
           } catch (decryptError) {
-            console.error('Decryption failed:', decryptError);
-            throw new OnvmError(`Failed to decrypt response: ${decryptError}`);
+            throw new OnvmError(
+              'Failed to decrypt response. Your credentials may be incorrect or the response format is invalid.',
+              500,
+              decryptError
+            );
           }
         }
       }
@@ -217,6 +273,7 @@ export class OnvmClient {
     data: Buffer | Uint8Array,
     mimeType?: string
   ): Promise<UploadBlobResponse> {
+    const nodeMode = await this.detectNodeMode();
     const url = `${this.rpcUrl}/blobs`;
     const headers: Record<string, string> = {};
 
@@ -224,7 +281,7 @@ export class OnvmClient {
       headers['x-mime'] = mimeType;
     }
 
-    if (this.mode === RpcMode.Prod && this.derivedKeys && this.projectId) {
+    if (nodeMode === 'prod' && this.derivedKeys && this.projectId) {
       const bodyStr = Buffer.from(data).toString('base64');
       const authHeaders = buildAuthHeaders(
         'POST',
@@ -253,10 +310,11 @@ export class OnvmClient {
   }
 
   async downloadBlob(blobId: string): Promise<Buffer> {
+    const nodeMode = await this.detectNodeMode();
     const url = `${this.rpcUrl}/blobs/${blobId}`;
     const headers: Record<string, string> = {};
 
-    if (this.mode === RpcMode.Prod && this.derivedKeys && this.projectId) {
+    if (nodeMode === 'prod' && this.derivedKeys && this.projectId) {
       const authHeaders = buildAuthHeaders(
         'GET',
         `/blobs/${blobId}`,

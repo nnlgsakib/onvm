@@ -1,5 +1,3 @@
-import { OnvmClient } from 'onvm-sdk';
-
 export interface User {
   id: string
   username: string
@@ -256,24 +254,14 @@ interface ErrorResponse {
 type Response = OkResponse | LoginOkResponse | PostResponse | FeedResponse | ProfileResponse | UsersResponse | ErrorResponse
 type AnyResponse = Partial<Response> & { status?: string; message?: string }
 
-const RPC_ENDPOINT = process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8080"
-const PROGRAM_ID = process.env.NEXT_PUBLIC_ONVM_PROGRAM_ID || ""
-const PROJECT_ID = process.env.NEXT_PUBLIC_PROJECT_ID
-const PROJECT_SECRET = process.env.PROJECT_SECRET
-
+const API_ENDPOINT = "/api/onvm"
+const PROGRAM_ID = process.env.NEXT_PUBLIC_ONVM_PROGRAM_ID || "38ec7cf6280521e004e2d6148abbec866c15d797f66f4e80520d0cb21dcb935c"
 export class NbookONVMClient {
-  private client: OnvmClient
+  private apiEndpoint: string
   private programId: string
 
   constructor() {
-    this.client = new OnvmClient({
-      rpcUrl: RPC_ENDPOINT,
-      programId: PROGRAM_ID,
-      projectId: PROJECT_ID,
-      projectSecret: PROJECT_SECRET,
-      timeout: 30000,
-    })
-
+    this.apiEndpoint = API_ENDPOINT
     this.programId = PROGRAM_ID
   }
 
@@ -492,11 +480,24 @@ export class NbookONVMClient {
   private async executeProgram<T extends Response>(request: Request): Promise<T> {
     const inputBase64 = btoa(JSON.stringify(request))
 
-    const result = await this.client.executeProgram({
-      program_id: this.programId,
-      input_base64: inputBase64,
+    const response = await fetch(this.apiEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        operation: 'executeProgram',
+        program_id: this.programId,
+        input_base64: inputBase64,
+      }),
     })
 
+    if (!response.ok) {
+      const error = await response.json()
+      throw new Error(error.error || 'Failed to execute program')
+    }
+
+    const result = await response.json()
     const returnData = atob(result.return_base64)
     const parsedResponse = JSON.parse(returnData) as AnyResponse
     if (!parsedResponse.status) {
@@ -507,13 +508,44 @@ export class NbookONVMClient {
 
   async uploadBlob(buffer: ArrayBuffer): Promise<string> {
     const uint8Array = new Uint8Array(buffer)
-    const result = await this.client.uploadBlob(uint8Array)
+    const response = await fetch(this.apiEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        operation: 'uploadBlob',
+        buffer: Array.from(uint8Array),
+      }),
+    })
+
+    if (!response.ok) {
+      const error = await response.json()
+      throw new Error(error.error || 'Failed to upload blob')
+    }
+
+    const result = await response.json()
     return result.id
   }
 
   async fetchBlob(id: string): Promise<{ blob: Blob; contentType: string }> {
-    const buffer = await this.client.downloadBlob(id)
-    const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+    const response = await fetch(this.apiEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        operation: 'downloadBlob',
+        id,
+      }),
+    })
+
+    if (!response.ok) {
+      const error = await response.json()
+      throw new Error(error.error || 'Failed to download blob')
+    }
+
+    const arrayBuffer = await response.arrayBuffer()
     const sniffed = sniffContentType(arrayBuffer, "")
     const blob = new Blob([arrayBuffer], { type: sniffed })
     return { blob, contentType: sniffed }

@@ -493,7 +493,7 @@ export class NbookONVMClient {
     })
 
     if (!response.ok) {
-      const error = await response.json()
+      const error = await response.json().catch(() => ({ error: 'Failed to execute program' }))
       throw new Error(error.error || 'Failed to execute program')
     }
 
@@ -520,7 +520,7 @@ export class NbookONVMClient {
     })
 
     if (!response.ok) {
-      const error = await response.json()
+      const error = await response.json().catch(() => ({ error: 'Failed to upload blob' }))
       throw new Error(error.error || 'Failed to upload blob')
     }
 
@@ -541,7 +541,7 @@ export class NbookONVMClient {
     })
 
     if (!response.ok) {
-      const error = await response.json()
+      const error = await response.json().catch(() => ({ error: 'Failed to download blob' }))
       throw new Error(error.error || 'Failed to download blob')
     }
 

@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { OnvmClient } from 'onvm-sdk'
 
-const RPC_ENDPOINT = process.env.ONVM_RPC_ENDPOINT || "http://localhost:8080"
-const PROGRAM_ID = process.env.ONVM_PROGRAM_ID || "38ec7cf6280521e004e2d6148abbec866c15d797f66f4e80520d0cb21dcb935c"
-const PROJECT_ID = process.env.ONVM_PROJECT_ID || "77e632e611090aaf7232cee2a4bfe02a"
-const PROJECT_SECRET = process.env.PROJECT_SECRET || "cfe294285bc599abc8e42cac4ece78bdee1d9a784752ccb7d309fcca8c48bc61"
+const RPC_ENDPOINT = process.env.ONVM_RPC_ENDPOINT as string
+const PROGRAM_ID = process.env.ONVM_PROGRAM_ID 
+const PROJECT_ID = process.env.ONVM_PROJECT_ID 
+const PROJECT_SECRET = process.env.PROJECT_SECRET 
 
 let clientInstance: OnvmClient | null = null
 

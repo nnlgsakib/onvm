@@ -15,6 +15,7 @@ import {
   listFollowers,
   listFollowing,
   followUser,
+  unfollowUser,
 } from "@/lib/api"
 import { getSession } from "@/lib/auth"
 import type { Post, ProfileView, UserSummary } from "@/lib/onvm-client"
@@ -39,6 +40,8 @@ export function ProfileContent() {
   const [followerList, setFollowerList] = useState<UserSummary[]>([])
   const [followingList, setFollowingList] = useState<UserSummary[]>([])
   const [listLoading, setListLoading] = useState(false)
+  const [isFollowing, setIsFollowing] = useState(false)
+  const [followBusy, setFollowBusy] = useState(false)
 
   useEffect(() => {
     const s = getSession()
@@ -64,6 +67,10 @@ export function ProfileContent() {
         // Initially hydrate lists as bare usernames; full summaries are loaded on demand.
         setFollowerList((p.followerList || []).map((u) => ({ username: u, followers: 0 } as UserSummary)))
         setFollowingList((p.followingList || []).map((u) => ({ username: u, followers: 0 } as UserSummary)))
+        setIsFollowing(false)
+        if (sessionUser && (p.followerList || []).includes(sessionUser)) {
+          setIsFollowing(true)
+        }
 
         // Load posts authored by this user
         const fetched = await Promise.all(
@@ -97,6 +104,56 @@ export function ProfileContent() {
   }, [profile])
 
   const isSelf = !requestedUser || requestedUser === sessionUser
+
+  const toggleFollow = async () => {
+    if (!sessionUser || !profile) {
+      toast({
+        title: "Please log in",
+        description: "You need to be signed in to follow people.",
+      })
+      return
+    }
+    setFollowBusy(true)
+    try {
+      if (isFollowing) {
+        await unfollowUser(profile.username)
+        setIsFollowing(false)
+        setProfile((p) =>
+          p
+            ? {
+                ...p,
+                followers: Math.max(0, p.followers - 1),
+                followerList: p.followerList.filter((u) => u !== sessionUser),
+              }
+            : p
+        )
+        toast({ title: `Unfollowed ${profile.username}` })
+      } else {
+        await followUser(profile.username)
+        setIsFollowing(true)
+        setProfile((p) =>
+          p
+            ? {
+                ...p,
+                followers: p.followers + 1,
+                followerList: p.followerList.includes(sessionUser)
+                  ? p.followerList
+                  : [...p.followerList, sessionUser],
+              }
+            : p
+        )
+        toast({ title: `Following ${profile.username}` })
+      }
+    } catch (e) {
+      toast({
+        title: "Follow action failed",
+        description: e instanceof Error ? e.message : "Please try again.",
+        variant: "destructive",
+      })
+    } finally {
+      setFollowBusy(false)
+    }
+  }
 
   if (!hydrated || loading) {
     return (
@@ -133,9 +190,22 @@ export function ProfileContent() {
               <h1 className="text-xl font-bold">{profile.displayName || profile.username}</h1>
               <p className="text-sm text-muted-foreground">{posts.length} posts</p>
             </div>
-            <Button size="sm" variant="ghost">
-              <Settings className="w-4 h-4" />
-            </Button>
+            <div className="flex items-center gap-2">
+              {!isSelf ? (
+                <Button
+                  size="sm"
+                  variant={isFollowing ? "outline" : "default"}
+                  onClick={toggleFollow}
+                  disabled={followBusy}
+                  className="min-w-[96px]"
+                >
+                  {followBusy ? "..." : isFollowing ? "Unfollow" : "Follow"}
+                </Button>
+              ) : null}
+              <Button size="sm" variant="ghost">
+                <Settings className="w-4 h-4" />
+              </Button>
+            </div>
           </div>
         </div>
       </div>

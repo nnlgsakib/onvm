@@ -15,6 +15,8 @@ export interface User {
 interface ApiPost {
   id: string
   author: string
+  author_avatar_blob_id?: string | null
+  author_display_name?: string | null
   text: string
   attachments: Attachment[]
   created_at: number
@@ -46,6 +48,8 @@ export interface CommentView {
 export interface Post {
   id: string
   author: string
+  displayName?: string | null
+  avatarBlobId?: string | null
   text: string
   attachments: Attachment[]
   createdAt: number
@@ -553,6 +557,8 @@ export class NbookONVMClient {
     return {
       id: api.id,
       author: api.author,
+      displayName: api.author_display_name,
+      avatarBlobId: api.author_avatar_blob_id,
       text: api.text,
       attachments: api.attachments,
       createdAt: api.created_at,

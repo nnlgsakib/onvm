@@ -160,7 +160,7 @@ export function FeedContent({ initialTab = "following", fixedDiscover = false, t
             <p>No posts yet. Be the first to share something!</p>
           </div>
         ) : (
-          posts.map((post) => <PostCard key={post.id} post={post} onUpdate={loadFeed} />)
+            posts.map((post) => <PostCard key={post.id} post={post} onUpdate={loadFeed} />)
         )}
       </div>
     </div>

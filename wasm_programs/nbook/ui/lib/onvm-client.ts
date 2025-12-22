@@ -1,5 +1,4 @@
-// ONVM Client for nbook Social Media WASM Program
-// This client interacts with the ONVM RPC to manage social media operations
+import { OnvmClient } from 'onvm-sdk';
 
 export interface User {
   id: string
@@ -258,17 +257,26 @@ type Response = OkResponse | LoginOkResponse | PostResponse | FeedResponse | Pro
 type AnyResponse = Partial<Response> & { status?: string; message?: string }
 
 const RPC_ENDPOINT = process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8080"
+const PROGRAM_ID = process.env.NEXT_PUBLIC_ONVM_PROGRAM_ID || ""
+const PROJECT_ID = process.env.NEXT_PUBLIC_PROJECT_ID
+const PROJECT_SECRET = process.env.PROJECT_SECRET
 
 export class NbookONVMClient {
-  private rpcEndpoint: string
+  private client: OnvmClient
   private programId: string
 
-  constructor(rpcEndpoint: string = RPC_ENDPOINT, programId: string = process.env.NEXT_PUBLIC_ONVM_PROGRAM_ID || "c4f18b0ae12975f4df2ff6739ae77f0d31cd2a4b11bb73fa96a6da2f3a0f3cd9") {
-    this.rpcEndpoint = rpcEndpoint
-    this.programId = programId
+  constructor() {
+    this.client = new OnvmClient({
+      rpcUrl: RPC_ENDPOINT,
+      programId: PROGRAM_ID,
+      projectId: PROJECT_ID,
+      projectSecret: PROJECT_SECRET,
+      timeout: 30000,
+    })
+
+    this.programId = PROGRAM_ID
   }
 
-  // Authentication operations
   async register(username: string, password: string): Promise<OkResponse> {
     const response = await this.executeProgram<OkResponse>({
       op: "register",
@@ -315,7 +323,6 @@ export class NbookONVMClient {
     }
   }
 
-  // Post operations
   async createPost(session: string, text: string, attachments: string[] = []): Promise<Post> {
     const response = await this.executeProgram<PostResponse>({
       op: "create_post",
@@ -365,7 +372,6 @@ export class NbookONVMClient {
     return this.normalizePost((response as PostResponse).post)
   }
 
-  // Feed operations
   async getFeed(session: string, limit = 20, discover = false): Promise<Post[]> {
     const response = await this.executeProgram<FeedResponse>({
       op: "feed",
@@ -379,7 +385,6 @@ export class NbookONVMClient {
     return (response as FeedResponse).posts.map((p) => this.normalizePost(p))
   }
 
-  // Social operations
   async follow(session: string, target: string): Promise<void> {
     const response = await this.executeProgram<OkResponse>({
       op: "follow",
@@ -402,7 +407,6 @@ export class NbookONVMClient {
     }
   }
 
-  // Profile operations
   async getProfile(username: string): Promise<ProfileView> {
     const response = await this.executeProgram<ProfileResponse>({
       op: "profile",
@@ -485,143 +489,36 @@ export class NbookONVMClient {
     return this.normalizeUsers((response as UsersResponse).users)
   }
 
-  // Generic execute program method
   private async executeProgram<T extends Response>(request: Request): Promise<T> {
-    try {
-      if (!this.programId) {
-        throw new Error("NEXT_PUBLIC_ONVM_PROGRAM_ID is not set")
-      }
+    const inputBase64 = btoa(JSON.stringify(request))
 
-      // Encode request as base64
-      const inputBase64 = btoa(JSON.stringify(request))
-
-      // Execute program via ONVM RPC
-      const response = await fetch(`${this.rpcEndpoint}/execute`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          program_id: this.programId,
-          input_base64: inputBase64,
-        }),
-      })
-
-      if (!response.ok) {
-        const errorText = await response.text()
-        throw new Error(`RPC error: ${response.status} - ${errorText}`)
-      }
-
-      const result = await response.json()
-
-      // Decode the response
-      const returnData = atob(result.return_base64)
-      const parsedResponse = JSON.parse(returnData) as AnyResponse
-      if (!parsedResponse.status) {
-        throw new Error("invalid response from program")
-      }
-      return parsedResponse as T
-    } catch (error) {
-      console.error("[v0] ONVM Client Error:", error)
-      throw error
-    }
-  }
-
-  // Helper method to upload a WASM program
-  async uploadWasm(wasmBuffer: ArrayBuffer): Promise<string> {
-    try {
-      // Upload WASM blob
-      const blobResponse = await fetch(`${this.rpcEndpoint}/blobs`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/wasm",
-        },
-        body: wasmBuffer,
-      })
-
-      if (!blobResponse.ok) {
-        const errorText = await blobResponse.text()
-        throw new Error(`Blob upload error: ${blobResponse.status} - ${errorText}`)
-      }
-
-      const blobResult = await blobResponse.json()
-      const blobId = blobResult.id
-
-      // Convert ArrayBuffer to base64
-      const bytes = new Uint8Array(wasmBuffer)
-      let binary = ""
-      for (let i = 0; i < bytes.length; i++) {
-        binary += String.fromCharCode(bytes[i])
-      }
-      const wasmBase64 = btoa(binary)
-
-      // Deploy program
-      const deployResponse = await fetch(`${this.rpcEndpoint}/programs`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          wasm_base64: wasmBase64,
-          entrypoint: "onvm_main",
-          blob_refs: [],
-        }),
-      })
-
-      if (!deployResponse.ok) {
-        const errorText = await deployResponse.text()
-        throw new Error(`Program deploy error: ${deployResponse.status} - ${errorText}`)
-      }
-
-      const deployResult = await deployResponse.json()
-      return deployResult.id
-    } catch (error) {
-      console.error("[v0] WASM Upload Error:", error)
-      throw error
-    }
-  }
-
-  // Helper method to upload blobs (images, videos, etc.)
-  async uploadBlob(buffer: ArrayBuffer): Promise<string> {
-    try {
-      const response = await fetch(`${this.rpcEndpoint}/blobs`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/octet-stream",
-        },
-        body: buffer,
-      })
-
-      if (!response.ok) {
-        const errorText = await response.text()
-        throw new Error(`Blob upload error: ${response.status} - ${errorText}`)
-      }
-
-      const result = await response.json()
-      return result.id
-    } catch (error) {
-      console.error("[v0] Blob Upload Error:", error)
-      throw error
-    }
-  }
-
-  // Download a blob and return it as a Browser Blob
-  async fetchBlob(id: string): Promise<{ blob: Blob; contentType: string }> {
-    const response = await fetch(`${this.rpcEndpoint}/blobs/${id}`, {
-      method: "GET",
+    const result = await this.client.executeProgram({
+      program_id: this.programId,
+      input_base64: inputBase64,
     })
-    if (!response.ok) {
-      const txt = await response.text()
-      throw new Error(`Blob fetch error: ${response.status} ${txt}`)
+
+    const returnData = atob(result.return_base64)
+    const parsedResponse = JSON.parse(returnData) as AnyResponse
+    if (!parsedResponse.status) {
+      throw new Error("invalid response from program")
     }
-    const headerCt = response.headers.get("content-type") || ""
-    const buffer = await response.arrayBuffer()
-    const sniffed = sniffContentType(buffer, headerCt)
-    const blob = new Blob([buffer], { type: sniffed })
+    return parsedResponse as T
+  }
+
+  async uploadBlob(buffer: ArrayBuffer): Promise<string> {
+    const uint8Array = new Uint8Array(buffer)
+    const result = await this.client.uploadBlob(uint8Array)
+    return result.id
+  }
+
+  async fetchBlob(id: string): Promise<{ blob: Blob; contentType: string }> {
+    const buffer = await this.client.downloadBlob(id)
+    const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+    const sniffed = sniffContentType(arrayBuffer, "")
+    const blob = new Blob([arrayBuffer], { type: sniffed })
     return { blob, contentType: sniffed }
   }
 
-  // Normalize API shapes (snake_case) to client shapes (camelCase)
   private normalizePost(api: ApiPost): Post {
     return {
       id: api.id,

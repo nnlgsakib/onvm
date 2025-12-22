@@ -1,6 +1,4 @@
-// ONVM Client for School Management WASM Program
-// This client interacts with the ONVM RPC to manage school entities
-
+import { OnvmClient } from 'onvm-sdk';
 import type {
   Student,
   Teacher,
@@ -8,18 +6,27 @@ import type {
   Grade
 } from '@/types'
 
-const RPC_ENDPOINT = 'http://localhost:8081';
+const RPC_ENDPOINT = process.env.NEXT_PUBLIC_RPC_URL || 'http://localhost:8081';
+const PROGRAM_ID = process.env.NEXT_PUBLIC_SCHOOL_PROGRAM_ID || "618df68d440c4f7ac9dae7f63a36ff8e10fb3bb970c7e7aa3d00b4195e06bbd7";
+const PROJECT_ID = process.env.NEXT_PUBLIC_PROJECT_ID;
+const PROJECT_SECRET = process.env.NEXT_PUBLIC_PROJECT_SECRET;
 
 export class SchoolManagementClient {
-  private rpcEndpoint: string;
+  private client: OnvmClient;
   private programId: string;
 
-  constructor(rpcEndpoint: string = RPC_ENDPOINT, programId: string = "81b81270820fb1580b91f4b0e3bc249cfa5126a832ea4d46e6bf921cf1a6f0c8") {
-    this.rpcEndpoint = rpcEndpoint;
-    this.programId = programId;
+  constructor() {
+    this.client = new OnvmClient({
+      rpcUrl: RPC_ENDPOINT,
+      programId: PROGRAM_ID,
+      projectId: PROJECT_ID,
+      projectSecret: PROJECT_SECRET,
+      timeout: 30000,
+    });
+
+    this.programId = PROGRAM_ID;
   }
 
-  // Student operations
   async addStudent(student: Student): Promise<any> {
     return this.executeProgram({
       operation: 'add_student',
@@ -55,7 +62,6 @@ export class SchoolManagementClient {
     });
   }
 
-  // Teacher operations
   async addTeacher(teacher: Teacher): Promise<any> {
     return this.executeProgram({
       operation: 'add_teacher',
@@ -91,7 +97,6 @@ export class SchoolManagementClient {
     });
   }
 
-  // Course operations
   async addCourse(course: Course): Promise<any> {
     return this.executeProgram({
       operation: 'add_course',
@@ -127,7 +132,6 @@ export class SchoolManagementClient {
     });
   }
 
-  // Grade operations
   async assignGrade(grade: Grade): Promise<any> {
     return this.executeProgram({
       operation: 'assign_grade',
@@ -149,7 +153,6 @@ export class SchoolManagementClient {
     });
   }
 
-  // Enrollment operations
   async enrollStudent(studentId: string, courseId: string): Promise<any> {
     return this.executeProgram({
       operation: 'enroll_student',
@@ -157,96 +160,24 @@ export class SchoolManagementClient {
     });
   }
 
-  // Generic execute program method
   private async executeProgram<T extends { status: string }>(
     request: any
   ): Promise<T> {
-    try {
-      if (!this.programId) {
-        throw new Error('PROGRAM_ID is not set');
-      }
+    const inputBase64 = Buffer.from(JSON.stringify(request)).toString('base64');
 
-      // Encode request as base64
-      const inputBase64 = Buffer.from(JSON.stringify(request)).toString('base64');
+    const result = await this.client.executeProgram({
+      program_id: this.programId,
+      input_base64: inputBase64,
+    });
 
-      // Execute program via ONVM RPC
-      const response = await fetch(`${this.rpcEndpoint}/execute`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          program_id: this.programId,
-          input_base64: inputBase64,
-        }),
-      });
+    const returnData = Buffer.from(result.return_base64, 'base64').toString('utf-8');
+    const parsedResponse = JSON.parse(returnData);
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`RPC error: ${response.status} - ${errorText}`);
-      }
-
-      const result = await response.json();
-      
-      // Decode the response
-      const returnData = Buffer.from(result.return_base64, 'base64').toString('utf-8');
-      const parsedResponse = JSON.parse(returnData);
-      
-      if (parsedResponse.status === 'error') {
-        throw new Error(parsedResponse.error || 'Unknown error occurred');
-      }
-      
-      return parsedResponse as T;
-    } catch (error) {
-      console.error('ONVM Client Error:', error);
-      throw error;
+    if (parsedResponse.status === 'error') {
+      throw new Error(parsedResponse.error || 'Unknown error occurred');
     }
-  }
 
-  // Helper method to upload a WASM program
-  async uploadWasm(wasmBuffer: ArrayBuffer): Promise<string> {
-    try {
-      // Upload WASM blob
-      const blobResponse = await fetch(`${this.rpcEndpoint}/blobs`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/wasm',
-        },
-        body: wasmBuffer,
-      });
-
-      if (!blobResponse.ok) {
-        const errorText = await blobResponse.text();
-        throw new Error(`Blob upload error: ${blobResponse.status} - ${errorText}`);
-      }
-
-      const blobResult = await blobResponse.json();
-      const blobId = blobResult.id;
-
-      // Deploy program
-      const deployResponse = await fetch(`${this.rpcEndpoint}/programs`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          wasm_base64: Buffer.from(wasmBuffer).toString('base64'),
-          entrypoint: 'onvm_main',
-          blob_refs: [],
-        }),
-      });
-
-      if (!deployResponse.ok) {
-        const errorText = await deployResponse.text();
-        throw new Error(`Program deploy error: ${deployResponse.status} - ${errorText}`);
-      }
-
-      const deployResult = await deployResponse.json();
-      return deployResult.id;
-    } catch (error) {
-      // Wasm Upload Error:', error);
-      throw error;
-    }
+    return parsedResponse as T;
   }
 }
 
@@ -254,10 +185,9 @@ let schoolClient: SchoolManagementClient | null = null;
 
 export const getSchoolClient = (): SchoolManagementClient => {
   if (!schoolClient) {
-    schoolClient = new SchoolManagementClient(RPC_ENDPOINT, "618df68d440c4f7ac9dae7f63a36ff8e10fb3bb970c7e7aa3d00b4195e06bbd7");
+    schoolClient = new SchoolManagementClient();
   }
   return schoolClient;
 };
-
 
 export default SchoolManagementClient;

@@ -1,18 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { OnvmClient } from 'onvm-sdk'
 
-const RPC_ENDPOINT = process.env.ONVM_RPC_ENDPOINT
-const PROGRAM_ID = process.env.ONVM_PROGRAM_ID
-const PROJECT_ID = process.env.ONVM_PROJECT_ID
-const PROJECT_SECRET = process.env.PROJECT_SECRET
-
+const RPC_ENDPOINT = process.env.ONVM_RPC_ENDPOINT as string
+const PROGRAM_ID = process.env.ONVM_PROGRAM_ID 
+const PROJECT_ID = process.env.ONVM_PROJECT_ID 
+const PROJECT_SECRET = process.env.PROJECT_SECRET 
 let clientInstance: OnvmClient | null = null
 
 function getClient(): OnvmClient {
-  if (!RPC_ENDPOINT || !PROGRAM_ID || !PROJECT_ID || !PROJECT_SECRET) {
-    throw new Error('Missing required environment variables. Please check .env.local')
-  }
-
   if (!clientInstance) {
     clientInstance = new OnvmClient({
       rpcUrl: RPC_ENDPOINT,

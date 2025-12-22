@@ -218,7 +218,10 @@ pub async fn verify_signed_request(
     mac.update(canonical.as_bytes());
     let expected = mac.finalize().into_bytes();
     if expected.as_slice().ct_eq(signature.as_slice()).unwrap_u8() != 1 {
-        warn!("rpc auth: signature mismatch");
+        warn!(
+            "rpc auth: signature mismatch for project {} (path: {})",
+            project_id, path
+        );
         return Err(StatusCode::UNAUTHORIZED);
     }
     let response_key = project_keys.response_key;
@@ -233,6 +236,14 @@ pub async fn verify_signed_request(
 
     let req = Request::from_parts(parts, Body::from(body_bytes.clone()));
     let resp = next.run(req).await;
+
+    if !resp.status().is_success() {
+        warn!(
+            "rpc auth: downstream handler returned error {}, skipping encryption",
+            resp.status()
+        );
+        return Ok(resp);
+    }
 
     let (mut resp_parts, resp_body) = resp.into_parts();
     let plaintext = to_bytes(resp_body, usize::MAX)

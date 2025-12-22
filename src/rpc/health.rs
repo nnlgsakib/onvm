@@ -18,15 +18,20 @@ pub struct HealthRpcContext {
     pub reporter: Arc<HealthReporter>,
     pub scheduler: std::sync::Weak<crate::wasm_runtime::JobScheduler>,
     pub max_concurrent: usize,
+    pub dev_mode: bool,
 }
 
 #[derive(Serialize)]
 struct LivenessResponse {
     alive: bool,
+    mode: String,
 }
 
-async fn liveness() -> Json<LivenessResponse> {
-    Json(LivenessResponse { alive: true })
+async fn liveness(State(ctx): State<Arc<HealthRpcContext>>) -> Json<LivenessResponse> {
+    Json(LivenessResponse {
+        alive: true,
+        mode: if ctx.dev_mode { "dev".to_string() } else { "prod".to_string() },
+    })
 }
 
 async fn readiness(

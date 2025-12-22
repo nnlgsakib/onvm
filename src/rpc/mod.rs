@@ -211,6 +211,7 @@ pub async fn start_rpc(
         reporter: health_reporter,
         scheduler: Arc::downgrade(&job_ctx.scheduler),
         max_concurrent: 10,
+        dev_mode: auth_state.is_none(),
     });
 
     let scheduler_handle = job_ctx.scheduler.clone();
@@ -242,7 +243,9 @@ pub async fn start_rpc(
         .allow_headers(Any)
         .allow_credentials(false);
 
-    let public = Router::new().route("/rpc-auth/projects", post(create_project));
+    let public = Router::new()
+        .route("/rpc-auth/projects", post(create_project))
+        .merge(health_routes().with_state(health_ctx.clone()));
 
     let protected = Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -258,7 +261,6 @@ pub async fn start_rpc(
         .route("/estimate-fuel", post(estimate_fuel))
         .route("/fuel-profile/:program_id", get(get_fuel_profile))
         .merge(job_routes().with_state(job_ctx.clone()))
-        .merge(health_routes().with_state(health_ctx.clone()))
         .with_state(ctx.clone());
 
     let protected = if let Some(state) = auth_state {

@@ -281,8 +281,11 @@ export class OnvmClient {
       headers['x-mime'] = mimeType;
     }
 
+    let authTimestamp: number | undefined;
+    let authNonce: string | undefined;
+    const bodyStr = Buffer.from(data).toString('utf8');
+
     if (nodeMode === 'prod' && this.derivedKeys && this.projectId) {
-      const bodyStr = Buffer.from(data).toString('base64');
       const authHeaders = buildAuthHeaders(
         'POST',
         '/blobs',
@@ -291,6 +294,8 @@ export class OnvmClient {
         this.derivedKeys.signing_key
       );
       Object.assign(headers, authHeaders);
+      authTimestamp = parseInt(authHeaders['x-timestamp']);
+      authNonce = authHeaders['x-nonce'];
     }
 
     const response = await fetch(url, {
@@ -299,20 +304,50 @@ export class OnvmClient {
       body: data,
     });
 
+    const responseText = await response.text();
+
     if (!response.ok) {
       throw new OnvmError(
         `Upload failed: ${response.statusText}`,
-        response.status
+        response.status,
+        responseText
       );
     }
 
-    return response.json();
+    if (
+      nodeMode === 'prod' &&
+      this.derivedKeys &&
+      authTimestamp &&
+      authNonce
+    ) {
+      const responseNonce = response.headers.get('x-response-nonce');
+      const responseAead = response.headers.get('x-response-aead');
+
+      if (responseAead === 'XChaCha20Poly1305') {
+        const { decryptResponse } = await import('./auth');
+        const canonical = `POST /blobs\n${authTimestamp}\n${authNonce}\n${bodyStr}`;
+        const decrypted = decryptResponse(
+          responseText,
+          this.derivedKeys.response_key,
+          authNonce,
+          authTimestamp,
+          canonical,
+          responseNonce || undefined
+        );
+        return JSON.parse(decrypted);
+      }
+    }
+
+    return responseText ? JSON.parse(responseText) : ({} as UploadBlobResponse);
   }
 
   async downloadBlob(blobId: string): Promise<Buffer> {
     const nodeMode = await this.detectNodeMode();
     const url = `${this.rpcUrl}/blobs/${blobId}`;
     const headers: Record<string, string> = {};
+
+    let authTimestamp: number | undefined;
+    let authNonce: string | undefined;
 
     if (nodeMode === 'prod' && this.derivedKeys && this.projectId) {
       const authHeaders = buildAuthHeaders(
@@ -323,6 +358,8 @@ export class OnvmClient {
         this.derivedKeys.signing_key
       );
       Object.assign(headers, authHeaders);
+      authTimestamp = parseInt(authHeaders['x-timestamp']);
+      authNonce = authHeaders['x-nonce'];
     }
 
     const response = await fetch(url, {
@@ -335,6 +372,29 @@ export class OnvmClient {
         `Download failed: ${response.statusText}`,
         response.status
       );
+    }
+
+    const responseAead = response.headers.get('x-response-aead');
+    if (
+      nodeMode === 'prod' &&
+      this.derivedKeys &&
+      authTimestamp &&
+      authNonce &&
+      responseAead === 'XChaCha20Poly1305'
+    ) {
+      const responseNonce = response.headers.get('x-response-nonce');
+      const { decryptResponseToBuffer } = await import('./auth');
+      const canonical = `GET /blobs/${blobId}\n${authTimestamp}\n${authNonce}\n`;
+      const ciphertextBase64 = await response.text();
+      const decrypted = decryptResponseToBuffer(
+        ciphertextBase64,
+        this.derivedKeys.response_key,
+        authNonce,
+        authTimestamp,
+        canonical,
+        responseNonce || undefined
+      );
+      return decrypted;
     }
 
     const arrayBuffer = await response.arrayBuffer();

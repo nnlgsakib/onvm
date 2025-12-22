@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { OnvmClient } from 'onvm-sdk'
 
-const RPC_ENDPOINT = process.env.ONVM_RPC_ENDPOINT as string
+const RPC_ENDPOINT = process.env.ONVM_RPC_ENDPOINT
 const PROGRAM_ID = process.env.ONVM_PROGRAM_ID 
 const PROJECT_ID = process.env.ONVM_PROJECT_ID 
 const PROJECT_SECRET = process.env.PROJECT_SECRET 
@@ -21,11 +21,28 @@ function getClient(): OnvmClient {
 }
 
 export async function POST(request: NextRequest) {
+  const contentType = request.headers.get('content-type') || ''
+  const client = getClient()
+  
+  if (!contentType.includes('application/json')) {
+    try {
+      const arrayBuffer = await request.arrayBuffer()
+      const uint8Array = new Uint8Array(arrayBuffer)
+      const result = await client.uploadBlob(uint8Array)
+      console.log('Upload result:', result)
+      return NextResponse.json(result)
+    } catch (error) {
+      console.error('ONVM API upload error:', error)
+      return NextResponse.json(
+        { error: error instanceof Error ? error.message : 'Upload failed' },
+        { status: 500 }
+      )
+    }
+  }
+  
   try {
     const body = await request.json()
     const { operation, ...params } = body
-
-    const client = getClient()
 
     switch (operation) {
       case 'executeProgram': {
@@ -36,16 +53,9 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(result)
       }
 
-      case 'uploadBlob': {
-        const uint8Array = new Uint8Array(params.buffer)
-        const result = await client.uploadBlob(uint8Array)
-        return NextResponse.json(result)
-      }
-
       case 'downloadBlob': {
         const buffer = await client.downloadBlob(params.id)
-        const arrayBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
-        return new NextResponse(arrayBuffer, {
+        return new NextResponse(buffer, {
           headers: {
             'Content-Type': 'application/octet-stream',
           },

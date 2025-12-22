@@ -143,7 +143,7 @@ export function ProfileContent() {
       <div className="relative h-48 bg-gradient-to-br from-primary via-accent to-primary overflow-hidden">
         {profile.bannerBlobId ? (
           <img
-            src={`${process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8081"}/blobs/${profile.bannerBlobId}`}
+            src={`/api/onvm/blob/${profile.bannerBlobId}`}
             alt="banner"
             className="absolute inset-0 h-full w-full object-cover"
           />
@@ -157,7 +157,7 @@ export function ProfileContent() {
           <Avatar className="w-32 h-32 border-4 border-background shadow-2xl">
             {profile.avatarBlobId ? (
               <img
-                src={`${process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8081"}/blobs/${profile.avatarBlobId}`}
+                src={`/api/onvm/blob/${profile.avatarBlobId}`}
                 alt="avatar"
                 className="w-full h-full object-cover rounded-full"
               />
@@ -405,7 +405,7 @@ export function ProfileContent() {
                       <Avatar className="w-8 h-8">
                         {u.avatarBlobId ? (
                           <img
-                            src={`${process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8081"}/blobs/${u.avatarBlobId}`}
+                            src={`/api/onvm/blob/${u.avatarBlobId}`}
                             alt={u.username}
                             className="w-full h-full object-cover rounded-full"
                             onError={(e) => {

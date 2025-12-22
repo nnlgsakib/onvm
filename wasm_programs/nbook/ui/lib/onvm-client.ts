@@ -511,12 +511,9 @@ export class NbookONVMClient {
     const response = await fetch(this.apiEndpoint, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/octet-stream',
       },
-      body: JSON.stringify({
-        operation: 'uploadBlob',
-        buffer: Array.from(uint8Array),
-      }),
+      body: uint8Array,
     })
 
     if (!response.ok) {

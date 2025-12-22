@@ -131,7 +131,7 @@ export function PostCard({ post, onUpdate }: PostCardProps) {
         <Avatar className="w-10 h-10 border-2 border-transparent group-hover:border-primary/20 transition-colors">
           {localPost.avatarBlobId ? (
             <img
-              src={`${process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8081"}/blobs/${localPost.avatarBlobId}`}
+              src={`/api/onvm/blob/${localPost.avatarBlobId}`}
               alt={localPost.author}
               className="w-full h-full object-cover rounded-full"
               onError={(e) => {

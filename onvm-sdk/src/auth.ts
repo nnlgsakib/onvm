@@ -157,6 +157,29 @@ export function decryptResponse(
   canonical: string,
   responseNonceHex?: string
 ): string {
+  const plaintext = decryptResponseToBuffer(
+    ciphertextBase64,
+    responseKey,
+    requestNonce,
+    timestamp,
+    canonical,
+    responseNonceHex
+  );
+  return plaintext.toString("utf8");
+}
+
+/**
+ * Decrypt an encrypted response and return the raw bytes.
+ * Useful for binary endpoints like blob downloads.
+ */
+export function decryptResponseToBuffer(
+  ciphertextBase64: string,
+  responseKey: Buffer,
+  requestNonce: string,
+  timestamp: number,
+  canonical: string,
+  responseNonceHex?: string
+): Buffer {
   const ciphertext = Buffer.from(ciphertextBase64, 'base64');
 
   // Use provided nonce or derive it
@@ -181,7 +204,7 @@ export function decryptResponse(
       throw new Error('Decryption failed: authentication tag mismatch');
     }
     
-    return Buffer.from(plaintext).toString('utf8');
+    return Buffer.from(plaintext);
   } catch (error) {
     throw new OnvmAuthError(`Response decryption failed: ${error}`);
   }

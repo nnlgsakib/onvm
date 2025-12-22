@@ -63,7 +63,7 @@ export function RightPanel() {
       <Avatar className="w-10 h-10 border-2 border-transparent group-hover:border-primary/30 transition-colors">
         {user.avatarBlobId ? (
           <img
-            src={`${process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8081"}/blobs/${user.avatarBlobId}`}
+            src={`/api/onvm/blob/${user.avatarBlobId}`}
             alt={user.username}
             className="w-full h-full object-cover rounded-full"
             onError={(e) => {

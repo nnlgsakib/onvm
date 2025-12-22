@@ -84,7 +84,7 @@ export function Sidebar() {
           <Avatar className="w-10 h-10 border-2 border-primary/20 group-hover:border-primary/40 transition-colors">
             {avatarId ? (
               <img
-                src={`${process.env.NEXT_PUBLIC_ONVM_RPC_ENDPOINT || "http://localhost:8081"}/blobs/${avatarId}`}
+                src={`/api/onvm/blob/${avatarId}`}
                 alt={username || "avatar"}
                 className="w-full h-full object-cover rounded-full"
               />

@@ -70,7 +70,9 @@ pub fn verify_sparse_merkle_proof(
 ) -> bool {
     let key_hash = hash_bytes(key);
     let mut node = hash_leaf(&key_hash, &hash_bytes(value));
-    for (depth, sibling) in proof.iter().enumerate() {
+    for (offset, sibling) in proof.iter().enumerate() {
+        // Proof is collected from leaf to root, so walk bits from the least significant upwards.
+        let depth = 255usize.saturating_sub(offset);
         let bit = bit_at(&key_hash, depth);
         node = if bit {
             hash_internal(sibling, &node)

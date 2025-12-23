@@ -2,3 +2,4 @@
 /node*
 # wasm_programs/
 # onvm-sdk/
+plans/

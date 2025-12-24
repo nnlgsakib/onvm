@@ -1,11 +1,5 @@
-mod engine;
-mod execution;
-mod ingestion;
-mod network_handlers;
-mod receipt_verifier;
-mod sync_tasks;
-mod types;
+pub mod core;
 
-pub use engine::DagEngine;
-pub use receipt_verifier::ReceiptVerifier;
-pub use types::{BlobSyncMode, DagConfig, DagId, DagNode, DagRef, Operation};
+pub use core::DagEngine;
+pub use core::ReceiptVerifier;
+pub use core::{BlobSyncMode, DagConfig, DagId, DagNode, DagRef, Operation};

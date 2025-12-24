@@ -1,3 +1,5 @@
+//! Consensus core types (legacy DAG node model).
+
 use crate::types::{ComputeOp, NodeId, Object, ObjectId};
 use serde::{Deserialize, Serialize};
 

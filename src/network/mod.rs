@@ -18,6 +18,8 @@ pub use service::{
 };
 pub use unified_protocol::{
     AggregatedReceiptBundle, BatchChunkRequest, BatchChunkResponse, ChunkRequest, ChunkResponse,
-    ManifestRequest, ManifestResponse, ObjectAnnouncement, ObjectAvailabilityRequest,
-    ObjectAvailabilityResponse, UnifiedProtocolMessage, UnifiedRequest, UnifiedResponse,
+    FinalizedTransitionRequest, FinalizedTransitionResponse, LeaderExecutionRequest,
+    LeaderExecutionResponse, ManifestRequest, ManifestResponse, ObjectAnnouncement,
+    ObjectAvailabilityRequest, ObjectAvailabilityResponse, ProgramHead, StateTransitionProposal,
+    StateTransitionVote, UnifiedProtocolMessage, UnifiedRequest, UnifiedResponse,
 };

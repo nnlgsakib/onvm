@@ -167,26 +167,39 @@ impl ExecutionEngine {
         memory.read(&mut store, out_ptr as usize, &mut buf)?;
         let remaining = store.get_fuel().unwrap_or(0);
         let consumed = self.max_fuel.saturating_sub(remaining);
-        let mut writes: Vec<(Vec<u8>, Vec<u8>)> = store
+        let mut writes: Vec<(Vec<u8>, Option<Vec<u8>>)> = store
             .data()
             .pending_writes
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         writes.sort_by(|a, b| a.0.cmp(&b.0));
-        for (k, v) in &writes {
-            self.state_store
-                .set_scoped(&program_id.0, k, v)
-                .context("state apply")?;
-        }
-        let state_root = self
-            .state_store
-            .root_scoped(&program_id.0)
-            .context("state root")?;
-        let state_writes = writes
-            .into_iter()
-            .map(|(key, value)| StateWrite { key, value })
+
+        let state_writes: Vec<StateWrite> = writes
+            .iter()
+            .map(|(key, value)| StateWrite {
+                key: key.clone(),
+                value: value.clone(),
+            })
             .collect();
+
+        let pairs = self
+            .state_store
+            .get_all_scoped(&program_id.0)
+            .context("state read")?;
+        let mut map: HashMap<Vec<u8>, Vec<u8>> = pairs.into_iter().collect();
+        for (k, entry) in &writes {
+            match entry {
+                Some(v) => {
+                    map.insert(k.clone(), v.clone());
+                }
+                None => {
+                    map.remove(k);
+                }
+            }
+        }
+        let merged: Vec<(Vec<u8>, Vec<u8>)> = map.into_iter().collect();
+        let state_root = crate::merkle::sparse_merkle_root(&merged);
         Ok(ExecutionOutcome {
             program_id: program_id.clone(),
             return_data: buf,

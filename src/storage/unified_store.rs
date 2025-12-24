@@ -18,6 +18,7 @@ impl UnifiedStore {
         db.open_tree("objects")?;
         db.open_tree("manifests")?;
         db.open_tree("chunks")?;
+        db.open_tree("manifest_index")?;
         Ok(Self { db })
     }
 
@@ -152,19 +153,40 @@ impl UnifiedStore {
         let encoded = bincode::serde::encode_to_vec(manifest, bincode::config::standard())?;
         tree.insert(manifest.object_id.0, encoded)?;
         tree.flush()?;
+
+        let index = self.db.open_tree("manifest_index")?;
+        let manifest_id = manifest.id();
+        index.insert(manifest_id.0, &manifest.object_id.0)?;
+        index.flush()?;
         Ok(())
     }
 
     pub fn get_manifest(&self, manifest_id: &ManifestId) -> Result<Option<Manifest>> {
+        let index = self.db.open_tree("manifest_index")?;
+        if let Some(raw) = index.get(manifest_id.0)? {
+            if raw.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&raw);
+                let object_id = ObjectId(arr);
+                if let Some(manifest) = self.get_manifest_by_object(&object_id)? {
+                    return Ok(Some(manifest));
+                }
+            }
+        }
+
+        // Fallback for older databases without index.
         let tree = self.db.open_tree("manifests")?;
         for entry in tree.iter() {
             let (_, v) = entry?;
             let (manifest, _): (Manifest, _) =
                 bincode::serde::decode_from_slice(&v, bincode::config::standard())?;
             if manifest.id() == *manifest_id {
+                index.insert(manifest_id.0, &manifest.object_id.0)?;
+                let _ = index.flush();
                 return Ok(Some(manifest));
             }
         }
+
         Ok(None)
     }
 

@@ -140,6 +140,18 @@ impl JobExecutor {
                         outcome.fuel_consumed
                     ),
                 );
+
+                if !outcome.state_writes.is_empty() {
+                    let state_store = self.engine.state_store();
+                    for write in &outcome.state_writes {
+                        match &write.value {
+                            Some(value) => {
+                                state_store.set_scoped(&job.program_id.0, &write.key, value)?
+                            }
+                            None => state_store.delete_scoped(&job.program_id.0, &write.key)?,
+                        }
+                    }
+                }
             }
             Ok(Err(e)) => {
                 let reason = Self::classify_error(&e);

@@ -2,12 +2,19 @@ use crate::node::{Node, NodeConfig};
 use crate::rpc::start_rpc;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
+use chacha20poly1305::{
+    aead::{Aead, Payload},
+    KeyInit, XChaCha20Poly1305, XNonce,
+};
 use clap::{Parser, Subcommand};
 use futures::{StreamExt, TryStreamExt};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use indicatif::{ProgressBar, ProgressStyle};
 use libp2p::Multiaddr;
 use reqwest::Body;
 use rpassword::prompt_password;
+use sha2::Sha256;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,28 +22,20 @@ use tokio::io::AsyncWriteExt;
 use tokio::signal;
 use tokio_util::io::ReaderStream;
 use tracing_subscriber::EnvFilter;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use hkdf::Hkdf;
-use chacha20poly1305::{
-    aead::{Aead, Payload},
-    XChaCha20Poly1305, KeyInit, XNonce,
-};
 
 fn derive_keys(project_secret: &str) -> Result<([u8; 32], [u8; 32])> {
-    let secret_bytes = hex::decode(project_secret)
-        .context("project_secret must be hex-encoded")?;
+    let secret_bytes = hex::decode(project_secret).context("project_secret must be hex-encoded")?;
     if secret_bytes.len() != 32 {
         anyhow::bail!("project_secret must be 32 bytes (64 hex chars)");
     }
     let mut secret_arr = [0u8; 32];
     secret_arr.copy_from_slice(&secret_bytes);
-    
+
     let hk = Hkdf::<Sha256>::new(None, &secret_arr);
     let mut okm = [0u8; 64];
     hk.expand(b"onvm-rpc-auth", &mut okm)
         .map_err(|_| anyhow::anyhow!("failed to derive keys"))?;
-    
+
     let mut signing_key = [0u8; 32];
     let mut response_key = [0u8; 32];
     signing_key.copy_from_slice(&okm[0..32]);
@@ -72,20 +71,20 @@ fn build_auth_headers(
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as i64;
     let nonce = uuid::Uuid::new_v4().to_string();
-    
+
     let canonical = format!("{} {}\n{}\n{}\n{}", method, path, timestamp, nonce, body);
-    
+
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&signing_key)
         .map_err(|e| anyhow::anyhow!("hmac error: {}", e))?;
     mac.update(canonical.as_bytes());
     let signature = hex::encode(mac.finalize().into_bytes());
-    
+
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("x-project-id", project_id.parse()?);
     headers.insert("x-timestamp", timestamp.to_string().parse()?);
     headers.insert("x-nonce", nonce.clone().parse()?);
     headers.insert("x-signature", signature.parse()?);
-    
+
     Ok(AuthContext {
         headers,
         timestamp,
@@ -103,9 +102,10 @@ fn decrypt_response(
     canonical: &str,
     response_nonce_hex: Option<&str>,
 ) -> Result<String> {
-    let ciphertext = general_purpose::STANDARD.decode(ciphertext_b64)
+    let ciphertext = general_purpose::STANDARD
+        .decode(ciphertext_b64)
         .context("failed to decode base64 response")?;
-    
+
     let response_nonce = if let Some(hex) = response_nonce_hex {
         let bytes = hex::decode(hex).context("failed to decode response nonce hex")?;
         if bytes.len() != 24 {
@@ -117,7 +117,7 @@ fn decrypt_response(
     } else {
         derive_response_nonce(response_key, nonce, timestamp)?
     };
-    
+
     let cipher = XChaCha20Poly1305::new(response_key.into());
     let plaintext = cipher
         .decrypt(
@@ -128,7 +128,7 @@ fn decrypt_response(
             },
         )
         .map_err(|e| anyhow::anyhow!("decryption failed: {}", e))?;
-    
+
     Ok(String::from_utf8(plaintext)?)
 }
 
@@ -420,6 +420,7 @@ pub async fn run() -> Result<()> {
             let identity_path = data_dir.join("identity");
             tokio::fs::create_dir_all(&data_dir).await?;
             let mut identity_passphrase = identity_passphrase;
+            let mut identity_keys: Option<crate::crypto::keys::NodeKeys> = None;
 
             if identity_path.exists() {
                 println!(
@@ -444,13 +445,9 @@ pub async fn run() -> Result<()> {
                     identity_path.display(),
                     keys.node_id
                 );
+                identity_keys = Some(keys);
             }
 
-            let rpc_secret_passphrase = identity_passphrase.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "RPC auth secrets require --identity-passphrase; rerun init with a passphrase"
-                )
-            })?;
             let rpc_secret_path = data_dir.join("rpc_auth.secret");
             let rpc_secret_rel = rpc_secret_path
                 .strip_prefix(&data_dir)
@@ -458,6 +455,11 @@ pub async fn run() -> Result<()> {
                 .to_string_lossy()
                 .to_string();
             if !rpc_secret_path.exists() {
+                let rpc_secret_passphrase = identity_passphrase.clone().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "RPC auth secrets require --identity-passphrase; rerun init with a passphrase"
+                    )
+                })?;
                 let (_, secret_bytes, _) = crate::rpc::auth::generate_project_secret()?;
                 crate::rpc::auth::encrypt_and_write_secret(
                     &rpc_secret_path,
@@ -465,6 +467,34 @@ pub async fn run() -> Result<()> {
                     &secret_bytes,
                 )?;
                 println!("Wrote RPC auth secret to {}", rpc_secret_path.display());
+            }
+
+            let bls_identity_path = data_dir.join("bls_identity");
+            if !bls_identity_path.exists() {
+                if identity_keys.is_none() {
+                    if identity_passphrase.is_none() && !allow_plaintext_identity {
+                        identity_passphrase = Some(prompt_for_passphrase_once()?);
+                    }
+
+                    let keys = crate::crypto::keys::NodeKeys::load_or_generate(
+                        &identity_path,
+                        identity_passphrase.as_deref(),
+                        allow_plaintext_identity,
+                    )
+                    .await?;
+                    identity_keys = Some(keys);
+                }
+
+                let keys = identity_keys
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing identity keys for BLS init"))?;
+                let (_sk, pk) =
+                    crate::crypto::bls::generate_and_store_identity(&data_dir, keys).await?;
+                println!(
+                    "Generated BLS consensus identity at {} (pubkey {})",
+                    bls_identity_path.display(),
+                    hex::encode(pk.0)
+                );
             }
 
             let cfg_path = data_dir.join("config.toml");
@@ -687,7 +717,13 @@ pub async fn run() -> Result<()> {
             println!("project_id={}", pid);
             println!("project_secret={}", secret);
         }
-        Commands::UploadBlob { rpc, file, mime, project_id, project_secret } => {
+        Commands::UploadBlob {
+            rpc,
+            file,
+            mime,
+            project_id,
+            project_secret,
+        } => {
             let metadata = tokio::fs::metadata(&file).await?;
             let total = metadata.len();
             let pb = ProgressBar::new(total);
@@ -697,25 +733,25 @@ pub async fn run() -> Result<()> {
                 )
                 .unwrap(),
             );
-            
+
             let blob_data = std::fs::read(&file)?;
             let body_str = String::from_utf8_lossy(&blob_data).to_string();
-            
+
             let client = reqwest::Client::new();
             let endpoint = normalize_rpc_endpoint(&rpc);
             let mut req = client.post(format!("{endpoint}/blobs"));
-            
+
             if let Some(m) = mime.clone() {
                 req = req.header("x-mime", m);
             }
-            
+
             if let (Some(id), Some(secret)) = (&project_id, &project_secret) {
                 let ctx = build_auth_headers("POST", "/blobs", &body_str, id, secret)?;
                 for (key, value) in ctx.headers.iter() {
                     req = req.header(key, value);
                 }
             }
-            
+
             let f = tokio::fs::File::open(&file).await?;
             let pb_clone = pb.clone();
             let stream = ReaderStream::new(f).inspect_ok(move |chunk| {
@@ -723,18 +759,20 @@ pub async fn run() -> Result<()> {
             });
             let body = Body::wrap_stream(stream);
             req = req.body(body);
-            
+
             let res = req.send().await?;
             pb.finish_and_clear();
             let status = res.status();
             let text = res.text().await?;
-            
+
             if status.is_success() {
                 println!("{}", text);
             } else if status == reqwest::StatusCode::UNAUTHORIZED {
                 eprintln!("Authentication failed: The node requires project credentials.");
                 eprintln!("Please provide --project-id and --project-secret flags.");
-                return Err(anyhow::anyhow!("Unauthorized: Missing or invalid project credentials"));
+                return Err(anyhow::anyhow!(
+                    "Unauthorized: Missing or invalid project credentials"
+                ));
             } else {
                 eprintln!("Blob upload failed with status: {}", status);
                 if !text.is_empty() {
@@ -769,7 +807,7 @@ pub async fn run() -> Result<()> {
                 .post(format!("{endpoint}/programs"))
                 .header("content-type", "application/json")
                 .body(body_str.clone());
-            
+
             let auth_ctx = if let (Some(id), Some(secret)) = (&project_id, &project_secret) {
                 let ctx = build_auth_headers("POST", "/programs", &body_str, id, secret)?;
                 for (key, value) in ctx.headers.iter() {
@@ -779,15 +817,26 @@ pub async fn run() -> Result<()> {
             } else {
                 None
             };
-            
+
             let res = req.send().await?;
             let status = res.status();
-            let response_nonce = res.headers().get("x-response-nonce").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+            let response_nonce = res
+                .headers()
+                .get("x-response-nonce")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             let text = res.text().await?;
-            
+
             let final_text = if let Some(ctx) = auth_ctx {
                 if !text.is_empty() && response_nonce.is_some() {
-                    match decrypt_response(&text, &ctx.response_key, &ctx.nonce, ctx.timestamp, &ctx.canonical, response_nonce.as_deref()) {
+                    match decrypt_response(
+                        &text,
+                        &ctx.response_key,
+                        &ctx.nonce,
+                        ctx.timestamp,
+                        &ctx.canonical,
+                        response_nonce.as_deref(),
+                    ) {
                         Ok(decrypted) => decrypted,
                         Err(e) => {
                             eprintln!("Warning: Failed to decrypt response: {}", e);
@@ -800,14 +849,18 @@ pub async fn run() -> Result<()> {
             } else {
                 text
             };
-            
+
             if status.is_success() {
                 println!("{}", final_text);
             } else if status == reqwest::StatusCode::UNAUTHORIZED {
                 eprintln!("Authentication failed: The node requires project credentials.");
                 eprintln!("Please provide --project-id and --project-secret flags.");
-                eprintln!("Use 'onvm create-project' to generate credentials if you don't have them.");
-                return Err(anyhow::anyhow!("Unauthorized: Missing or invalid project credentials"));
+                eprintln!(
+                    "Use 'onvm create-project' to generate credentials if you don't have them."
+                );
+                return Err(anyhow::anyhow!(
+                    "Unauthorized: Missing or invalid project credentials"
+                ));
             } else {
                 eprintln!("Deploy failed with status: {}", status);
                 if !final_text.is_empty() {
@@ -955,7 +1008,7 @@ pub async fn run() -> Result<()> {
                     .post(format!("{endpoint}/estimate-fuel"))
                     .header("content-type", "application/json")
                     .body(body_str.clone());
-                
+
                 let auth_ctx = if let (Some(id), Some(secret)) = (&project_id, &project_secret) {
                     let ctx = build_auth_headers("POST", "/estimate-fuel", &body_str, id, secret)?;
                     for (key, value) in ctx.headers.iter() {
@@ -965,15 +1018,26 @@ pub async fn run() -> Result<()> {
                 } else {
                     None
                 };
-                
+
                 let res = req.send().await?;
                 let status = res.status();
-                let response_nonce = res.headers().get("x-response-nonce").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+                let response_nonce = res
+                    .headers()
+                    .get("x-response-nonce")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
                 let text = res.text().await?;
-                
+
                 let final_text = if let Some(ctx) = auth_ctx {
                     if !text.is_empty() && response_nonce.is_some() {
-                        match decrypt_response(&text, &ctx.response_key, &ctx.nonce, ctx.timestamp, &ctx.canonical, response_nonce.as_deref()) {
+                        match decrypt_response(
+                            &text,
+                            &ctx.response_key,
+                            &ctx.nonce,
+                            ctx.timestamp,
+                            &ctx.canonical,
+                            response_nonce.as_deref(),
+                        ) {
                             Ok(decrypted) => decrypted,
                             Err(e) => {
                                 eprintln!("Warning: Failed to decrypt response: {}", e);
@@ -986,12 +1050,14 @@ pub async fn run() -> Result<()> {
                 } else {
                     text
                 };
-                
+
                 if !status.is_success() {
                     if status == reqwest::StatusCode::UNAUTHORIZED {
                         eprintln!("Authentication failed: The node requires project credentials.");
                         eprintln!("Please provide --project-id and --project-secret flags.");
-                        return Err(anyhow::anyhow!("Unauthorized: Missing or invalid project credentials"));
+                        return Err(anyhow::anyhow!(
+                            "Unauthorized: Missing or invalid project credentials"
+                        ));
                     } else {
                         eprintln!("Fuel estimation failed with status: {}", status);
                         if !final_text.is_empty() {
@@ -1036,7 +1102,7 @@ pub async fn run() -> Result<()> {
                     .post(format!("{endpoint}/execute"))
                     .header("content-type", "application/json")
                     .body(body_str.clone());
-                
+
                 let auth_ctx = if let (Some(id), Some(secret)) = (&project_id, &project_secret) {
                     let ctx = build_auth_headers("POST", "/execute", &body_str, id, secret)?;
                     for (key, value) in ctx.headers.iter() {
@@ -1046,15 +1112,26 @@ pub async fn run() -> Result<()> {
                 } else {
                     None
                 };
-                
+
                 let res = req.send().await?;
                 let status = res.status();
-                let response_nonce = res.headers().get("x-response-nonce").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+                let response_nonce = res
+                    .headers()
+                    .get("x-response-nonce")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
                 let text = res.text().await?;
-                
+
                 let final_text = if let Some(ctx) = auth_ctx {
                     if !text.is_empty() && response_nonce.is_some() {
-                        match decrypt_response(&text, &ctx.response_key, &ctx.nonce, ctx.timestamp, &ctx.canonical, response_nonce.as_deref()) {
+                        match decrypt_response(
+                            &text,
+                            &ctx.response_key,
+                            &ctx.nonce,
+                            ctx.timestamp,
+                            &ctx.canonical,
+                            response_nonce.as_deref(),
+                        ) {
                             Ok(decrypted) => decrypted,
                             Err(e) => {
                                 eprintln!("Warning: Failed to decrypt response: {}", e);
@@ -1067,12 +1144,14 @@ pub async fn run() -> Result<()> {
                 } else {
                     text
                 };
-                
+
                 if !status.is_success() {
                     if status == reqwest::StatusCode::UNAUTHORIZED {
                         eprintln!("Authentication failed: The node requires project credentials.");
                         eprintln!("Please provide --project-id and --project-secret flags.");
-                        return Err(anyhow::anyhow!("Unauthorized: Missing or invalid project credentials"));
+                        return Err(anyhow::anyhow!(
+                            "Unauthorized: Missing or invalid project credentials"
+                        ));
                     } else {
                         eprintln!("Execution failed with status: {}", status);
                         if !final_text.is_empty() {

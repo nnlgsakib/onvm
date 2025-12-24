@@ -1,4 +1,3 @@
-use crate::crypto::hashing::hash_bytes;
 use crate::storage::{StateStore, UnifiedStore};
 use crate::types::{ObjectId, ProgramId};
 use anyhow::Result;
@@ -16,7 +15,7 @@ pub struct ExecutionContext {
     pub unified_store: Arc<UnifiedStore>,
     pub state_store: Arc<StateStore>,
     pub program_id: ProgramId,
-    pub pending_writes: HashMap<Vec<u8>, Vec<u8>>,
+    pub pending_writes: HashMap<Vec<u8>, Option<Vec<u8>>>,
     pub wasi: wasmtime_wasi::WasiCtx,
 }
 
@@ -171,8 +170,8 @@ pub fn attach_state_host_functions(linker: &mut wasmtime::Linker<ExecutionContex
             {
                 return -2;
             }
-            if caller.data().pending_writes.contains_key(&key_buf) {
-                return 1;
+            if let Some(entry) = caller.data().pending_writes.get(&key_buf) {
+                return if entry.is_some() { 1 } else { 0 };
             }
             let ns = caller.data().program_id.0;
             match caller.data().state_store.get_scoped(&ns, &key_buf) {
@@ -198,8 +197,11 @@ pub fn attach_state_host_functions(linker: &mut wasmtime::Linker<ExecutionContex
             {
                 return -2;
             }
-            if let Some(v) = caller.data().pending_writes.get(&key_buf) {
-                return v.len() as i64;
+            if let Some(entry) = caller.data().pending_writes.get(&key_buf) {
+                return match entry {
+                    Some(v) => v.len() as i64,
+                    None => -1,
+                };
             }
             let ns = caller.data().program_id.0;
             match caller.data().state_store.get_scoped(&ns, &key_buf) {
@@ -225,12 +227,8 @@ pub fn attach_state_host_functions(linker: &mut wasmtime::Linker<ExecutionContex
             {
                 return -2;
             }
-            caller.data_mut().pending_writes.remove(&key_buf);
-            let ns = caller.data().program_id.0;
-            match caller.data().state_store.delete_scoped(&ns, &key_buf) {
-                Ok(_) => 0,
-                Err(_) => -3,
-            }
+            caller.data_mut().pending_writes.insert(key_buf, None);
+            0
         },
     )?;
 
@@ -257,8 +255,8 @@ pub fn attach_state_host_functions(linker: &mut wasmtime::Linker<ExecutionContex
             let ns = caller.data().program_id.0;
 
             let mut keys: HashMap<Vec<u8>, ()> = HashMap::new();
-            for k in caller.data().pending_writes.keys() {
-                if k.starts_with(&prefix) {
+            for (k, entry) in &caller.data().pending_writes {
+                if entry.is_some() && k.starts_with(&prefix) {
                     keys.insert(k.clone(), ());
                 }
             }
@@ -268,6 +266,15 @@ pub fn attach_state_host_functions(linker: &mut wasmtime::Linker<ExecutionContex
             };
             for (k, _) in pairs {
                 if k.starts_with(&prefix) {
+                    if caller
+                        .data()
+                        .pending_writes
+                        .get(&k)
+                        .map(|v| v.is_none())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
                     keys.entry(k).or_insert(());
                 }
             }
@@ -327,7 +334,10 @@ pub fn attach_state_host_functions(linker: &mut wasmtime::Linker<ExecutionContex
             {
                 return -3;
             }
-            caller.data_mut().pending_writes.insert(key_buf, val_buf);
+            caller
+                .data_mut()
+                .pending_writes
+                .insert(key_buf, Some(val_buf));
             0
         },
     )?;
@@ -354,15 +364,20 @@ pub fn attach_state_host_functions(linker: &mut wasmtime::Linker<ExecutionContex
                 return -2;
             }
             // prefer pending writes overlay
-            if let Some(v) = caller.data().pending_writes.get(&key_buf).cloned() {
-                let len = v.len() as i32;
-                if len > out_cap {
-                    return -len;
+            if let Some(entry) = caller.data().pending_writes.get(&key_buf).cloned() {
+                match entry {
+                    Some(v) => {
+                        let len = v.len() as i32;
+                        if len > out_cap {
+                            return -len;
+                        }
+                        if memory.write(&mut caller, out_ptr as usize, &v).is_err() {
+                            return -4;
+                        }
+                        return len;
+                    }
+                    None => return 0,
                 }
-                if memory.write(&mut caller, out_ptr as usize, &v).is_err() {
-                    return -4;
-                }
-                return len;
             }
             let ns = caller.data().program_id.0;
             let val = match caller.data().state_store.get_scoped(&ns, &key_buf) {
@@ -391,34 +406,23 @@ pub fn attach_state_host_functions(linker: &mut wasmtime::Linker<ExecutionContex
                 _ => return -1,
             };
             let ns = caller.data().program_id.0;
-            // include pending writes not yet applied by reading overlay into a temp state root
-            let pairs: Vec<_> = caller
-                .data()
-                .pending_writes
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let root = if pairs.is_empty() {
-                match caller.data().state_store.root_scoped(&ns) {
-                    Ok(r) => r,
-                    Err(_) => return -2,
-                }
-            } else {
-                let mut current = caller
-                    .data()
-                    .state_store
-                    .root_scoped(&ns)
-                    .unwrap_or([0u8; 32]);
-                // simplistic: fold hashes of pending writes into root
-                for (k, v) in pairs {
-                    current = hash_bytes(
-                        [current.as_slice(), k.as_slice(), v.as_slice()]
-                            .concat()
-                            .as_slice(),
-                    );
-                }
-                current
+            let pairs = match caller.data().state_store.get_all_scoped(&ns) {
+                Ok(p) => p,
+                Err(_) => return -2,
             };
+            let mut map: HashMap<Vec<u8>, Vec<u8>> = pairs.into_iter().collect();
+            for (k, entry) in &caller.data().pending_writes {
+                match entry {
+                    Some(v) => {
+                        map.insert(k.clone(), v.clone());
+                    }
+                    None => {
+                        map.remove(k);
+                    }
+                }
+            }
+            let merged: Vec<(Vec<u8>, Vec<u8>)> = map.into_iter().collect();
+            let root = crate::merkle::sparse_merkle_root(&merged);
             if memory.write(&mut caller, out_ptr as usize, &root).is_err() {
                 return -3;
             }
@@ -849,7 +853,7 @@ mod tests {
         assert_eq!(root_res, 0);
         let mut root = [0u8; 32];
         memory.read(&store, 384, &mut root)?;
-        let direct_root = state.root_scoped(&ProgramId([1u8; 32]).0)?;
+        let direct_root = state.sparse_root_scoped(&ProgramId([1u8; 32]).0)?;
         assert_eq!(root, direct_root);
         Ok(())
     }

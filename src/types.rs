@@ -48,6 +48,8 @@ pub struct ProgramManifest {
     pub initial_state_root: StateRoot,
     pub dag_parent: Option<StateRoot>,
     pub timestamp_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committee: Option<CommitteeCertificate>,
     pub signature: Vec<u8>,
 }
 
@@ -79,6 +81,8 @@ pub struct ExecutionCall {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecutionReceipt {
     pub program_id: ProgramId,
+    #[serde(default)]
+    pub height: u64,
     pub state_root_in: StateRoot,
     pub call: ExecutionCall,
     pub inputs_hash: [u8; 32],
@@ -203,7 +207,7 @@ pub struct Chunk {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StateWrite {
     pub key: Vec<u8>,
-    pub value: Vec<u8>,
+    pub value: Option<Vec<u8>>,
 }
 
 /// Legacy compute operation type
@@ -361,7 +365,9 @@ impl NodeId {
 
 impl ProgramManifest {
     pub fn digest(&self) -> [u8; 32] {
-        let encoded = bincode::serde::encode_to_vec(self, bincode::config::standard())
+        let mut tmp = self.clone();
+        tmp.signature.clear();
+        let encoded = bincode::serde::encode_to_vec(&tmp, bincode::config::standard())
             .expect("program manifest encoding should never fail");
         hash_bytes(&encoded)
     }

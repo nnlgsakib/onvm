@@ -1,3 +1,5 @@
+//! Local ingestion helpers (objects, blobs, programs) and related gossip.
+
 use super::DagEngine;
 use crate::crypto::hashing::hash_bytes;
 use crate::network::NetworkMessage;
@@ -119,7 +121,7 @@ impl DagEngine {
         let program_id = ProgramId(object.id.0);
         let initial_state_root = self
             .state_store
-            .root_scoped(&program_id.0)
+            .sparse_root_scoped(&program_id.0)
             .context("computing initial state root")?;
 
         let metadata_hash = {
@@ -146,6 +148,18 @@ impl DagEngine {
             initial_state_root,
             dag_parent: None,
             timestamp_ms,
+            committee: Some(crate::types::CommitteeCertificate {
+                program_id: ProgramId(object.id.0),
+                epoch: 0,
+                members: vec![crate::types::CommitteeMember {
+                    node: self.identity.node_id.clone(),
+                    weight: 1,
+                    bls_public_key: self.bls_public.clone(),
+                }],
+                threshold: 1,
+                aggregate_public_key: self.bls_public.clone(),
+                signature: None,
+            }),
             signature: Vec::new(),
         };
 

@@ -1,6 +1,6 @@
 use crate::types::{
-    AggregatedReceipt, ChunkId, CommitteeCertificate, Manifest, ManifestId, Object, ObjectId,
-    ProgramAnnouncement,
+    AggregatedReceipt, ChunkId, CommitteeCertificate, ExecutionReceipt, Manifest, ManifestId,
+    NodeId, Object, ObjectId, ProgramAnnouncement, ProgramId, ReceiptId, StateWrite,
 };
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,59 @@ pub struct ObjectMetadataResponse {
 pub struct AggregatedReceiptBundle {
     pub receipt: AggregatedReceipt,
     pub committee: CommitteeCertificate,
+    #[serde(default)]
+    pub state_writes: Vec<StateWrite>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateTransitionProposal {
+    pub receipt: ExecutionReceipt,
+    pub committee_epoch: u64,
+    pub state_writes: Vec<StateWrite>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateTransitionVote {
+    pub program_id: ProgramId,
+    pub committee_epoch: u64,
+    pub receipt_id: ReceiptId,
+    pub signer: NodeId,
+    pub signature: crate::crypto::bls::BlsSignature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramHead {
+    pub program_id: ProgramId,
+    pub height: u64,
+    pub state_root: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalizedTransitionRequest {
+    pub program_id: ProgramId,
+    pub height: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalizedTransitionResponse {
+    pub program_id: ProgramId,
+    pub height: u64,
+    pub bundle: Option<AggregatedReceiptBundle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaderExecutionRequest {
+    pub request_id: [u8; 32],
+    pub program_id: ProgramId,
+    pub calldata: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaderExecutionResponse {
+    pub request_id: [u8; 32],
+    pub outcome: Option<crate::wasm_runtime::ExecutionOutcome>,
+    pub redirect: Option<NodeId>,
+    pub error: Option<String>,
 }
 
 /// Unified protocol message for gossipsub
@@ -98,6 +151,9 @@ pub enum UnifiedProtocolMessage {
     ManifestResponse(Manifest),
     ProgramAnnouncement(ProgramAnnouncement),
     AggregatedReceipt(AggregatedReceiptBundle),
+    StateTransitionProposal(StateTransitionProposal),
+    StateTransitionVote(StateTransitionVote),
+    ProgramHead(ProgramHead),
 }
 
 /// Unified request-response protocol
@@ -108,6 +164,8 @@ pub enum UnifiedRequest {
     GetChunks(BatchChunkRequest),
     GetObjectAvailability(ObjectAvailabilityRequest),
     GetObjectMetadata(ObjectMetadataRequest),
+    GetFinalizedTransition(FinalizedTransitionRequest),
+    ExecuteViaLeader(LeaderExecutionRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +175,8 @@ pub enum UnifiedResponse {
     Chunks(BatchChunkResponse),
     ObjectAvailability(ObjectAvailabilityResponse),
     ObjectMetadata(ObjectMetadataResponse),
+    FinalizedTransition(FinalizedTransitionResponse),
+    ExecuteViaLeader(LeaderExecutionResponse),
 }
 
 impl ObjectAnnouncement {

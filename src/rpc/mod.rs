@@ -502,16 +502,39 @@ async fn program_committee(
     let program_id =
         parse_program_id(&id_hex).map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e))?;
 
+    let manifest = ctx
+        .node
+        .program_catalog
+        .get_manifest(&program_id)
+        .map_err(internal_err)?
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                "program not found".to_string(),
+            )
+        })?;
+
+    let committee = manifest.committee.ok_or_else(|| {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            "committee not set for program".to_string(),
+        )
+    })?;
+
     let resp = CommitteeResponse {
-        program_id: hex::encode(program_id.0),
-        epoch: 0,
-        aggregate_public_key: hex::encode(ctx.node.bls_public.0),
-        threshold: 1,
-        members: vec![CommitteeMemberResponse {
-            node: hex::encode(ctx.node.identity.node_id.0),
-            weight: 1,
-            bls_public_key: hex::encode(ctx.node.bls_public.0),
-        }],
+        program_id: hex::encode(committee.program_id.0),
+        epoch: committee.epoch,
+        aggregate_public_key: hex::encode(committee.aggregate_public_key.0),
+        threshold: committee.threshold,
+        members: committee
+            .members
+            .into_iter()
+            .map(|m| CommitteeMemberResponse {
+                node: hex::encode(m.node.0),
+                weight: m.weight,
+                bls_public_key: hex::encode(m.bls_public_key.0),
+            })
+            .collect(),
     };
     Ok(Json(resp))
 }

@@ -71,7 +71,15 @@ impl Node {
             "contract_state",
         )?);
 
-        let (bls_secret, bls_public) = crate::crypto::bls::generate_keypair()?;
+        let (bls_secret, bls_public) =
+            crate::crypto::bls::load_identity(&config.data_dir, &identity)
+                .await
+                .with_context(|| {
+                    format!(
+                    "loading BLS identity (missing `bls_identity` under {}; run `onvm init` first)",
+                    config.data_dir.display()
+                )
+                })?;
 
         let execution_adapter = Arc::new(ExecutionAdapter::new(unified_store.clone()));
 

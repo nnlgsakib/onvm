@@ -30,7 +30,11 @@ struct LivenessResponse {
 async fn liveness(State(ctx): State<Arc<HealthRpcContext>>) -> Json<LivenessResponse> {
     Json(LivenessResponse {
         alive: true,
-        mode: if ctx.dev_mode { "dev".to_string() } else { "prod".to_string() },
+        mode: if ctx.dev_mode {
+            "dev".to_string()
+        } else {
+            "prod".to_string()
+        },
     })
 }
 

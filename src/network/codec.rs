@@ -6,12 +6,65 @@ use ed25519_dalek::{PublicKey as EdPublicKey, Signature as EdSignature};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 pub const TOPIC_BLOBS: &str = "onvm-blobs";
 pub const TOPIC_PROGRAMS: &str = "onvm-programs";
 pub const TOPIC_BLOCKS: &str = "onvm-dag";
 
 pub const TRANSFER_PROTOCOL: &str = "/onvm/transfer/3.0.0";
+pub const HANDSHAKE_PROTOCOL: &str = "/onvm/handshake/1.0.0";
+
+pub fn transfer_codec_fingerprint() -> [u8; 32] {
+    static FINGERPRINT: OnceLock<[u8; 32]> = OnceLock::new();
+    *FINGERPRINT.get_or_init(|| {
+        let mut hasher = blake3::Hasher::new();
+
+        let dummy_program = ProgramId([0u8; 32]);
+        let req = TransferRequest::StateRequest(StateRequest {
+            program_id: dummy_program,
+        });
+        let resp = TransferResponse::Ack;
+
+        match bincode::serde::encode_to_vec(&req, bincode::config::standard()) {
+            Ok(bytes) => {
+                hasher.update(&bytes);
+            }
+            Err(_) => {
+                hasher.update(b"req-encode-error");
+            }
+        }
+        match bincode::serde::encode_to_vec(&resp, bincode::config::standard()) {
+            Ok(bytes) => {
+                hasher.update(&bytes);
+            }
+            Err(_) => {
+                hasher.update(b"resp-encode-error");
+            }
+        }
+
+        let hash = hasher.finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(hash.as_bytes());
+        out
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandshakeRequest {
+    pub node_version: String,
+    pub transfer_protocol: String,
+    pub transfer_codec_fingerprint: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandshakeResponse {
+    pub ok: bool,
+    pub node_version: String,
+    pub transfer_protocol: String,
+    pub transfer_codec_fingerprint: [u8; 32],
+    pub message: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ProviderKind {

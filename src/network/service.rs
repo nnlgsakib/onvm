@@ -1,8 +1,9 @@
 use crate::crypto::keys::NodeKeys;
 use crate::network::codec::{
-    sign_network_message, verify_signed_message, NetworkMessage, ProviderKind,
-    SignedNetworkMessage, TransferRequest, TransferResponse, TOPIC_BLOBS, TOPIC_BLOCKS,
-    TOPIC_PROGRAMS, TRANSFER_PROTOCOL,
+    sign_network_message, transfer_codec_fingerprint, verify_signed_message, HandshakeRequest,
+    HandshakeResponse, NetworkMessage, ProviderKind, SignedNetworkMessage, TransferRequest,
+    TransferResponse, HANDSHAKE_PROTOCOL, TOPIC_BLOBS, TOPIC_BLOCKS, TOPIC_PROGRAMS,
+    TRANSFER_PROTOCOL,
 };
 use anyhow::{anyhow, Context, Result};
 use blake3;
@@ -20,7 +21,7 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::yamux;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -116,6 +117,7 @@ struct Behaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
     kademlia: Kademlia<MemoryStore>,
+    handshake: cbor::Behaviour<HandshakeRequest, HandshakeResponse>,
     transfer: cbor::Behaviour<TransferRequest, TransferResponse>,
 }
 
@@ -167,6 +169,15 @@ impl NetworkService {
 
         let kademlia = crate::network::dht::build_kademlia(peer_id);
 
+        let handshake_protocol = StreamProtocol::new(HANDSHAKE_PROTOCOL);
+        let handshake_config = libp2p::request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(10))
+            .with_max_concurrent_streams(config.max_inbound_streams);
+        let handshake = cbor::Behaviour::new(
+            std::iter::once((handshake_protocol, ProtocolSupport::Full)),
+            handshake_config,
+        );
+
         let transfer_protocol = StreamProtocol::new(TRANSFER_PROTOCOL);
         let transfer_config = libp2p::request_response::Config::default()
             .with_request_timeout(Duration::from_secs(60))
@@ -179,6 +190,7 @@ impl NetworkService {
             gossipsub,
             mdns,
             kademlia,
+            handshake,
             transfer,
         };
 
@@ -227,6 +239,15 @@ impl NetworkService {
         let signing_keys = identity.clone();
 
         tokio::spawn(async move {
+            let mut handshake_pending: HashMap<
+                libp2p::request_response::OutboundRequestId,
+                PeerId,
+            > = HashMap::new();
+            let mut handshake_inflight: HashSet<PeerId> = HashSet::new();
+            let mut transfer_ready: HashSet<PeerId> = HashSet::new();
+            let mut transfer_blocked: HashSet<PeerId> = HashSet::new();
+            let mut transfer_buffer: HashMap<PeerId, VecDeque<TransferJob>> = HashMap::new();
+
             loop {
                 tokio::select! {
                     swarm_event = swarm.select_next_some() => {
@@ -304,13 +325,169 @@ impl NetworkService {
                                 swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
                                 let _ = swarm.behaviour_mut().kademlia.bootstrap();
 
+                                if !handshake_inflight.contains(&peer_id) && !transfer_blocked.contains(&peer_id) {
+                                    let req = HandshakeRequest {
+                                        node_version: env!("CARGO_PKG_VERSION").to_string(),
+                                        transfer_protocol: TRANSFER_PROTOCOL.to_string(),
+                                        transfer_codec_fingerprint: transfer_codec_fingerprint(),
+                                    };
+                                    let req_id = swarm
+                                        .behaviour_mut()
+                                        .handshake
+                                        .send_request(&peer_id, req);
+                                    handshake_pending.insert(req_id, peer_id);
+                                    handshake_inflight.insert(peer_id);
+                                    tracing::debug!("sent handshake request {:?} to {}", req_id, peer_id);
+                                }
+
                                 let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
                             }
                             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                                 tracing::warn!("disconnected from peer {}", peer_id);
                                 peers_clone.write().await.remove(&peer_id);
+                                handshake_inflight.remove(&peer_id);
+                                handshake_pending.retain(|_, peer| *peer != peer_id);
+                                transfer_ready.remove(&peer_id);
+                                transfer_blocked.remove(&peer_id);
+                                transfer_buffer.remove(&peer_id);
                                 let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
                             }
+                            SwarmEvent::Behaviour(BehaviourEvent::Handshake(event)) => match event {
+                                libp2p::request_response::Event::Message { peer, message } => match message {
+                                    libp2p::request_response::Message::Request { request, channel, .. } => {
+                                        let local_fp = transfer_codec_fingerprint();
+                                        let ok = request.transfer_protocol == TRANSFER_PROTOCOL
+                                            && request.transfer_codec_fingerprint == local_fp;
+                                        let message = if ok {
+                                            None
+                                        } else {
+                                            Some(format!(
+                                                "transfer mismatch: expected proto={} fp={}",
+                                                TRANSFER_PROTOCOL,
+                                                hex::encode(local_fp)
+                                            ))
+                                        };
+
+                                        let response = HandshakeResponse {
+                                            ok,
+                                            node_version: env!("CARGO_PKG_VERSION").to_string(),
+                                            transfer_protocol: TRANSFER_PROTOCOL.to_string(),
+                                            transfer_codec_fingerprint: local_fp,
+                                            message,
+                                        };
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .handshake
+                                            .send_response(channel, response);
+
+                                        if ok {
+                                            transfer_blocked.remove(&peer);
+                                            transfer_ready.insert(peer);
+                                            if let Some(mut queued) = transfer_buffer.remove(&peer) {
+                                                while let Some(job) = queued.pop_front() {
+                                                    let req_id = swarm
+                                                        .behaviour_mut()
+                                                        .transfer
+                                                        .send_request(&job.peer, job.req);
+                                                    tracing::debug!(
+                                                        "sent buffered transfer request {:?} to {}",
+                                                        req_id,
+                                                        job.peer
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            transfer_ready.remove(&peer);
+                                            transfer_blocked.insert(peer);
+                                            transfer_buffer.remove(&peer);
+                                        }
+                                    }
+                                    libp2p::request_response::Message::Response { response, request_id } => {
+                                        let Some(peer) = handshake_pending.remove(&request_id) else {
+                                            continue;
+                                        };
+                                        handshake_inflight.remove(&peer);
+
+                                        if !response.ok {
+                                            tracing::warn!(
+                                                "handshake rejected by {}: {}",
+                                                peer,
+                                                response.message.as_deref().unwrap_or("no details")
+                                            );
+                                            transfer_ready.remove(&peer);
+                                            transfer_blocked.insert(peer);
+                                            transfer_buffer.remove(&peer);
+                                            continue;
+                                        }
+
+                                        let local_fp = transfer_codec_fingerprint();
+                                        if response.transfer_protocol != TRANSFER_PROTOCOL
+                                            || response.transfer_codec_fingerprint != local_fp
+                                        {
+                                            tracing::warn!(
+                                                "handshake mismatch with {}: remote proto={} fp={} (local proto={} fp={})",
+                                                peer,
+                                                response.transfer_protocol,
+                                                hex::encode(response.transfer_codec_fingerprint),
+                                                TRANSFER_PROTOCOL,
+                                                hex::encode(local_fp)
+                                            );
+                                            transfer_ready.remove(&peer);
+                                            transfer_blocked.insert(peer);
+                                            transfer_buffer.remove(&peer);
+                                            continue;
+                                        }
+
+                                        transfer_blocked.remove(&peer);
+                                        transfer_ready.insert(peer);
+
+                                        if let Some(mut queued) = transfer_buffer.remove(&peer) {
+                                            while let Some(job) = queued.pop_front() {
+                                                let req_id = swarm
+                                                    .behaviour_mut()
+                                                    .transfer
+                                                    .send_request(&job.peer, job.req);
+                                                tracing::debug!(
+                                                    "sent buffered transfer request {:?} to {}",
+                                                    req_id,
+                                                    job.peer
+                                                );
+                                            }
+                                        }
+                                    }
+                                },
+                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
+                                    handshake_pending.remove(&request_id);
+                                    handshake_inflight.remove(&peer);
+                                    if matches!(error, libp2p::request_response::OutboundFailure::UnsupportedProtocols) {
+                                        tracing::debug!(
+                                            "handshake unsupported by {} ({}): {:?}",
+                                            peer,
+                                            HANDSHAKE_PROTOCOL,
+                                            request_id
+                                        );
+                                    } else {
+                                        tracing::debug!(
+                                            "handshake outbound failure to {}: {error:?} ({:?})",
+                                            peer,
+                                            request_id
+                                        );
+                                    }
+                                    transfer_ready.remove(&peer);
+                                    transfer_blocked.insert(peer);
+                                    transfer_buffer.remove(&peer);
+                                }
+                                libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
+                                    tracing::debug!(
+                                        "handshake inbound failure from {}: {error:?} ({:?})",
+                                        peer,
+                                        request_id
+                                    );
+                                }
+                                libp2p::request_response::Event::ResponseSent { peer, request_id } => {
+                                    tracing::trace!("handshake response sent to {} ({:?})", peer, request_id);
+                                }
+                            },
                             SwarmEvent::Behaviour(BehaviourEvent::Transfer(event)) => match event {
                                 libp2p::request_response::Event::Message { peer, message } => {
                                     match message {
@@ -341,6 +518,9 @@ impl NetworkService {
                                                 TRANSFER_PROTOCOL,
                                                 request_id
                                             );
+                                            transfer_ready.remove(&peer);
+                                            transfer_blocked.insert(peer);
+                                            transfer_buffer.remove(&peer);
                                         }
                                         _ => {
                                             tracing::warn!(
@@ -370,6 +550,9 @@ impl NetworkService {
                                                 TRANSFER_PROTOCOL,
                                                 request_id
                                             );
+                                            transfer_ready.remove(&peer);
+                                            transfer_blocked.insert(peer);
+                                            transfer_buffer.remove(&peer);
                                         }
                                         _ => {
                                             tracing::warn!(
@@ -399,6 +582,18 @@ impl NetworkService {
                         }
                     }
                     Some(job) = transfer_rx.recv() => {
+                        if transfer_blocked.contains(&job.peer) {
+                            tracing::debug!("dropping transfer request to blocked peer {}", job.peer);
+                            continue;
+                        }
+                        if !transfer_ready.contains(&job.peer) {
+                            let queue = transfer_buffer.entry(job.peer).or_default();
+                            if queue.len() >= 64 {
+                                queue.pop_front();
+                            }
+                            queue.push_back(job);
+                            continue;
+                        }
                         let req_id = swarm.behaviour_mut().transfer.send_request(&job.peer, job.req);
                         tracing::debug!("sent transfer request {:?} to {}", req_id, job.peer);
                     }

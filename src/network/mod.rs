@@ -8,10 +8,11 @@ pub mod unified_protocol;
 pub use chunk_distributor::ChunkDistributor;
 pub use codec::{
     sign_network_message, verify_signed_message, BlobAdvertisement, BlobBroadcast,
-    BlobInventoryEntry, BlobRequest, BloomFilter, DagInventory, ExecutionBroadcast, NetworkMessage,
-    ProgramBroadcast, ProgramSyncRequest, ProviderKind, SignedNetworkMessage, StateRequest,
-    StateResponse, StateSyncMessage, SyncDelta, SyncSnapshot, TransferRequest, TransferResponse,
-    TOPIC_BLOBS, TOPIC_BLOCKS, TOPIC_PROGRAMS, TRANSFER_PROTOCOL,
+    BlobInventoryEntry, BlobRequest, BloomFilter, DagInventory, ExecutionBroadcast,
+    HandshakeRequest, HandshakeResponse, NetworkMessage, ProgramBroadcast, ProgramSyncRequest,
+    ProviderKind, SignedNetworkMessage, StateRequest, StateResponse, StateSyncMessage, SyncDelta,
+    SyncSnapshot, TransferRequest, TransferResponse, HANDSHAKE_PROTOCOL, TOPIC_BLOBS, TOPIC_BLOCKS,
+    TOPIC_PROGRAMS, TRANSFER_PROTOCOL,
 };
 pub use coordination::{
     BalancingStrategy, CapabilityAdvertiser, CoordinationManager, CoordinationTask,

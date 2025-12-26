@@ -57,6 +57,7 @@ pub struct DagEngine {
     pub(super) pending_leader_execs:
         Arc<RwLock<HashMap<[u8; 32], tokio::sync::oneshot::Sender<LeaderForwardResponse>>>>,
     pub(super) program_locks: Arc<RwLock<HashMap<ProgramId, Arc<tokio::sync::Mutex<()>>>>>,
+    pub(super) last_broadcast_heads: Arc<RwLock<HashMap<ProgramId, (u64, [u8; 32])>>>,
 }
 
 pub(super) struct PendingTransition {
@@ -118,6 +119,7 @@ impl DagEngine {
             finalized_transition_store,
             pending_leader_execs: Arc::new(RwLock::new(HashMap::new())),
             program_locks: Arc::new(RwLock::new(HashMap::new())),
+            last_broadcast_heads: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 

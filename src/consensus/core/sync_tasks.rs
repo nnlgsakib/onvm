@@ -17,6 +17,7 @@ impl DagEngine {
 
     async fn broadcast_program_heads(&self) -> Result<()> {
         let manifests = self.program_catalog.list_manifests()?;
+        let mut cache = self.last_broadcast_heads.write().await;
         for manifest in manifests {
             let (height, state_root) = if let Some(commitment) = self
                 .program_catalog
@@ -26,6 +27,14 @@ impl DagEngine {
             } else {
                 (0, manifest.initial_state_root)
             };
+
+            if cache
+                .get(&manifest.program_id)
+                .is_some_and(|(h, r)| *h == height && *r == state_root)
+            {
+                continue;
+            }
+            cache.insert(manifest.program_id.clone(), (height, state_root));
 
             let head = crate::network::unified_protocol::ProgramHead {
                 program_id: manifest.program_id,

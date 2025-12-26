@@ -229,6 +229,17 @@ pub enum Commands {
         identity_passphrase: String,
         #[arg(long, help = "Optional project id to reuse; random if omitted")]
         project_id: Option<String>,
+        #[arg(long, help = "Optional project secret (hex) to import; random if omitted")]
+        project_secret: Option<String>,
+    },
+    /// Verify project credentials against a node's RPC auth
+    AuthCheck {
+        #[arg(long, default_value = "127.0.0.1:8080", alias = "rpc")]
+        rpc: String,
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        project_secret: String,
     },
     /// Run a full ONVM node (network + consensus + RPC)
     RunNode {
@@ -687,11 +698,13 @@ pub async fn run() -> Result<()> {
             rpc,
             identity_passphrase,
             project_id,
+            project_secret,
         } => {
             let endpoint = normalize_rpc_endpoint(&rpc);
             let body = serde_json::json!({
                 "identity_passphrase": identity_passphrase,
                 "project_id": project_id,
+                "project_secret": project_secret,
             });
             let client = reqwest::Client::new();
             let res = client
@@ -721,6 +734,32 @@ pub async fn run() -> Result<()> {
                 .unwrap_or_default();
             println!("project_id={}", pid);
             println!("project_secret={}", secret);
+        }
+        Commands::AuthCheck {
+            rpc,
+            project_id,
+            project_secret,
+        } => {
+            let endpoint = normalize_rpc_endpoint(&rpc);
+            let client = reqwest::Client::new();
+            let body_str = "";
+            let auth_ctx = build_auth_headers("GET", "/health", body_str, &project_id, &project_secret)?;
+            let mut req = client.get(format!("{endpoint}/health"));
+            for (key, value) in auth_ctx.headers.iter() {
+                req = req.header(key, value);
+            }
+            let res = req.send().await?;
+            let status = res.status();
+            let text = res.text().await.unwrap_or_default();
+            if status.is_success() {
+                println!("ok");
+            } else {
+                eprintln!("auth check failed: HTTP {}", status);
+                if !text.is_empty() {
+                    eprintln!("Server response: {}", text);
+                }
+                return Err(anyhow::anyhow!("auth check failed"));
+            }
         }
         Commands::UploadBlob {
             rpc,
@@ -773,8 +812,10 @@ pub async fn run() -> Result<()> {
             if status.is_success() {
                 println!("{}", text);
             } else if status == reqwest::StatusCode::UNAUTHORIZED {
-                eprintln!("Authentication failed: The node requires project credentials.");
-                eprintln!("Please provide --project-id and --project-secret flags.");
+                eprintln!("Authentication failed (401 Unauthorized).");
+                eprintln!("Check that:");
+                eprintln!("- --project-id/--project-secret are correct");
+                eprintln!("- the project is registered on this node (run `onvm generate-project --rpc ... --identity-passphrase ... --project-id ... --project-secret ...` to import)");
                 return Err(anyhow::anyhow!(
                     "Unauthorized: Missing or invalid project credentials"
                 ));
@@ -858,11 +899,10 @@ pub async fn run() -> Result<()> {
             if status.is_success() {
                 println!("{}", final_text);
             } else if status == reqwest::StatusCode::UNAUTHORIZED {
-                eprintln!("Authentication failed: The node requires project credentials.");
-                eprintln!("Please provide --project-id and --project-secret flags.");
-                eprintln!(
-                    "Use 'onvm create-project' to generate credentials if you don't have them."
-                );
+                eprintln!("Authentication failed (401 Unauthorized).");
+                eprintln!("Check that:");
+                eprintln!("- --project-id/--project-secret are correct");
+                eprintln!("- the project is registered on this node (run `onvm generate-project --rpc ... --identity-passphrase ... --project-id ... --project-secret ...` to import)");
                 return Err(anyhow::anyhow!(
                     "Unauthorized: Missing or invalid project credentials"
                 ));

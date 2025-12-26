@@ -37,6 +37,14 @@ impl AuthStore {
         Ok(secret)
     }
 
+    pub fn upsert_project_secret(&self, project_id: &str, secret: [u8; 32]) -> Result<()> {
+        let tree = self.db.open_tree(STORE_TREE)?;
+        let enc = self.encrypt(&secret)?;
+        tree.insert(project_id.as_bytes(), enc)?;
+        tree.flush()?;
+        Ok(())
+    }
+
     pub fn load_all(&self) -> Result<HashMap<String, [u8; 32]>> {
         let tree = self.db.open_tree(STORE_TREE)?;
         let mut out = HashMap::new();

@@ -25,7 +25,7 @@ use rand_core::OsRng;
 use rand_core::RngCore;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::warn;
 use zeroize::Zeroize;
 
@@ -64,7 +64,7 @@ pub struct AuthConfig {
 #[derive(Clone)]
 pub struct AuthState {
     pub config: AuthConfig,
-    keys: HashMap<String, DerivedKeys>,
+    keys: Arc<RwLock<HashMap<String, DerivedKeys>>>,
     replay_cache: Arc<Mutex<NonceCache>>,
     rate_limiter: Option<Arc<Mutex<TokenBucket>>>,
 }
@@ -114,9 +114,17 @@ impl AuthState {
                 config.nonce_ttl,
             ))),
             config,
-            keys: map,
+            keys: Arc::new(RwLock::new(map)),
             rate_limiter: limiter,
         })
+    }
+
+    pub async fn upsert_project(&self, project_id: &str, mut secret: [u8; 32]) -> Result<()> {
+        let keys = derive_keys(&secret, project_id)?;
+        secret.zeroize();
+        let mut map = self.keys.write().await;
+        map.insert(project_id.to_string(), keys);
+        Ok(())
     }
 }
 
@@ -154,7 +162,7 @@ pub fn encrypt_project_secret(master_password: &str, secret: &[u8]) -> Result<St
 }
 
 pub async fn verify_signed_request(
-    State(state): State<AuthState>,
+    State(state): State<Arc<AuthState>>,
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
@@ -168,7 +176,8 @@ pub async fn verify_signed_request(
 
     let headers = req.headers();
     let project_id = header(headers, HDR_PROJECT_ID)?;
-    let Some(project_keys) = state.keys.get(&project_id) else {
+    let project_keys = { state.keys.read().await.get(&project_id).cloned() };
+    let Some(project_keys) = project_keys else {
         warn!("rpc auth: project_id mismatch");
         return Err(StatusCode::UNAUTHORIZED);
     };

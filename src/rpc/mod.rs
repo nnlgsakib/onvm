@@ -39,6 +39,7 @@ pub struct RpcContext {
     pub node: Arc<Node>,
     pub data_dir: PathBuf,
     pub rpc_auth: RpcAuthConfig,
+    pub auth_state: Option<Arc<crate::rpc::auth::AuthState>>,
 }
 
 #[derive(Serialize)]
@@ -157,6 +158,7 @@ struct StateProofQuery {
 struct CreateProjectRequest {
     identity_passphrase: String,
     project_id: Option<String>,
+    project_secret: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -172,12 +174,13 @@ pub async fn start_rpc(
     data_dir: PathBuf,
     identity_passphrase: Option<String>,
 ) -> Result<RpcServer> {
-    let auth_state =
-        auth::AuthState::from_config(&rpc_auth, &data_dir, identity_passphrase.as_deref())?;
+    let auth_state = auth::AuthState::from_config(&rpc_auth, &data_dir, identity_passphrase.as_deref())?
+        .map(Arc::new);
     let ctx = RpcContext {
         node: node.clone(),
         data_dir: data_dir.clone(),
         rpc_auth: rpc_auth.clone(),
+        auth_state: auth_state.clone(),
     };
 
     let db = node.db.clone();
@@ -263,7 +266,7 @@ pub async fn start_rpc(
         .merge(job_routes().with_state(job_ctx.clone()))
         .with_state(ctx.clone());
 
-    let protected = if let Some(state) = auth_state {
+    let protected = if let Some(state) = auth_state.clone() {
         info!("RPC auth enabled for project {}", state.config.project_id);
         protected.layer(from_fn_with_state(state, auth::verify_signed_request))
     } else {
@@ -668,9 +671,28 @@ async fn create_project(
             .map(|(id, _, _)| id)
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
-    let secret = store
-        .ensure_project(&project_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let secret = if let Some(secret_hex) = req.project_secret {
+        let bytes = hex::decode(secret_hex).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        if bytes.len() != 32 {
+            return Err((StatusCode::BAD_REQUEST, "project_secret must be 32 bytes hex".into()));
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&bytes);
+        store
+            .upsert_project_secret(&project_id, secret)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        secret
+    } else {
+        store
+            .ensure_project(&project_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+    if let Some(auth_state) = &ctx.auth_state {
+        auth_state
+            .upsert_project(&project_id, secret)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
     Ok(Json(CreateProjectResponse {
         project_id,
         project_secret: hex::encode(secret),

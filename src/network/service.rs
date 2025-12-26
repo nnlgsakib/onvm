@@ -478,15 +478,8 @@ impl NetworkService {
         } else {
             Toggle::from(None)
         };
-        let store = MemoryStore::new(peer_id);
 
-        let mut kad_config = libp2p::kad::Config::default();
-        kad_config
-            .set_provider_record_ttl(Some(Duration::from_secs(3600)))
-            .set_provider_publication_interval(Some(Duration::from_secs(600)));
-
-        let mut kademlia = Kademlia::with_config(peer_id, store, kad_config);
-        kademlia.set_mode(Some(libp2p::kad::Mode::Server));
+        let kademlia = crate::network::dht::build_kademlia(peer_id);
 
         let transfer_protocol = StreamProtocol::new("/onvm/transfer/1.0.0");
         let transfer_config = libp2p::request_response::Config::default()

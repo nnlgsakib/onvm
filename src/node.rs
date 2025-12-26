@@ -177,6 +177,9 @@ impl Node {
                 let _ = syncer
                     .await_initial_sync(std::time::Duration::from_secs(30))
                     .await;
+                syncer
+                    .run_status_logger(std::time::Duration::from_secs(10))
+                    .await;
             })
         };
 

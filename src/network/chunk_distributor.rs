@@ -1,3 +1,4 @@
+use crate::network::dht;
 use crate::network::unified_protocol::{ChunkRequest, ObjectAnnouncement};
 use crate::network::{NetworkHandle, ProviderKind};
 use crate::storage::UnifiedStore;
@@ -7,6 +8,7 @@ use libp2p::PeerId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::time::Instant;
 use tokio::time::{interval, Duration};
 
 const MAX_CONCURRENT_CHUNK_FETCHES: usize = 16;
@@ -126,21 +128,31 @@ impl ChunkDistributor {
             tracing::info!("no providers in map, querying DHT for object {}", object_id);
             self.network.find_providers(&object_id.0, kind);
 
-            for i in 0..5 {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-
+            let deadline = Instant::now() + dht::FIND_PROVIDERS_MAX_WAIT;
+            loop {
                 let provider_map = self.provider_map.read().await;
                 if provider_map
                     .get(object_id)
                     .map(|s| !s.is_empty())
                     .unwrap_or(false)
                 {
-                    tracing::info!("DHT returned providers after {} seconds", i + 1);
+                    tracing::info!("DHT returned providers for {}", object_id);
                     return;
                 }
+
+                if Instant::now() >= deadline {
+                    break;
+                }
+
+                drop(provider_map);
+                tokio::time::sleep(dht::FIND_PROVIDERS_POLL_INTERVAL).await;
             }
 
-            tracing::warn!("no DHT providers found after 5 seconds");
+            tracing::warn!(
+                "no DHT providers found for {} after {:?}",
+                object_id,
+                dht::FIND_PROVIDERS_MAX_WAIT
+            );
         }
     }
 
@@ -151,7 +163,16 @@ impl ChunkDistributor {
     ) -> Result<crate::types::Object> {
         self.network.find_providers(&object_id.0, kind);
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        let deadline = Instant::now() + dht::FIND_PROVIDERS_MAX_WAIT;
+        loop {
+            if !self.get_providers_for_object(object_id).await.is_empty() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(dht::FIND_PROVIDERS_POLL_INTERVAL).await;
+        }
 
         let providers = self.get_providers_for_object(object_id).await;
 
@@ -266,12 +287,20 @@ impl ChunkDistributor {
     ) -> Result<crate::types::Manifest> {
         self.network.find_providers(&object_id.0, kind);
 
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        let providers = self.get_providers_for_object(object_id).await;
+        let deadline = Instant::now() + dht::FIND_PROVIDERS_MAX_WAIT;
+        let providers = loop {
+            let providers = self.get_providers_for_object(object_id).await;
+            if !providers.is_empty() {
+                break providers;
+            }
+            if Instant::now() >= deadline {
+                break providers;
+            }
+            tokio::time::sleep(dht::FIND_PROVIDERS_POLL_INTERVAL).await;
+        };
 
         if providers.is_empty() {
-            tracing::warn!("no DHT providers for manifest, trying gossipsub broadcast");
+            tracing::info!("no DHT providers for manifest yet, trying gossipsub broadcast");
             return self.fetch_manifest_from_any_peer(object_id).await;
         }
 
@@ -279,6 +308,7 @@ impl ChunkDistributor {
             match self.request_manifest_from_peer(provider, object_id).await {
                 Ok(manifest) => {
                     self.store.store_manifest(&manifest)?;
+                    self.network.provide(&object_id.0);
                     return Ok(manifest);
                 }
                 Err(e) => {
@@ -312,6 +342,7 @@ impl ChunkDistributor {
 
             if let Some(manifest) = self.store.get_manifest_by_object(object_id)? {
                 tracing::info!("received manifest after {} attempts", i + 1);
+                self.network.provide(&object_id.0);
                 return Ok(manifest);
             }
         }

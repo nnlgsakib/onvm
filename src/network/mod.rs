@@ -1,5 +1,6 @@
 mod chunk_distributor;
 pub mod coordination;
+pub mod dht;
 mod service;
 pub mod unified_protocol;
 

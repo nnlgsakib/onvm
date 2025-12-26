@@ -16,7 +16,7 @@ impl DagEngine {
         mut events: mpsc::UnboundedReceiver<crate::network::NetworkEvent>,
     ) {
         let mut tick = interval(Duration::from_secs(5));
-        let mut dht_announce_tick = interval(Duration::from_secs(300));
+        let mut dht_announce_tick = interval(crate::network::dht::ANNOUNCE_INTERVAL);
 
         loop {
             tokio::select! {
@@ -42,15 +42,22 @@ impl DagEngine {
     async fn periodic_dht_announce(&self) -> Result<()> {
         let objects = self.unified_store.list_objects()?;
 
-        tracing::info!("announcing {} objects to DHT", objects.len());
+        let mut announced = 0usize;
 
         for object in objects {
-            if self.unified_store.is_complete(&object.id).unwrap_or(false) {
+            if self
+                .unified_store
+                .get_manifest_by_object(&object.id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
                 self.network.provide(&object.id.0);
-                tracing::debug!("announced object {} to DHT", object.id);
+                announced += 1;
             }
         }
 
+        tracing::debug!("announced {} objects to DHT", announced);
         Ok(())
     }
 
@@ -59,6 +66,11 @@ impl DagEngine {
             crate::network::NetworkEvent::PeerConnected(peer_id) => {
                 self.peers.write().await.insert(peer_id);
                 tracing::info!("peer connected: {}", peer_id);
+                let engine = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(crate::network::dht::ANNOUNCE_AFTER_CONNECT_DELAY).await;
+                    let _ = engine.periodic_dht_announce().await;
+                });
             }
             crate::network::NetworkEvent::PeerDisconnected(peer_id) => {
                 self.peers.write().await.remove(&peer_id);
@@ -95,11 +107,11 @@ impl DagEngine {
             let object_id = crate::types::ObjectId(object_id_bytes);
 
             if peers.is_empty() {
-                tracing::warn!("DHT query for {} returned 0 providers", object_id);
+                tracing::debug!("DHT query for {} returned 0 providers", object_id);
                 return Ok(());
             }
 
-            tracing::info!(
+            tracing::debug!(
                 "DHT found {} providers for object {}: {:?}",
                 peers.len(),
                 object_id,
@@ -114,7 +126,7 @@ impl DagEngine {
                     entry.insert(peer);
                 }
 
-                tracing::info!("added {} providers for object {}", entry.len(), object_id);
+                tracing::debug!("added {} providers for object {}", entry.len(), object_id);
             }
         }
         Ok(())
@@ -132,6 +144,7 @@ impl DagEngine {
                         if let Some(manifest) = manifest_resp.manifest {
                             tracing::info!("received manifest for object {}", manifest.object_id);
                             let _ = self.unified_store.store_manifest(&manifest);
+                            self.network.provide(&manifest.object_id.0);
                         }
                     }
                     UnifiedResponse::Chunk(chunk_resp) => {

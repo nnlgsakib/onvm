@@ -10,6 +10,7 @@ use blake3;
 use futures::StreamExt;
 use libp2p::gossipsub::{self, IdentTopic as Topic};
 use libp2p::identity as libp2p_identity;
+use libp2p::identify;
 use libp2p::kad::{
     store::MemoryStore, Behaviour as Kademlia, Event as KademliaEvent, QueryId, QueryResult,
     RecordKey,
@@ -17,6 +18,7 @@ use libp2p::kad::{
 use libp2p::mdns;
 use libp2p::noise;
 use libp2p::request_response::{cbor, ProtocolSupport, ResponseChannel};
+use libp2p::core::ConnectedPoint;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::yamux;
@@ -25,6 +27,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::{interval, Instant};
+
+#[derive(Debug, Clone)]
+struct RedialState {
+    next_attempt_at: Instant,
+    attempts: u32,
+}
 #[derive(Debug)]
 pub enum NetworkEvent {
     Inbound(PeerId, NetworkMessage),
@@ -90,9 +99,14 @@ pub struct NetworkConfig {
     pub enable_mdns: bool,
     pub require_encryption: bool,
     pub max_inbound_connections: usize,
+    pub max_total_connections: usize,
+    pub max_connections_per_peer: usize,
     pub max_inbound_streams: usize,
     pub max_gossip_bytes: usize,
     pub bootnodes: Vec<Multiaddr>,
+    pub pex: crate::config::PexConfig,
+    pub keep_alive: crate::config::KeepAliveConfig,
+    pub memory_throttle: crate::config::MemoryThrottleConfig,
 }
 
 enum KadCommand {
@@ -116,12 +130,73 @@ struct TransferResponseJob {
 struct Behaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: Toggle<mdns::tokio::Behaviour>,
+    identify: identify::Behaviour,
     kademlia: Kademlia<MemoryStore>,
     handshake: cbor::Behaviour<HandshakeRequest, HandshakeResponse>,
+    pex: cbor::Behaviour<crate::network::pex::PexRequest, crate::network::pex::PexResponse>,
+    ping_png: cbor::Behaviour<
+        crate::network::ping_png::PingRequest,
+        crate::network::ping_png::PongResponse,
+    >,
     transfer: cbor::Behaviour<TransferRequest, TransferResponse>,
 }
 
 pub struct NetworkService;
+
+fn peer_id_from_multiaddr(addr: &Multiaddr) -> Option<PeerId> {
+    for proto in addr.iter() {
+        if let libp2p::multiaddr::Protocol::P2p(peer) = proto {
+            return Some(peer);
+        }
+    }
+    None
+}
+
+fn strip_p2p_component(addr: &Multiaddr) -> Multiaddr {
+    let mut out = addr.clone();
+    if let Some(last) = out.pop() {
+        if matches!(last, libp2p::multiaddr::Protocol::P2p(_)) {
+            return out;
+        }
+        out.push(last);
+    }
+    out
+}
+
+fn ensure_p2p_component(mut addr: Multiaddr, peer: &PeerId) -> Multiaddr {
+    let has_p2p = addr
+        .iter()
+        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_)));
+    if !has_p2p {
+        addr.push(libp2p::multiaddr::Protocol::P2p((*peer).into()));
+    }
+    addr
+}
+
+fn dial_peer_best_effort(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    peer: PeerId,
+    known_addrs: &HashMap<PeerId, HashSet<Multiaddr>>,
+) -> bool {
+    if let Some(addrs) = known_addrs.get(&peer) {
+        for addr in addrs.iter().take(4) {
+            let dial_addr = ensure_p2p_component(addr.clone(), &peer);
+            match swarm.dial(dial_addr) {
+                Ok(_) => return true,
+                Err(err) => {
+                    tracing::debug!("dial {} via addr failed: {}", peer, err);
+                }
+            }
+        }
+    }
+    match swarm.dial(peer) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::debug!("dial {} by peer id failed: {}", peer, err);
+            false
+        }
+    }
+}
 
 impl NetworkService {
     pub async fn start(identity: &NodeKeys, config: NetworkConfig) -> Result<NetworkStreams> {
@@ -167,6 +242,13 @@ impl NetworkService {
             Toggle::from(None)
         };
 
+        let identify = identify::Behaviour::new(
+            identify::Config::new("onvm/1.0.0".to_string(), local_key.public())
+                .with_agent_version(format!("onvm/{}", env!("CARGO_PKG_VERSION")))
+                .with_push_listen_addr_updates(true)
+                .with_cache_size(1024),
+        );
+
         let kademlia = crate::network::dht::build_kademlia(peer_id);
 
         let handshake_protocol = StreamProtocol::new(HANDSHAKE_PROTOCOL);
@@ -176,6 +258,26 @@ impl NetworkService {
         let handshake = cbor::Behaviour::new(
             std::iter::once((handshake_protocol, ProtocolSupport::Full)),
             handshake_config,
+        );
+
+        let pex_protocol = StreamProtocol::new(crate::network::pex::PEX_PROTOCOL);
+        let pex_config = libp2p::request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(10))
+            .with_max_concurrent_streams(config.max_inbound_streams);
+        let pex = cbor::Behaviour::new(
+            std::iter::once((pex_protocol, ProtocolSupport::Full)),
+            pex_config,
+        );
+
+        let ping_protocol = StreamProtocol::new(crate::network::ping_png::PING_PROTOCOL);
+        let ping_config = libp2p::request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(
+                config.keep_alive.ping_timeout_secs.max(1),
+            ))
+            .with_max_concurrent_streams(config.max_inbound_streams);
+        let ping_png = cbor::Behaviour::new(
+            std::iter::once((ping_protocol, ProtocolSupport::Full)),
+            ping_config,
         );
 
         let transfer_protocol = StreamProtocol::new(TRANSFER_PROTOCOL);
@@ -189,8 +291,11 @@ impl NetworkService {
         let behaviour = Behaviour {
             gossipsub,
             mdns,
+            identify,
             kademlia,
             handshake,
+            pex,
+            ping_png,
             transfer,
         };
 
@@ -237,6 +342,14 @@ impl NetworkService {
         let peers_shared = Arc::new(RwLock::new(HashSet::new()));
         let peers_clone = Arc::clone(&peers_shared);
         let signing_keys = identity.clone();
+        let pex_cfg = config.pex.clone();
+        let keep_alive_cfg = config.keep_alive.clone();
+        let mem_cfg = config.memory_throttle.clone();
+        let max_total_connections = config.max_total_connections.max(1);
+        let max_connections_per_peer = config.max_connections_per_peer.max(1);
+        let max_inbound_connections = config.max_inbound_connections.max(1);
+
+        let bootnodes = config.bootnodes.clone();
 
         tokio::spawn(async move {
             let mut handshake_pending: HashMap<
@@ -247,9 +360,118 @@ impl NetworkService {
             let mut transfer_ready: HashSet<PeerId> = HashSet::new();
             let mut transfer_blocked: HashSet<PeerId> = HashSet::new();
             let mut transfer_buffer: HashMap<PeerId, VecDeque<TransferJob>> = HashMap::new();
+            let mut redial: HashMap<PeerId, RedialState> = HashMap::new();
+            let mut redial_tick = interval(Duration::from_secs(2));
+            let mut total_connections: usize = 0;
+            let mut inbound_connections: usize = 0;
+            let mut counted_connections: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
+            let mut counted_inbound: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
+
+            let mut sys = sysinfo::System::new();
+            let mut memory_pressure = false;
+            let mut mem_tick = interval(Duration::from_secs(5));
+
+            let pex_policy = crate::network::pex::PexPolicy {
+                max_peers_per_response: pex_cfg.max_peers_shared,
+                max_addrs_per_peer: pex_cfg.max_addrs_per_peer,
+                allow_private_addrs: pex_cfg.allow_private_addrs,
+                allow_loopback_addrs: pex_cfg.allow_loopback_addrs,
+            };
+            let mut known_addrs: HashMap<PeerId, HashSet<Multiaddr>> = HashMap::new();
+            known_addrs.insert(peer_id, HashSet::new());
+            for addr in &bootnodes {
+                if let Some(peer) = peer_id_from_multiaddr(addr) {
+                    let base = strip_p2p_component(addr);
+                    known_addrs.entry(peer).or_default().insert(base.clone());
+                    swarm.behaviour_mut().kademlia.add_address(&peer, base);
+                }
+            }
+            let mut pex_tick = interval(Duration::from_secs(pex_cfg.request_interval_secs.max(1)));
+            let mut pex_pending: HashMap<libp2p::request_response::OutboundRequestId, PeerId> =
+                HashMap::new();
+
+            let mut ping_tick = interval(Duration::from_secs(
+                keep_alive_cfg.ping_interval_secs.max(1),
+            ));
+            let mut ping_pending: HashMap<libp2p::request_response::OutboundRequestId, PeerId> =
+                HashMap::new();
+            let mut ping_inflight: HashSet<PeerId> = HashSet::new();
+            let mut ping_failures: HashMap<PeerId, u32> = HashMap::new();
 
             loop {
                 tokio::select! {
+                    _ = mem_tick.tick() => {
+                        if mem_cfg.enable {
+                            sys.refresh_memory();
+                            let avail_mb = sys.available_memory() / 1024 / 1024;
+                            let new_pressure = avail_mb < mem_cfg.min_available_mb;
+                            if new_pressure != memory_pressure {
+                                memory_pressure = new_pressure;
+                                if memory_pressure {
+                                    tracing::warn!(
+                                        "memory pressure: available={}MB below threshold {}MB; throttling connections",
+                                        avail_mb,
+                                        mem_cfg.min_available_mb
+                                    );
+                                } else {
+                                    tracing::info!("memory pressure cleared: available={}MB", avail_mb);
+                                }
+                            }
+                        }
+                    }
+                    _ = ping_tick.tick() => {
+                        if keep_alive_cfg.enable {
+                            let peers: Vec<PeerId> = peers_clone.read().await.iter().copied().collect();
+                            for peer in peers {
+                                if ping_inflight.contains(&peer) {
+                                    continue;
+                                }
+                                let ping = crate::network::ping_png::new_ping();
+                                let req_id = swarm.behaviour_mut().ping_png.send_request(&peer, ping);
+                                ping_pending.insert(req_id, peer);
+                                ping_inflight.insert(peer);
+                            }
+                        }
+                    }
+                    _ = pex_tick.tick() => {
+                        if pex_cfg.enable {
+                            let peer_count = peers_clone.read().await.len();
+                            if peer_count < pex_cfg.target_peers && !memory_pressure {
+                                let peers: Vec<PeerId> = peers_clone.read().await.iter().copied().collect();
+                                for peer in peers.into_iter().take(3) {
+                                    let req = crate::network::pex::PexRequest { want: pex_cfg.want_peers as u32 };
+                                    let req_id = swarm.behaviour_mut().pex.send_request(&peer, req);
+                                    pex_pending.insert(req_id, peer);
+                                }
+                            }
+                        }
+                    }
+                    _ = redial_tick.tick() => {
+                        let now = Instant::now();
+                        let mut remove: Vec<PeerId> = Vec::new();
+                        for (peer, state) in redial.iter_mut() {
+                            if now < state.next_attempt_at {
+                                continue;
+                            }
+
+                            if state.attempts >= 20 {
+                                remove.push(*peer);
+                                continue;
+                            }
+
+                            state.attempts = state.attempts.saturating_add(1);
+                            let backoff_secs = 1u64 << state.attempts.min(5);
+                            let backoff = Duration::from_secs(backoff_secs.min(30));
+                            state.next_attempt_at = now + backoff;
+
+                            if dial_peer_best_effort(&mut swarm, *peer, &known_addrs) {
+                                tracing::debug!("redial attempt {} to {}", state.attempts, peer);
+                            }
+                        }
+                        for peer in remove {
+                            redial.remove(&peer);
+                        }
+                    }
                     swarm_event = swarm.select_next_some() => {
                         match swarm_event {
                             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(ev)) => {
@@ -312,20 +534,127 @@ impl NetworkService {
                                     }
                                 }
                             },
+                            SwarmEvent::Behaviour(BehaviourEvent::Identify(ev)) => match ev {
+                                identify::Event::Received { peer_id: remote, info, .. }
+                                | identify::Event::Pushed { peer_id: remote, info, .. } => {
+                                    let mut addrs = info.listen_addrs;
+                                    addrs.push(info.observed_addr);
+                                    let validated = match crate::network::pex::validate_peer_addrs(
+                                        &remote,
+                                        &addrs,
+                                        &pex_policy,
+                                    ) {
+                                        Ok(v) => v,
+                                        Err(err) => {
+                                            tracing::debug!(
+                                                "identify produced invalid addrs for {}: {}",
+                                                remote,
+                                                err
+                                            );
+                                            Vec::new()
+                                        }
+                                    };
+                                    if !validated.is_empty() {
+                                        let entry = known_addrs.entry(remote).or_default();
+                                        for addr in validated {
+                                            entry.insert(addr.clone());
+                                            swarm.behaviour_mut().kademlia.add_address(&remote, addr);
+                                        }
+                                    }
+                                }
+                                identify::Event::Error { peer_id: remote, error, .. } => {
+                                    tracing::debug!("identify error from {}: {error:?}", remote);
+                                }
+                                identify::Event::Sent { .. } => {}
+                            },
                             SwarmEvent::NewListenAddr { address, .. } => {
                                 let mut addr_with_peer = address.clone();
                                 addr_with_peer.push(libp2p::multiaddr::Protocol::P2p(peer_id.into()));
                                 tracing::info!("listening on {}", addr_with_peer);
+                                known_addrs
+                                    .entry(peer_id)
+                                    .or_default()
+                                    .insert(address.clone());
                                 let _ = event_tx.send(NetworkEvent::Listening(addr_with_peer));
                             }
-                            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                                tracing::info!("connected to peer {} at {:?}", peer_id, endpoint.get_remote_address());
-                                peers_clone.write().await.insert(peer_id);
+                            SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
+                                let inbound = matches!(endpoint, ConnectedPoint::Listener { .. });
+                                let effective_max_total = if mem_cfg.enable && memory_pressure {
+                                    mem_cfg.max_total_connections_under_pressure
+                                } else {
+                                    max_total_connections
+                                }
+                                .max(1);
 
-                                swarm.behaviour_mut().kademlia.add_address(&peer_id, endpoint.get_remote_address().clone());
+                                if inbound && inbound_connections >= max_inbound_connections {
+                                    tracing::warn!(
+                                        "dropping inbound connection from {}: inbound limit reached ({}/{})",
+                                        peer_id,
+                                        inbound_connections,
+                                        max_inbound_connections
+                                    );
+                                    let _ = swarm.close_connection(connection_id);
+                                    continue;
+                                }
+                                if total_connections >= effective_max_total {
+                                    tracing::warn!(
+                                        "dropping connection from {}: global connection limit reached ({}/{})",
+                                        peer_id,
+                                        total_connections,
+                                        effective_max_total
+                                    );
+                                    let _ = swarm.close_connection(connection_id);
+                                    continue;
+                                }
+                                let established_to_peer = num_established.get();
+                                if established_to_peer as usize > max_connections_per_peer {
+                                    tracing::warn!(
+                                        "dropping extra connection to {}: per-peer limit reached ({}/{})",
+                                        peer_id,
+                                        established_to_peer,
+                                        max_connections_per_peer
+                                    );
+                                    let _ = swarm.close_connection(connection_id);
+                                    continue;
+                                }
+
+                                counted_connections.insert(connection_id);
+                                total_connections = total_connections.saturating_add(1);
+                                if inbound {
+                                    counted_inbound.insert(connection_id);
+                                    inbound_connections = inbound_connections.saturating_add(1);
+                                }
+
+                                tracing::info!(
+                                    "connected to peer {} at {:?} (peer_conns={} total_conns={})",
+                                    peer_id,
+                                    endpoint.get_remote_address(),
+                                    established_to_peer,
+                                    total_connections
+                                );
+
+                                known_addrs
+                                    .entry(peer_id)
+                                    .or_default()
+                                    .insert(endpoint.get_remote_address().clone());
+
+                                redial.remove(&peer_id);
+
+                                if established_to_peer == 1 {
+                                    peers_clone.write().await.insert(peer_id);
+                                    let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
+                                }
+
+                                swarm
+                                    .behaviour_mut()
+                                    .kademlia
+                                    .add_address(&peer_id, endpoint.get_remote_address().clone());
                                 let _ = swarm.behaviour_mut().kademlia.bootstrap();
 
-                                if !handshake_inflight.contains(&peer_id) && !transfer_blocked.contains(&peer_id) {
+                                if !transfer_ready.contains(&peer_id)
+                                    && !handshake_inflight.contains(&peer_id)
+                                    && !transfer_blocked.contains(&peer_id)
+                                {
                                     let req = HandshakeRequest {
                                         node_version: env!("CARGO_PKG_VERSION").to_string(),
                                         transfer_protocol: TRANSFER_PROTOCOL.to_string(),
@@ -337,21 +666,160 @@ impl NetworkService {
                                         .send_request(&peer_id, req);
                                     handshake_pending.insert(req_id, peer_id);
                                     handshake_inflight.insert(peer_id);
-                                    tracing::debug!("sent handshake request {:?} to {}", req_id, peer_id);
+                                    tracing::debug!(
+                                        "sent handshake request {:?} to {}",
+                                        req_id,
+                                        peer_id
+                                    );
+                                }
+                            }
+                            SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint: _endpoint, num_established, cause, .. } => {
+                                if counted_connections.remove(&connection_id) {
+                                    total_connections = total_connections.saturating_sub(1);
+                                }
+                                if counted_inbound.remove(&connection_id) {
+                                    inbound_connections = inbound_connections.saturating_sub(1);
                                 }
 
-                                let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
+                                if let Some(cause) = &cause {
+                                    tracing::warn!(
+                                        "connection closed with peer {} (remaining_connections={} total_conns={}): {}",
+                                        peer_id,
+                                        num_established,
+                                        total_connections,
+                                        cause
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "connection closed with peer {} (remaining_connections={} total_conns={})",
+                                        peer_id,
+                                        num_established,
+                                        total_connections
+                                    );
+                                }
+
+                                if num_established == 0 {
+                                    peers_clone.write().await.remove(&peer_id);
+                                    handshake_inflight.remove(&peer_id);
+                                    handshake_pending.retain(|_, peer| *peer != peer_id);
+                                    transfer_ready.remove(&peer_id);
+                                    transfer_blocked.remove(&peer_id);
+                                    transfer_buffer.remove(&peer_id);
+                                    ping_inflight.remove(&peer_id);
+                                    ping_failures.remove(&peer_id);
+                                    ping_pending.retain(|_, peer| *peer != peer_id);
+
+                                    redial.entry(peer_id).or_insert(RedialState {
+                                        next_attempt_at: Instant::now() + Duration::from_millis(250),
+                                        attempts: 0,
+                                    });
+
+                                    let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
+                                } else if !transfer_ready.contains(&peer_id)
+                                    && !transfer_blocked.contains(&peer_id)
+                                {
+                                    // If we still have a connection but handshake was on the closed one, allow resending.
+                                    handshake_inflight.remove(&peer_id);
+                                    handshake_pending.retain(|_, peer| *peer != peer_id);
+                                }
                             }
-                            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                                tracing::warn!("disconnected from peer {}", peer_id);
-                                peers_clone.write().await.remove(&peer_id);
-                                handshake_inflight.remove(&peer_id);
-                                handshake_pending.retain(|_, peer| *peer != peer_id);
-                                transfer_ready.remove(&peer_id);
-                                transfer_blocked.remove(&peer_id);
-                                transfer_buffer.remove(&peer_id);
-                                let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
-                            }
+                            SwarmEvent::Behaviour(BehaviourEvent::Pex(event)) => match event {
+                                libp2p::request_response::Event::Message { peer: _, message } => match message {
+                                    libp2p::request_response::Message::Request { request, channel, .. } => {
+                                        let response = crate::network::pex::build_response(
+                                            &known_addrs,
+                                            &pex_policy,
+                                            request.want as usize,
+                                            peer_id,
+                                        );
+                                        let _ = swarm.behaviour_mut().pex.send_response(channel, response);
+                                    }
+                                    libp2p::request_response::Message::Response { response, request_id } => {
+                                        let _ = pex_pending.remove(&request_id);
+                                        let discovered = crate::network::pex::parse_response(
+                                            response,
+                                            &pex_policy,
+                                            peer_id,
+                                        );
+                                        if discovered.is_empty() {
+                                            continue;
+                                        }
+
+                                        let effective_max_total = if mem_cfg.enable && memory_pressure {
+                                            mem_cfg.max_total_connections_under_pressure
+                                        } else {
+                                            max_total_connections
+                                        }
+                                        .max(1);
+
+                                        for (pid, addrs) in discovered {
+                                            let entry = known_addrs.entry(pid).or_default();
+                                            for addr in addrs {
+                                                entry.insert(addr.clone());
+                                                swarm.behaviour_mut().kademlia.add_address(&pid, addr);
+                                            }
+
+                                            if memory_pressure || total_connections >= effective_max_total {
+                                                continue;
+                                            }
+
+                                            let connected = peers_clone.read().await.contains(&pid);
+                                            if connected {
+                                                continue;
+                                            }
+
+                                            // Prefer dialing by PeerId after adding addresses to the swarm's address book.
+                                            if redial.contains_key(&pid) {
+                                                continue;
+                                            }
+                                            if dial_peer_best_effort(&mut swarm, pid, &known_addrs) {
+                                                tracing::debug!("PEX dialing discovered peer {}", pid);
+                                            }
+                                        }
+                                    }
+                                },
+                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
+                                    pex_pending.remove(&request_id);
+                                    tracing::debug!("PEX outbound failure to {}: {error:?} ({:?})", peer, request_id);
+                                }
+                                libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
+                                    tracing::debug!("PEX inbound failure from {}: {error:?} ({:?})", peer, request_id);
+                                }
+                                libp2p::request_response::Event::ResponseSent { .. } => {}
+                            },
+                            SwarmEvent::Behaviour(BehaviourEvent::PingPng(event)) => match event {
+                                libp2p::request_response::Event::Message { peer: _, message } => match message {
+                                    libp2p::request_response::Message::Request { request, channel, .. } => {
+                                        let pong = crate::network::ping_png::PongResponse {
+                                            nonce: request.nonce,
+                                            received_at_ms: crate::network::ping_png::now_ms(),
+                                        };
+                                        let _ = swarm.behaviour_mut().ping_png.send_response(channel, pong);
+                                    }
+                                    libp2p::request_response::Message::Response { response: _response, request_id } => {
+                                        let Some(peer) = ping_pending.remove(&request_id) else {
+                                            continue;
+                                        };
+                                        ping_inflight.remove(&peer);
+                                        ping_failures.remove(&peer);
+                                    }
+                                },
+                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
+                                    ping_pending.remove(&request_id);
+                                    ping_inflight.remove(&peer);
+                                    let failures = ping_failures.entry(peer).or_insert(0);
+                                    *failures = failures.saturating_add(1);
+                                    tracing::debug!("ping outbound failure to {}: {error:?} ({:?})", peer, request_id);
+                                    if *failures >= keep_alive_cfg.max_failures {
+                                        tracing::warn!("ping failure threshold reached for {}; disconnecting", peer);
+                                        let _ = swarm.disconnect_peer_id(peer);
+                                    }
+                                }
+                                libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
+                                    tracing::debug!("ping inbound failure from {}: {error:?} ({:?})", peer, request_id);
+                                }
+                                libp2p::request_response::Event::ResponseSent { .. } => {}
+                            },
                             SwarmEvent::Behaviour(BehaviourEvent::Handshake(event)) => match event {
                                 libp2p::request_response::Event::Message { peer, message } => match message {
                                     libp2p::request_response::Message::Request { request, channel, .. } => {

@@ -276,7 +276,7 @@ impl BloomFilter {
         let mut salt = [0u8; 32];
         OsRng.fill_bytes(&mut salt);
         Self {
-            bits: vec![0u8; size_bytes],
+            bits: vec![0u8; size_bytes.max(1)],
             k,
             salt,
         }
@@ -304,16 +304,24 @@ impl BloomFilter {
     }
 
     fn set_bit(&mut self, hash: &[u8]) {
-        let idx =
-            (u64::from_le_bytes(hash[0..8].try_into().unwrap()) as usize) % (self.bits.len() * 8);
+        let Some(prefix) = hash.get(..8) else {
+            return;
+        };
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(prefix);
+        let idx = (u64::from_le_bytes(bytes) as usize) % (self.bits.len() * 8);
         let byte = idx / 8;
         let bit = idx % 8;
         self.bits[byte] |= 1 << bit;
     }
 
     fn get_bit(&self, hash: &[u8]) -> bool {
-        let idx =
-            (u64::from_le_bytes(hash[0..8].try_into().unwrap()) as usize) % (self.bits.len() * 8);
+        let Some(prefix) = hash.get(..8) else {
+            return false;
+        };
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(prefix);
+        let idx = (u64::from_le_bytes(bytes) as usize) % (self.bits.len() * 8);
         let byte = idx / 8;
         let bit = idx % 8;
         (self.bits[byte] & (1 << bit)) != 0

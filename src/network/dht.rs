@@ -16,6 +16,8 @@ pub fn build_kademlia(peer_id: PeerId) -> Kademlia<MemoryStore> {
     let store = MemoryStore::new(peer_id);
     let mut kad_config = KadConfig::default();
     kad_config
+        .disjoint_query_paths(true)
+        .set_query_timeout(Duration::from_secs(60))
         .set_provider_record_ttl(Some(PROVIDER_RECORD_TTL))
         .set_provider_publication_interval(Some(PROVIDER_PUBLICATION_INTERVAL));
     let mut kademlia = Kademlia::with_config(peer_id, store, kad_config);

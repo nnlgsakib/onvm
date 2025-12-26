@@ -29,6 +29,52 @@ pub struct NetworkConfig {
     pub max_inbound_streams: usize,
     /// Maximum gossipsub message size in bytes.
     pub max_gossip_bytes: usize,
+    /// Maximum established connections (inbound + outbound).
+    pub max_total_connections: usize,
+    /// Maximum concurrent connections to the same peer.
+    pub max_connections_per_peer: usize,
+    /// Peer exchange (PEX) settings.
+    pub pex: PexConfig,
+    /// Connection keep-alive (ping/pong) settings.
+    pub keep_alive: KeepAliveConfig,
+    /// Memory-based throttling settings.
+    pub memory_throttle: MemoryThrottleConfig,
+}
+
+#[derive(Clone, Debug)]
+pub struct PexConfig {
+    pub enable: bool,
+    /// How often to request peers from connected peers.
+    pub request_interval_secs: u64,
+    /// Target connected peer count.
+    pub target_peers: usize,
+    /// Max peers to request per round-trip.
+    pub want_peers: usize,
+    /// Max peers to include in responses.
+    pub max_peers_shared: usize,
+    /// Max addresses per peer in responses.
+    pub max_addrs_per_peer: usize,
+    /// Allow private (RFC1918 / ULA) addresses from peers.
+    pub allow_private_addrs: bool,
+    /// Allow loopback addresses from peers.
+    pub allow_loopback_addrs: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct KeepAliveConfig {
+    pub enable: bool,
+    pub ping_interval_secs: u64,
+    pub ping_timeout_secs: u64,
+    pub max_failures: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MemoryThrottleConfig {
+    pub enable: bool,
+    /// If available memory drops below this, throttle new connections/dials.
+    pub min_available_mb: u64,
+    /// Max total connections when under memory pressure.
+    pub max_total_connections_under_pressure: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +156,87 @@ impl OnvmConfig {
             "max_gossip_bytes".into(),
             toml::Value::Integer(self.network.max_gossip_bytes as i64),
         );
+        network.insert(
+            "max_total_connections".into(),
+            toml::Value::Integer(self.network.max_total_connections as i64),
+        );
+        network.insert(
+            "max_connections_per_peer".into(),
+            toml::Value::Integer(self.network.max_connections_per_peer as i64),
+        );
+
+        let mut pex = toml::map::Map::new();
+        pex.insert(
+            "enable".into(),
+            toml::Value::Boolean(self.network.pex.enable),
+        );
+        pex.insert(
+            "request_interval_secs".into(),
+            toml::Value::Integer(self.network.pex.request_interval_secs as i64),
+        );
+        pex.insert(
+            "target_peers".into(),
+            toml::Value::Integer(self.network.pex.target_peers as i64),
+        );
+        pex.insert(
+            "want_peers".into(),
+            toml::Value::Integer(self.network.pex.want_peers as i64),
+        );
+        pex.insert(
+            "max_peers_shared".into(),
+            toml::Value::Integer(self.network.pex.max_peers_shared as i64),
+        );
+        pex.insert(
+            "max_addrs_per_peer".into(),
+            toml::Value::Integer(self.network.pex.max_addrs_per_peer as i64),
+        );
+        pex.insert(
+            "allow_private_addrs".into(),
+            toml::Value::Boolean(self.network.pex.allow_private_addrs),
+        );
+        pex.insert(
+            "allow_loopback_addrs".into(),
+            toml::Value::Boolean(self.network.pex.allow_loopback_addrs),
+        );
+        network.insert("pex".into(), toml::Value::Table(pex));
+
+        let mut keep_alive = toml::map::Map::new();
+        keep_alive.insert(
+            "enable".into(),
+            toml::Value::Boolean(self.network.keep_alive.enable),
+        );
+        keep_alive.insert(
+            "ping_interval_secs".into(),
+            toml::Value::Integer(self.network.keep_alive.ping_interval_secs as i64),
+        );
+        keep_alive.insert(
+            "ping_timeout_secs".into(),
+            toml::Value::Integer(self.network.keep_alive.ping_timeout_secs as i64),
+        );
+        keep_alive.insert(
+            "max_failures".into(),
+            toml::Value::Integer(self.network.keep_alive.max_failures as i64),
+        );
+        network.insert("keep_alive".into(), toml::Value::Table(keep_alive));
+
+        let mut mem = toml::map::Map::new();
+        mem.insert(
+            "enable".into(),
+            toml::Value::Boolean(self.network.memory_throttle.enable),
+        );
+        mem.insert(
+            "min_available_mb".into(),
+            toml::Value::Integer(self.network.memory_throttle.min_available_mb as i64),
+        );
+        mem.insert(
+            "max_total_connections_under_pressure".into(),
+            toml::Value::Integer(
+                self.network
+                    .memory_throttle
+                    .max_total_connections_under_pressure as i64,
+            ),
+        );
+        network.insert("memory_throttle".into(), toml::Value::Table(mem));
         root.insert("network".into(), toml::Value::Table(network));
 
         let mut rpc_auth = toml::map::Map::new();
@@ -210,6 +337,29 @@ impl Default for OnvmConfig {
                 max_inbound_connections: 200,
                 max_inbound_streams: 64,
                 max_gossip_bytes: 256 * 1024,
+                max_total_connections: 256,
+                max_connections_per_peer: 2,
+                pex: PexConfig {
+                    enable: true,
+                    request_interval_secs: 20,
+                    target_peers: 24,
+                    want_peers: 32,
+                    max_peers_shared: 128,
+                    max_addrs_per_peer: 8,
+                    allow_private_addrs: true,
+                    allow_loopback_addrs: false,
+                },
+                keep_alive: KeepAliveConfig {
+                    enable: true,
+                    ping_interval_secs: 15,
+                    ping_timeout_secs: 10,
+                    max_failures: 3,
+                },
+                memory_throttle: MemoryThrottleConfig {
+                    enable: true,
+                    min_available_mb: 512,
+                    max_total_connections_under_pressure: 64,
+                },
             },
             rpc_auth: RpcAuthConfig {
                 enable: false,
@@ -283,6 +433,86 @@ impl OnvmConfig {
         }
         if let Some(max_gossip) = network.get("max_gossip_bytes").and_then(|v| v.as_integer()) {
             cfg.network.max_gossip_bytes = max_gossip as usize;
+        }
+        if let Some(max_total) = network
+            .get("max_total_connections")
+            .and_then(|v| v.as_integer())
+        {
+            cfg.network.max_total_connections = max_total as usize;
+        }
+        if let Some(max_per_peer) = network
+            .get("max_connections_per_peer")
+            .and_then(|v| v.as_integer())
+        {
+            cfg.network.max_connections_per_peer = max_per_peer as usize;
+        }
+
+        if let Some(pex) = network.get("pex") {
+            if let Some(enable) = pex.get("enable").and_then(|v| v.as_bool()) {
+                cfg.network.pex.enable = enable;
+            }
+            if let Some(v) = pex
+                .get("request_interval_secs")
+                .and_then(|v| v.as_integer())
+            {
+                cfg.network.pex.request_interval_secs = v as u64;
+            }
+            if let Some(v) = pex.get("target_peers").and_then(|v| v.as_integer()) {
+                cfg.network.pex.target_peers = v as usize;
+            }
+            if let Some(v) = pex.get("want_peers").and_then(|v| v.as_integer()) {
+                cfg.network.pex.want_peers = v as usize;
+            }
+            if let Some(v) = pex.get("max_peers_shared").and_then(|v| v.as_integer()) {
+                cfg.network.pex.max_peers_shared = v as usize;
+            }
+            if let Some(v) = pex.get("max_addrs_per_peer").and_then(|v| v.as_integer()) {
+                cfg.network.pex.max_addrs_per_peer = v as usize;
+            }
+            if let Some(v) = pex.get("allow_private_addrs").and_then(|v| v.as_bool()) {
+                cfg.network.pex.allow_private_addrs = v;
+            }
+            if let Some(v) = pex.get("allow_loopback_addrs").and_then(|v| v.as_bool()) {
+                cfg.network.pex.allow_loopback_addrs = v;
+            }
+        }
+
+        if let Some(keep_alive) = network.get("keep_alive") {
+            if let Some(enable) = keep_alive.get("enable").and_then(|v| v.as_bool()) {
+                cfg.network.keep_alive.enable = enable;
+            }
+            if let Some(v) = keep_alive
+                .get("ping_interval_secs")
+                .and_then(|v| v.as_integer())
+            {
+                cfg.network.keep_alive.ping_interval_secs = v as u64;
+            }
+            if let Some(v) = keep_alive
+                .get("ping_timeout_secs")
+                .and_then(|v| v.as_integer())
+            {
+                cfg.network.keep_alive.ping_timeout_secs = v as u64;
+            }
+            if let Some(v) = keep_alive.get("max_failures").and_then(|v| v.as_integer()) {
+                cfg.network.keep_alive.max_failures = v as u32;
+            }
+        }
+
+        if let Some(mem) = network.get("memory_throttle") {
+            if let Some(enable) = mem.get("enable").and_then(|v| v.as_bool()) {
+                cfg.network.memory_throttle.enable = enable;
+            }
+            if let Some(v) = mem.get("min_available_mb").and_then(|v| v.as_integer()) {
+                cfg.network.memory_throttle.min_available_mb = v as u64;
+            }
+            if let Some(v) = mem
+                .get("max_total_connections_under_pressure")
+                .and_then(|v| v.as_integer())
+            {
+                cfg.network
+                    .memory_throttle
+                    .max_total_connections_under_pressure = v as usize;
+            }
         }
         if let Some(enable) = rpc_auth.get("enable_rpc_auth").and_then(|v| v.as_bool()) {
             cfg.rpc_auth.enable = enable;

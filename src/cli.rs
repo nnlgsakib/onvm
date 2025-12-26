@@ -656,8 +656,13 @@ pub async fn run() -> Result<()> {
                         enable_mdns: onvm_cfg.network.enable_mdns,
                         require_encryption: onvm_cfg.network.require_encryption,
                         max_inbound_connections: onvm_cfg.network.max_inbound_connections,
+                        max_total_connections: onvm_cfg.network.max_total_connections,
+                        max_connections_per_peer: onvm_cfg.network.max_connections_per_peer,
                         max_inbound_streams: onvm_cfg.network.max_inbound_streams,
                         max_gossip_bytes: onvm_cfg.network.max_gossip_bytes,
+                        pex: onvm_cfg.network.pex.clone(),
+                        keep_alive: onvm_cfg.network.keep_alive.clone(),
+                        memory_throttle: onvm_cfg.network.memory_throttle.clone(),
                     },
                     bootnodes: parsed_bootnodes,
                 })

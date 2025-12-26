@@ -29,8 +29,13 @@ pub struct NetworkSecurityConfig {
     pub enable_mdns: bool,
     pub require_encryption: bool,
     pub max_inbound_connections: usize,
+    pub max_total_connections: usize,
+    pub max_connections_per_peer: usize,
     pub max_inbound_streams: usize,
     pub max_gossip_bytes: usize,
+    pub pex: crate::config::PexConfig,
+    pub keep_alive: crate::config::KeepAliveConfig,
+    pub memory_throttle: crate::config::MemoryThrottleConfig,
 }
 
 pub struct Node {
@@ -106,9 +111,14 @@ impl Node {
                     enable_mdns: config.network.enable_mdns,
                     require_encryption: config.network.require_encryption,
                     max_inbound_connections: config.network.max_inbound_connections,
+                    max_total_connections: config.network.max_total_connections,
+                    max_connections_per_peer: config.network.max_connections_per_peer,
                     max_inbound_streams: config.network.max_inbound_streams,
                     max_gossip_bytes: config.network.max_gossip_bytes,
                     bootnodes: config.bootnodes.clone(),
+                    pex: config.network.pex.clone(),
+                    keep_alive: config.network.keep_alive.clone(),
+                    memory_throttle: config.network.memory_throttle.clone(),
                 },
             )
             .await

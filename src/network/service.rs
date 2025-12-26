@@ -104,6 +104,8 @@ pub const TOPIC_BLOBS: &str = "onvm-blobs";
 pub const TOPIC_PROGRAMS: &str = "onvm-programs";
 pub const TOPIC_BLOCKS: &str = "onvm-dag";
 
+const TRANSFER_PROTOCOL: &str = "/onvm/transfer/2.0.0";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NetworkMessage {
     Blob(BlobBroadcast),
@@ -481,7 +483,7 @@ impl NetworkService {
 
         let kademlia = crate::network::dht::build_kademlia(peer_id);
 
-        let transfer_protocol = StreamProtocol::new("/onvm/transfer/1.0.0");
+        let transfer_protocol = StreamProtocol::new(TRANSFER_PROTOCOL);
         let transfer_config = libp2p::request_response::Config::default()
             .with_request_timeout(Duration::from_secs(60))
             .with_max_concurrent_streams(config.max_inbound_streams);
@@ -637,10 +639,62 @@ impl NetworkService {
                                     }
                                 }
                                 libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
-                                    tracing::warn!("transfer outbound failure to {}: {error:?} ({:?})", peer, request_id);
+                                    match &error {
+                                        libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
+                                            tracing::debug!(
+                                                "transfer unsupported by {} ({}): {:?}",
+                                                peer,
+                                                TRANSFER_PROTOCOL,
+                                                request_id
+                                            );
+                                        }
+                                        libp2p::request_response::OutboundFailure::Io(err)
+                                            if err.kind() == std::io::ErrorKind::InvalidData =>
+                                        {
+                                            tracing::warn!(
+                                                "transfer decode failure from {} ({}): {:?} (peer may be running an incompatible ONVM version)",
+                                                peer,
+                                                TRANSFER_PROTOCOL,
+                                                request_id
+                                            );
+                                        }
+                                        _ => {
+                                            tracing::warn!(
+                                                "transfer outbound failure to {}: {error:?} ({:?})",
+                                                peer,
+                                                request_id
+                                            );
+                                        }
+                                    }
                                 }
                                 libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
-                                    tracing::warn!("transfer inbound failure from {}: {error:?} ({:?})", peer, request_id);
+                                    match &error {
+                                        libp2p::request_response::InboundFailure::UnsupportedProtocols => {
+                                            tracing::debug!(
+                                                "transfer unsupported by {} ({}): {:?}",
+                                                peer,
+                                                TRANSFER_PROTOCOL,
+                                                request_id
+                                            );
+                                        }
+                                        libp2p::request_response::InboundFailure::Io(err)
+                                            if err.kind() == std::io::ErrorKind::InvalidData =>
+                                        {
+                                            tracing::warn!(
+                                                "transfer decode failure from {} ({}): {:?} (peer may be running an incompatible ONVM version)",
+                                                peer,
+                                                TRANSFER_PROTOCOL,
+                                                request_id
+                                            );
+                                        }
+                                        _ => {
+                                            tracing::warn!(
+                                                "transfer inbound failure from {}: {error:?} ({:?})",
+                                                peer,
+                                                request_id
+                                            );
+                                        }
+                                    }
                                 }
                                 libp2p::request_response::Event::ResponseSent { peer, request_id } => {
                                     tracing::trace!("transfer response sent to {} ({:?})", peer, request_id);

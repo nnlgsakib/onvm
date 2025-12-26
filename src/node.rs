@@ -172,14 +172,17 @@ impl Node {
         };
 
         let sync_task = {
-            let syncer = SyncMan::new(consensus.clone());
+            let consensus = consensus.clone();
             tokio::spawn(async move {
-                let _ = syncer
-                    .await_initial_sync(std::time::Duration::from_secs(30))
-                    .await;
-                syncer
-                    .run_status_logger(std::time::Duration::from_secs(10))
-                    .await;
+                let status_syncer = SyncMan::new(consensus.clone());
+                tokio::spawn(async move {
+                    status_syncer
+                        .run_status_logger(std::time::Duration::from_secs(10))
+                        .await;
+                });
+
+                let initial_syncer = SyncMan::new(consensus.clone());
+                let _ = initial_syncer.await_initial_sync(None).await;
             })
         };
 

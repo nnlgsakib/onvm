@@ -18,17 +18,22 @@ impl SyncMan {
         Self { dag }
     }
 
-    pub async fn await_initial_sync(&self, timeout: Duration) -> Result<()> {
+    pub async fn await_initial_sync(&self, timeout: Option<Duration>) -> Result<()> {
         let mut timeout_start: Option<Instant> = None;
         let mut last_gaps: Option<(usize, usize, usize)> = None;
         let mut last_log_at: Option<Instant> = None;
         loop {
-            if self.dag.peer_count().await == 0 {
+            let peers = self.dag.peer_count().await;
+            if peers == 0 {
                 timeout_start = None;
                 last_gaps = None;
                 last_log_at = None;
                 sleep(Duration::from_millis(500)).await;
                 continue;
+            }
+
+            if timeout.is_some() && timeout_start.is_none() {
+                timeout_start = Some(Instant::now());
             }
 
             self.dag.request_inventory().await?;
@@ -45,20 +50,21 @@ impl SyncMan {
                         .map(|at| at.elapsed() >= INITIAL_SYNC_LOG_INTERVAL)
                         .unwrap_or(true);
                 if should_log {
-                    timeout_start = Some(Instant::now());
                     Self::log_progress(g);
                     last_log_at = Some(Instant::now());
-                } else if timeout_start.is_none() {
-                    timeout_start = Some(Instant::now());
                 }
                 last_gaps = Some(g);
+            } else if last_log_at
+                .map(|at| at.elapsed() >= INITIAL_SYNC_LOG_INTERVAL)
+                .unwrap_or(true)
+            {
+                tracing::info!("sync status: waiting for inventory (peers={})", peers);
+                last_log_at = Some(Instant::now());
             }
 
-            if let Some(start) = timeout_start {
+            if let (Some(timeout), Some(start)) = (timeout, timeout_start) {
                 if start.elapsed() >= timeout {
-                    tracing::warn!(
-                        "initial sync timed out before fetching network programs/blobs; continuing startup with partial view"
-                    );
+                    tracing::warn!("initial sync timed out; continuing in background");
                     return Ok(());
                 }
             }
@@ -77,6 +83,8 @@ impl SyncMan {
                 tracing::info!("sync status: no peers connected");
                 continue;
             }
+
+            let _ = self.dag.request_inventory().await;
 
             if let Err(err) = self.dag.refresh_sync_state().await {
                 tracing::debug!("sync status refresh failed: {err}");

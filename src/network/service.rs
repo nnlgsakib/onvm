@@ -198,6 +198,27 @@ fn dial_peer_best_effort(
     }
 }
 
+fn is_expected_eof(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::UnexpectedEof {
+        return true;
+    }
+    let msg = err.to_string().to_lowercase();
+    if msg.contains("unexpected end of file") || msg.contains("unexpected eof") {
+        return true;
+    }
+    false
+}
+
+fn is_expected_disconnect_io(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::NotConnected
+    ) || is_expected_eof(err)
+}
+
 impl NetworkService {
     pub async fn start(identity: &NodeKeys, config: NetworkConfig) -> Result<NetworkStreams> {
         let secret =
@@ -216,8 +237,16 @@ impl NetworkService {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .validation_mode(gossipsub::ValidationMode::Strict)
             .message_id_fn(|m: &gossipsub::Message| {
-                let hash = blake3::hash(&m.data);
-                gossipsub::MessageId::from(hash.as_bytes().to_vec())
+                let mut hasher = blake3::Hasher::new();
+                if let Some(source) = &m.source {
+                    hasher.update(source.to_bytes().as_slice());
+                }
+                if let Some(seq) = m.sequence_number {
+                    hasher.update(&seq.to_be_bytes());
+                } else {
+                    hasher.update(&m.data);
+                }
+                gossipsub::MessageId::from(hasher.finalize().as_bytes().to_vec())
             })
             .heartbeat_interval(config.heartbeat)
             .max_transmit_size(config.max_gossip_bytes)
@@ -307,7 +336,7 @@ impl NetworkService {
                 yamux::Config::default,
             )?
             .with_behaviour(|_| behaviour)?
-            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(30)))
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(10 * 60)))
             .build();
         let peer_id = *swarm.local_peer_id();
 
@@ -335,9 +364,6 @@ impl NetworkService {
         let (transfer_resp_tx, mut transfer_resp_rx) =
             mpsc::unbounded_channel::<TransferResponseJob>();
         let mut pending_queries: HashMap<QueryId, ProviderKind> = HashMap::new();
-        let mut recent_ids: std::collections::VecDeque<gossipsub::MessageId> =
-            std::collections::VecDeque::new();
-        let dedupe_window: usize = 256;
 
         let peers_shared = Arc::new(RwLock::new(HashSet::new()));
         let peers_clone = Arc::clone(&peers_shared);
@@ -397,6 +423,7 @@ impl NetworkService {
                 HashMap::new();
             let mut ping_inflight: HashSet<PeerId> = HashSet::new();
             let mut ping_failures: HashMap<PeerId, u32> = HashMap::new();
+            let mut connected_peers_local: HashSet<PeerId> = HashSet::new();
 
             loop {
                 tokio::select! {
@@ -421,7 +448,7 @@ impl NetworkService {
                     }
                     _ = ping_tick.tick() => {
                         if keep_alive_cfg.enable {
-                            let peers: Vec<PeerId> = peers_clone.read().await.iter().copied().collect();
+                            let peers: Vec<PeerId> = connected_peers_local.iter().copied().collect();
                             for peer in peers {
                                 if ping_inflight.contains(&peer) {
                                     continue;
@@ -435,10 +462,9 @@ impl NetworkService {
                     }
                     _ = pex_tick.tick() => {
                         if pex_cfg.enable {
-                            let peer_count = peers_clone.read().await.len();
+                            let peer_count = connected_peers_local.len();
                             if peer_count < pex_cfg.target_peers && !memory_pressure {
-                                let peers: Vec<PeerId> = peers_clone.read().await.iter().copied().collect();
-                                for peer in peers.into_iter().take(3) {
+                                for peer in connected_peers_local.iter().copied().take(3) {
                                     let req = crate::network::pex::PexRequest { want: pex_cfg.want_peers as u32 };
                                     let req_id = swarm.behaviour_mut().pex.send_request(&peer, req);
                                     pex_pending.insert(req_id, peer);
@@ -504,9 +530,15 @@ impl NetworkService {
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Mdns(ev)) => match ev {
                                 mdns::Event::Discovered(list) => {
-                                    for (peer, _addr) in list {
+                                    for (peer, addr) in list {
+                                        let base = strip_p2p_component(&addr);
+                                        known_addrs.entry(peer).or_default().insert(base.clone());
+                                        swarm.behaviour_mut().kademlia.add_address(&peer, base);
+                                        if connected_peers_local.contains(&peer) {
+                                            continue;
+                                        }
                                         tracing::info!("mDNS discovered peer {}, attempting dial", peer);
-                                        let _ = swarm.dial(peer);
+                                        let _ = dial_peer_best_effort(&mut swarm, peer, &known_addrs);
                                     }
                                 }
                                 mdns::Event::Expired(list) => {
@@ -633,23 +665,38 @@ impl NetworkService {
                                     total_connections
                                 );
 
-                                known_addrs
-                                    .entry(peer_id)
-                                    .or_default()
-                                    .insert(endpoint.get_remote_address().clone());
+                                // Only treat `Dialer` endpoints as dialable addresses. For inbound connections the
+                                // "remote address" is a send-back address (often an ephemeral port) and is usually
+                                // not dialable. We rely on Identify to learn listen addrs.
+                                if endpoint.is_dialer() {
+                                    known_addrs
+                                        .entry(peer_id)
+                                        .or_default()
+                                        .insert(endpoint.get_remote_address().clone());
+                                }
 
                                 redial.remove(&peer_id);
 
                                 if established_to_peer == 1 {
+                                    swarm
+                                        .behaviour_mut()
+                                        .gossipsub
+                                        .add_explicit_peer(&peer_id);
                                     peers_clone.write().await.insert(peer_id);
+                                    connected_peers_local.insert(peer_id);
                                     let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
                                 }
 
-                                swarm
-                                    .behaviour_mut()
-                                    .kademlia
-                                    .add_address(&peer_id, endpoint.get_remote_address().clone());
-                                let _ = swarm.behaviour_mut().kademlia.bootstrap();
+                                if endpoint.is_dialer() {
+                                    swarm
+                                        .behaviour_mut()
+                                        .kademlia
+                                        .add_address(
+                                            &peer_id,
+                                            endpoint.get_remote_address().clone(),
+                                        );
+                                    let _ = swarm.behaviour_mut().kademlia.bootstrap();
+                                }
 
                                 if !transfer_ready.contains(&peer_id)
                                     && !handshake_inflight.contains(&peer_id)
@@ -682,15 +729,39 @@ impl NetworkService {
                                 }
 
                                 if let Some(cause) = &cause {
-                                    tracing::warn!(
-                                        "connection closed with peer {} (remaining_connections={} total_conns={}): {}",
-                                        peer_id,
-                                        num_established,
-                                        total_connections,
-                                        cause
-                                    );
+                                    match cause {
+                                        libp2p::swarm::ConnectionError::IO(err)
+                                            if is_expected_disconnect_io(err) =>
+                                        {
+                                            tracing::debug!(
+                                                "connection closed with peer {} (remaining_connections={} total_conns={}): {}",
+                                                peer_id,
+                                                num_established,
+                                                total_connections,
+                                                cause
+                                            );
+                                        }
+                                        libp2p::swarm::ConnectionError::KeepAliveTimeout => {
+                                            tracing::info!(
+                                                "connection closed with peer {} (remaining_connections={} total_conns={}): {}",
+                                                peer_id,
+                                                num_established,
+                                                total_connections,
+                                                cause
+                                            );
+                                        }
+                                        _ => {
+                                            tracing::warn!(
+                                                "connection closed with peer {} (remaining_connections={} total_conns={}): {}",
+                                                peer_id,
+                                                num_established,
+                                                total_connections,
+                                                cause
+                                            );
+                                        }
+                                    }
                                 } else {
-                                    tracing::warn!(
+                                    tracing::info!(
                                         "connection closed with peer {} (remaining_connections={} total_conns={})",
                                         peer_id,
                                         num_established,
@@ -699,7 +770,12 @@ impl NetworkService {
                                 }
 
                                 if num_established == 0 {
+                                    swarm
+                                        .behaviour_mut()
+                                        .gossipsub
+                                        .remove_explicit_peer(&peer_id);
                                     peers_clone.write().await.remove(&peer_id);
+                                    connected_peers_local.remove(&peer_id);
                                     handshake_inflight.remove(&peer_id);
                                     handshake_pending.retain(|_, peer| *peer != peer_id);
                                     transfer_ready.remove(&peer_id);
@@ -763,8 +839,7 @@ impl NetworkService {
                                                 continue;
                                             }
 
-                                            let connected = peers_clone.read().await.contains(&pid);
-                                            if connected {
+                                            if connected_peers_local.contains(&pid) {
                                                 continue;
                                             }
 
@@ -1107,19 +1182,11 @@ impl NetworkService {
                                 continue;
                             }
                         };
-                        let msg_id = gossipsub::MessageId::from(
-                            blake3::hash(&data).as_bytes().to_vec(),
-                        );
-                        if recent_ids.contains(&msg_id) {
-                            continue;
-                        }
-                        if recent_ids.len() >= dedupe_window {
-                            recent_ids.pop_front();
-                        }
-                        recent_ids.push_back(msg_id);
 
                         tracing::debug!("publishing {:?}", describe_msg(&msg));
-                        let _ = swarm.behaviour_mut().gossipsub.publish(topic, data);
+                        if let Err(err) = swarm.behaviour_mut().gossipsub.publish(topic, data) {
+                            tracing::debug!("publish failed: {err:?}");
+                        }
                     }
                 }
             }

@@ -137,6 +137,10 @@ impl DagEngine {
         response: crate::network::TransferResponse,
     ) -> Result<()> {
         match response {
+            crate::network::TransferResponse::Inventory(inv) => {
+                self.merge_inventory(inv).await;
+                self.refresh_sync_state().await?;
+            }
             crate::network::TransferResponse::Unified(unified_resp) => {
                 use crate::network::unified_protocol::*;
                 match unified_resp {
@@ -320,18 +324,12 @@ impl DagEngine {
                 );
             }
             crate::network::NetworkMessage::InventoryRequest => {
-                let inv = self.build_inventory()?;
-                self.network
-                    .publisher
-                    .send(crate::network::NetworkMessage::Inventory(inv))
-                    .map_err(|_| anyhow::anyhow!("failed to send inventory"))?;
+                // Inventory is exchanged via request-response (TransferRequest::InventoryRequest).
+                // This legacy gossipsub message is ignored to avoid broadcast storms.
+                tracing::debug!("ignoring legacy inventory_request gossip message");
             }
             crate::network::NetworkMessage::Inventory(inv) => {
-                {
-                    let mut state = self.sync_state.write().await;
-                    state.last_inventory = Some(inv);
-                    state.last_seen = true;
-                }
+                self.merge_inventory(inv).await;
                 self.refresh_sync_state().await?;
             }
             crate::network::NetworkMessage::Job(broadcast) => {
@@ -345,6 +343,54 @@ impl DagEngine {
             }
         }
         Ok(())
+    }
+
+    async fn merge_inventory(&self, inv: crate::network::DagInventory) {
+        use std::collections::{HashMap, HashSet};
+        let mut state = self.sync_state.write().await;
+
+        let Some(mut merged) = state.last_inventory.clone() else {
+            state.last_inventory = Some(inv);
+            state.last_seen = true;
+            return;
+        };
+
+        let mut programs: HashSet<[u8; 32]> = merged.programs.into_iter().collect();
+        programs.extend(inv.programs.into_iter());
+        merged.programs = programs.into_iter().collect();
+
+        let mut executions: HashSet<[u8; 32]> = merged.executions.into_iter().collect();
+        executions.extend(inv.executions.into_iter());
+        merged.executions = executions.into_iter().collect();
+
+        let mut blobs: HashMap<[u8; 32], crate::network::BlobInventoryEntry> = merged
+            .blobs
+            .into_iter()
+            .map(|b| (b.id, b))
+            .collect();
+        for b in inv.blobs.into_iter() {
+            blobs
+                .entry(b.id)
+                .and_modify(|existing| {
+                    existing.has_data |= b.has_data;
+                    if !b.locations.is_empty() {
+                        let mut seen: HashSet<String> =
+                            existing.locations.iter().cloned().collect();
+                        for loc in b.locations.iter() {
+                            if seen.insert(loc.clone()) {
+                                existing.locations.push(loc.clone());
+                            }
+                        }
+                    }
+                })
+                .or_insert(b);
+        }
+        merged.blobs = blobs.into_values().collect();
+
+        merged.program_bloom = None;
+
+        state.last_inventory = Some(merged);
+        state.last_seen = true;
     }
 
     fn build_inventory(&self) -> Result<crate::network::DagInventory> {
@@ -1059,6 +1105,19 @@ impl DagEngine {
         channel: libp2p::request_response::ResponseChannel<crate::network::TransferResponse>,
     ) -> Result<()> {
         match req {
+            crate::network::TransferRequest::InventoryRequest => {
+                match self.build_inventory() {
+                    Ok(inv) => {
+                        self.network
+                            .respond_transfer(channel, crate::network::TransferResponse::Inventory(inv));
+                    }
+                    Err(err) => {
+                        tracing::debug!("failed to build inventory for {}: {err}", peer_id);
+                        self.network
+                            .respond_transfer(channel, crate::network::TransferResponse::Ack);
+                    }
+                }
+            }
             crate::network::TransferRequest::Unified(unified_req) => match unified_req {
                 crate::network::unified_protocol::UnifiedRequest::ExecuteViaLeader(exec_req) => {
                     let engine = self.clone();

@@ -237,16 +237,8 @@ impl NetworkService {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .validation_mode(gossipsub::ValidationMode::Strict)
             .message_id_fn(|m: &gossipsub::Message| {
-                let mut hasher = blake3::Hasher::new();
-                if let Some(source) = &m.source {
-                    hasher.update(source.to_bytes().as_slice());
-                }
-                if let Some(seq) = m.sequence_number {
-                    hasher.update(&seq.to_be_bytes());
-                } else {
-                    hasher.update(&m.data);
-                }
-                gossipsub::MessageId::from(hasher.finalize().as_bytes().to_vec())
+                let hash = blake3::hash(&m.data);
+                gossipsub::MessageId::from(hash.as_bytes().to_vec())
             })
             .heartbeat_interval(config.heartbeat)
             .max_transmit_size(config.max_gossip_bytes)
@@ -514,7 +506,7 @@ impl NetworkService {
                                         Ok((env, _)) => {
                                             match verify_signed_message(&env) {
                                                 Ok(msg) => {
-                                                    tracing::info!("inbound {:?} from {}", describe_msg(&msg), propagation_source);
+                                                    tracing::debug!("inbound {:?} from {}", describe_msg(&msg), propagation_source);
                                                     let _ = event_tx.send(NetworkEvent::Inbound(propagation_source, msg));
                                                 }
                                                 Err(e) => {

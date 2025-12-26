@@ -170,10 +170,18 @@ impl DagEngine {
     }
 
     pub async fn request_inventory(&self) -> Result<()> {
-        self.network
-            .publisher
-            .send(crate::network::NetworkMessage::InventoryRequest)
-            .map_err(|_| anyhow!("failed to broadcast inventory request"))?;
+        let mut peers = self.network.get_connected_peers().await;
+        if peers.is_empty() {
+            return Ok(());
+        }
+        peers.sort();
+
+        // Request inventories from a bounded set of peers to avoid O(N^2) chatter on large networks.
+        let max_peers = 8usize;
+        for peer in peers.into_iter().take(max_peers) {
+            self.network
+                .request_transfer(peer, crate::network::TransferRequest::InventoryRequest);
+        }
         Ok(())
     }
 

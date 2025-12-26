@@ -156,6 +156,7 @@ pub enum TransferRequest {
     Sync(SyncSnapshot),
     Unified(crate::network::unified_protocol::UnifiedRequest),
     StateRequest(StateRequest),
+    InventoryRequest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +179,7 @@ pub enum TransferResponse {
     Ack,
     Unified(crate::network::unified_protocol::UnifiedResponse),
     StateResponse(StateResponse),
+    Inventory(DagInventory),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

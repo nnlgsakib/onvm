@@ -22,12 +22,14 @@ impl SyncMan {
         let mut timeout_start: Option<Instant> = None;
         let mut last_gaps: Option<(usize, usize, usize)> = None;
         let mut last_log_at: Option<Instant> = None;
+        let mut last_inventory_req_at: Option<Instant> = None;
         loop {
             let peers = self.dag.peer_count().await;
             if peers == 0 {
                 timeout_start = None;
                 last_gaps = None;
                 last_log_at = None;
+                last_inventory_req_at = None;
                 sleep(Duration::from_millis(500)).await;
                 continue;
             }
@@ -36,7 +38,13 @@ impl SyncMan {
                 timeout_start = Some(Instant::now());
             }
 
-            self.dag.request_inventory().await?;
+            let should_request = last_inventory_req_at
+                .map(|at| at.elapsed() >= Duration::from_secs(2))
+                .unwrap_or(true);
+            if should_request {
+                let _ = self.dag.request_inventory().await;
+                last_inventory_req_at = Some(Instant::now());
+            }
             self.dag.refresh_sync_state().await?;
             if self.dag.is_fully_synced().await {
                 tracing::info!("sync complete: programs/blobs/executions fully present");
@@ -84,14 +92,10 @@ impl SyncMan {
                 continue;
             }
 
-            let _ = self.dag.request_inventory().await;
-
-            if let Err(err) = self.dag.refresh_sync_state().await {
-                tracing::debug!("sync status refresh failed: {err}");
-            }
-
             if let Some(gaps) = self.dag.sync_gaps().await {
                 Self::log_progress(gaps);
+            } else if self.dag.is_fully_synced().await {
+                tracing::info!("sync status: synced");
             } else {
                 tracing::info!("sync status: waiting for inventory (peers={})", peers);
             }

@@ -229,7 +229,10 @@ pub enum Commands {
         identity_passphrase: String,
         #[arg(long, help = "Optional project id to reuse; random if omitted")]
         project_id: Option<String>,
-        #[arg(long, help = "Optional project secret (hex) to import; random if omitted")]
+        #[arg(
+            long,
+            help = "Optional project secret (hex) to import; random if omitted"
+        )]
         project_secret: Option<String>,
     },
     /// Verify project credentials against a node's RPC auth
@@ -743,7 +746,8 @@ pub async fn run() -> Result<()> {
             let endpoint = normalize_rpc_endpoint(&rpc);
             let client = reqwest::Client::new();
             let body_str = "";
-            let auth_ctx = build_auth_headers("GET", "/health", body_str, &project_id, &project_secret)?;
+            let auth_ctx =
+                build_auth_headers("GET", "/health", body_str, &project_id, &project_secret)?;
             let mut req = client.get(format!("{endpoint}/health"));
             for (key, value) in auth_ctx.headers.iter() {
                 req = req.header(key, value);

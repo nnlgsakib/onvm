@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::sync::RwLock;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 
 impl DagEngine {
     pub async fn submit_execution(
@@ -20,11 +20,39 @@ impl DagEngine {
         program_id: &crate::types::ProgramId,
         input: &[u8],
     ) -> Result<crate::wasm_runtime::ExecutionOutcome> {
-        let committee = self
+        let committee = match self
             .program_catalog
             .get_manifest(program_id)?
             .and_then(|m| m.committee)
-            .ok_or_else(|| anyhow!("missing committee for program {}", program_id))?;
+        {
+            Some(committee) => committee,
+            None => {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut last_request_at: Option<Instant> = None;
+                loop {
+                    let should_request = last_request_at
+                        .map(|at| at.elapsed() >= Duration::from_secs(1))
+                        .unwrap_or(true);
+                    if should_request {
+                        let _ = self.request_program_manifest(program_id).await;
+                        last_request_at = Some(Instant::now());
+                    }
+
+                    if let Some(committee) = self
+                        .program_catalog
+                        .get_manifest(program_id)?
+                        .and_then(|m| m.committee)
+                    {
+                        break committee;
+                    }
+
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!("missing committee for program {}", program_id));
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        };
 
         let next_height_hint = self
             .program_catalog

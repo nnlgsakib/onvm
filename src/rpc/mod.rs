@@ -174,8 +174,9 @@ pub async fn start_rpc(
     data_dir: PathBuf,
     identity_passphrase: Option<String>,
 ) -> Result<RpcServer> {
-    let auth_state = auth::AuthState::from_config(&rpc_auth, &data_dir, identity_passphrase.as_deref())?
-        .map(Arc::new);
+    let auth_state =
+        auth::AuthState::from_config(&rpc_auth, &data_dir, identity_passphrase.as_deref())?
+            .map(Arc::new);
     let ctx = RpcContext {
         node: node.clone(),
         data_dir: data_dir.clone(),
@@ -672,9 +673,13 @@ async fn create_project(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
     };
     let secret = if let Some(secret_hex) = req.project_secret {
-        let bytes = hex::decode(secret_hex).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        let bytes =
+            hex::decode(secret_hex).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         if bytes.len() != 32 {
-            return Err((StatusCode::BAD_REQUEST, "project_secret must be 32 bytes hex".into()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "project_secret must be 32 bytes hex".into(),
+            ));
         }
         let mut secret = [0u8; 32];
         secret.copy_from_slice(&bytes);

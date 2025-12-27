@@ -26,6 +26,7 @@ pub use unified_protocol::{
     AggregatedReceiptBundle, BatchChunkRequest, BatchChunkResponse, ChunkRequest, ChunkResponse,
     FinalizedTransitionRequest, FinalizedTransitionResponse, LeaderExecutionRequest,
     LeaderExecutionResponse, ManifestRequest, ManifestResponse, ObjectAnnouncement,
-    ObjectAvailabilityRequest, ObjectAvailabilityResponse, ProgramHead, StateTransitionProposal,
-    StateTransitionVote, UnifiedProtocolMessage, UnifiedRequest, UnifiedResponse,
+    ObjectAvailabilityRequest, ObjectAvailabilityResponse, ProgramHead, ProgramManifestRequest,
+    ProgramManifestResponse, StateTransitionProposal, StateTransitionVote, UnifiedProtocolMessage,
+    UnifiedRequest, UnifiedResponse,
 };

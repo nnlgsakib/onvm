@@ -8,9 +8,10 @@ use crate::network::codec::{
 use anyhow::{anyhow, Context, Result};
 use blake3;
 use futures::StreamExt;
+use libp2p::core::ConnectedPoint;
 use libp2p::gossipsub::{self, IdentTopic as Topic};
-use libp2p::identity as libp2p_identity;
 use libp2p::identify;
+use libp2p::identity as libp2p_identity;
 use libp2p::kad::{
     store::MemoryStore, Behaviour as Kademlia, Event as KademliaEvent, QueryId, QueryResult,
     RecordKey,
@@ -18,7 +19,6 @@ use libp2p::kad::{
 use libp2p::mdns;
 use libp2p::noise;
 use libp2p::request_response::{cbor, ProtocolSupport, ResponseChannel};
-use libp2p::core::ConnectedPoint;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::yamux;

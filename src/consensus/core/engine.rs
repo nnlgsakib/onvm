@@ -194,12 +194,27 @@ impl DagEngine {
         };
 
         let mut pending_programs: HashSet<ProgramId> = HashSet::new();
+        let mut manifest_requests = 0usize;
         for pid_bytes in inv.programs {
             let pid = ProgramId(pid_bytes);
             let object_id = pid.to_object_id();
-            if !self.unified_store.is_complete(&object_id).unwrap_or(false) {
+            let object_complete = self.unified_store.is_complete(&object_id).unwrap_or(false);
+            if !object_complete {
                 pending_programs.insert(pid.clone());
                 let _ = self.queue_object_fetch(object_id).await;
+            }
+
+            let has_committee = self
+                .program_catalog
+                .get_manifest(&pid)?
+                .and_then(|m| m.committee)
+                .is_some();
+            if !has_committee {
+                pending_programs.insert(pid.clone());
+                if manifest_requests < 8 {
+                    let _ = self.request_program_manifest(&pid).await;
+                    manifest_requests = manifest_requests.saturating_add(1);
+                }
             }
         }
 
@@ -222,6 +237,29 @@ impl DagEngine {
         state.pending_program_ids = pending_programs;
         state.pending_exec_ids.clear();
         state.last_seen = true;
+        Ok(())
+    }
+
+    pub async fn request_program_manifest(&self, program_id: &ProgramId) -> Result<()> {
+        let mut peers = self.network.get_connected_peers().await;
+        if peers.is_empty() {
+            return Ok(());
+        }
+
+        peers.sort();
+
+        let req = crate::network::unified_protocol::ProgramManifestRequest {
+            program_id: program_id.clone(),
+        };
+        let unified_req = crate::network::UnifiedRequest::GetProgramManifest(req);
+
+        for peer in peers.into_iter().take(8) {
+            self.network.request_transfer(
+                peer,
+                crate::network::TransferRequest::Unified(unified_req.clone()),
+            );
+        }
+
         Ok(())
     }
 

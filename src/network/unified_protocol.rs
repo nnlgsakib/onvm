@@ -1,6 +1,7 @@
 use crate::types::{
     AggregatedReceipt, ChunkId, CommitteeCertificate, ExecutionReceipt, Manifest, ManifestId,
-    NodeId, Object, ObjectId, ProgramAnnouncement, ProgramId, ReceiptId, StateWrite,
+    NodeId, Object, ObjectId, ProgramAnnouncement, ProgramId, ProgramManifest, ReceiptId,
+    StateWrite,
 };
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,17 @@ pub struct ObjectMetadataRequest {
 pub struct ObjectMetadataResponse {
     pub object_id: ObjectId,
     pub metadata: Option<Object>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramManifestRequest {
+    pub program_id: ProgramId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramManifestResponse {
+    pub program_id: ProgramId,
+    pub manifest: Option<ProgramManifest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +178,7 @@ pub enum UnifiedRequest {
     GetObjectMetadata(ObjectMetadataRequest),
     GetFinalizedTransition(FinalizedTransitionRequest),
     ExecuteViaLeader(LeaderExecutionRequest),
+    GetProgramManifest(ProgramManifestRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +190,7 @@ pub enum UnifiedResponse {
     ObjectMetadata(ObjectMetadataResponse),
     FinalizedTransition(FinalizedTransitionResponse),
     ExecuteViaLeader(LeaderExecutionResponse),
+    ProgramManifest(ProgramManifestResponse),
 }
 
 impl ObjectAnnouncement {
@@ -187,6 +201,49 @@ impl ObjectAnnouncement {
             total_size: object.total_size,
             chunk_count: object.chunk_count,
             providers: vec![local_peer.to_string()],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn program_manifest_request_bincode_roundtrip() {
+        let program_id = ProgramId([7u8; 32]);
+        let req = UnifiedRequest::GetProgramManifest(ProgramManifestRequest { program_id });
+
+        let bytes = bincode::serde::encode_to_vec(&req, bincode::config::standard()).unwrap();
+        let (decoded, _): (UnifiedRequest, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+
+        match decoded {
+            UnifiedRequest::GetProgramManifest(decoded_req) => {
+                assert_eq!(decoded_req.program_id.0, [7u8; 32]);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn program_manifest_response_bincode_roundtrip() {
+        let program_id = ProgramId([9u8; 32]);
+        let resp = UnifiedResponse::ProgramManifest(ProgramManifestResponse {
+            program_id,
+            manifest: None,
+        });
+
+        let bytes = bincode::serde::encode_to_vec(&resp, bincode::config::standard()).unwrap();
+        let (decoded, _): (UnifiedResponse, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+
+        match decoded {
+            UnifiedResponse::ProgramManifest(decoded_resp) => {
+                assert_eq!(decoded_resp.program_id.0, [9u8; 32]);
+                assert!(decoded_resp.manifest.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 }

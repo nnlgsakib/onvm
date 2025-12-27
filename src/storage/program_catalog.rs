@@ -128,7 +128,13 @@ impl ProgramCatalog {
             if existing.initial_state_root != manifest.initial_state_root {
                 bail!("manifest conflict for program {}", manifest.program_id);
             }
-            if existing.committee != manifest.committee {
+            if existing.committee.is_some()
+                && manifest.committee.is_some()
+                && existing.committee != manifest.committee
+            {
+                bail!("committee conflict for program {}", manifest.program_id);
+            }
+            if existing.committee.is_some() && manifest.committee.is_none() {
                 bail!("committee conflict for program {}", manifest.program_id);
             }
         }

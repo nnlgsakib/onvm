@@ -167,6 +167,30 @@ impl DagEngine {
                             let _ = self.unified_store.store_object(&object);
                         }
                     }
+                    UnifiedResponse::ProgramManifest(manifest_resp) => {
+                        if let Some(manifest) = manifest_resp.manifest {
+                            tracing::info!(
+                                "received program manifest for {} (version {})",
+                                manifest.program_id,
+                                manifest.version
+                            );
+                            if let Err(e) = self.program_catalog.verify_initial_sync(&manifest) {
+                                tracing::warn!(
+                                    "manifest conflict for program {}: {}",
+                                    manifest.program_id,
+                                    e
+                                );
+                                return Ok(());
+                            }
+                            if let Err(e) = self.program_catalog.store_manifest(&manifest) {
+                                tracing::warn!("failed to store program manifest: {}", e);
+                            } else {
+                                let _ = self
+                                    .apply_available_finalized_transitions(&manifest.program_id)
+                                    .await;
+                            }
+                        }
+                    }
                     UnifiedResponse::FinalizedTransition(resp) => {
                         let crate::network::unified_protocol::FinalizedTransitionResponse {
                             program_id,
@@ -363,11 +387,8 @@ impl DagEngine {
         executions.extend(inv.executions.into_iter());
         merged.executions = executions.into_iter().collect();
 
-        let mut blobs: HashMap<[u8; 32], crate::network::BlobInventoryEntry> = merged
-            .blobs
-            .into_iter()
-            .map(|b| (b.id, b))
-            .collect();
+        let mut blobs: HashMap<[u8; 32], crate::network::BlobInventoryEntry> =
+            merged.blobs.into_iter().map(|b| (b.id, b)).collect();
         for b in inv.blobs.into_iter() {
             blobs
                 .entry(b.id)
@@ -560,6 +581,10 @@ impl DagEngine {
                 }
                 if let Err(e) = self.program_catalog.store_manifest(&announce.manifest) {
                     tracing::warn!("failed to store program manifest: {}", e);
+                } else {
+                    let _ = self
+                        .apply_available_finalized_transitions(&announce.manifest.program_id)
+                        .await;
                 }
             }
             crate::network::unified_protocol::UnifiedProtocolMessage::AggregatedReceipt(bundle) => {
@@ -618,11 +643,17 @@ impl DagEngine {
     ) -> Result<()> {
         let program_id = proposal.receipt.program_id.clone();
 
-        let committee = self
+        let committee = match self
             .program_catalog
             .get_manifest(&program_id)?
             .and_then(|m| m.committee)
-            .ok_or_else(|| anyhow::anyhow!("missing committee for program {}", program_id))?;
+        {
+            Some(c) => c,
+            None => {
+                let _ = self.request_program_manifest(&program_id).await;
+                return Ok(());
+            }
+        };
         if proposal.committee_epoch != committee.epoch {
             return Ok(());
         }
@@ -855,11 +886,17 @@ impl DagEngine {
         program_id: &crate::types::ProgramId,
     ) -> Result<()> {
         loop {
-            let expected_committee = self
+            let expected_committee = match self
                 .program_catalog
                 .get_manifest(program_id)?
                 .and_then(|m| m.committee)
-                .ok_or_else(|| anyhow::anyhow!("missing committee for program {}", program_id))?;
+            {
+                Some(c) => c,
+                None => {
+                    let _ = self.request_program_manifest(program_id).await;
+                    return Ok(());
+                }
+            };
 
             let last_commit = self.program_catalog.latest_state_commitment(program_id)?;
             let expected_height = last_commit.as_ref().map(|c| c.height + 1).unwrap_or(1);
@@ -1070,6 +1107,14 @@ impl DagEngine {
                 "ignoring aggregated receipt for unknown program {} (missing committee)",
                 program_id
             );
+            if let Err(e) = self.store_finalized_transition(&bundle) {
+                tracing::debug!(
+                    "failed to cache finalized transition for {}: {}",
+                    program_id,
+                    e
+                );
+            }
+            let _ = self.request_program_manifest(&program_id).await;
             return Ok(());
         };
         if expected_committee != bundle.committee {
@@ -1105,19 +1150,19 @@ impl DagEngine {
         channel: libp2p::request_response::ResponseChannel<crate::network::TransferResponse>,
     ) -> Result<()> {
         match req {
-            crate::network::TransferRequest::InventoryRequest => {
-                match self.build_inventory() {
-                    Ok(inv) => {
-                        self.network
-                            .respond_transfer(channel, crate::network::TransferResponse::Inventory(inv));
-                    }
-                    Err(err) => {
-                        tracing::debug!("failed to build inventory for {}: {err}", peer_id);
-                        self.network
-                            .respond_transfer(channel, crate::network::TransferResponse::Ack);
-                    }
+            crate::network::TransferRequest::InventoryRequest => match self.build_inventory() {
+                Ok(inv) => {
+                    self.network.respond_transfer(
+                        channel,
+                        crate::network::TransferResponse::Inventory(inv),
+                    );
                 }
-            }
+                Err(err) => {
+                    tracing::debug!("failed to build inventory for {}: {err}", peer_id);
+                    self.network
+                        .respond_transfer(channel, crate::network::TransferResponse::Ack);
+                }
+            },
             crate::network::TransferRequest::Unified(unified_req) => match unified_req {
                 crate::network::unified_protocol::UnifiedRequest::ExecuteViaLeader(exec_req) => {
                     let engine = self.clone();
@@ -1260,6 +1305,15 @@ impl DagEngine {
                 Ok(UnifiedResponse::ObjectMetadata(ObjectMetadataResponse {
                     object_id: metadata_req.object_id,
                     metadata,
+                }))
+            }
+            UnifiedRequest::GetProgramManifest(manifest_req) => {
+                let manifest = self
+                    .program_catalog
+                    .get_manifest(&manifest_req.program_id)?;
+                Ok(UnifiedResponse::ProgramManifest(ProgramManifestResponse {
+                    program_id: manifest_req.program_id,
+                    manifest,
                 }))
             }
             UnifiedRequest::GetFinalizedTransition(req) => {

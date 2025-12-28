@@ -471,6 +471,7 @@ impl NetworkService {
             let mut ping_inflight: HashSet<PeerId> = HashSet::new();
             let mut ping_failures: HashMap<PeerId, u32> = HashMap::new();
             let mut connected_peers_local: HashSet<PeerId> = HashSet::new();
+            let mut dialing_peers: HashSet<PeerId> = HashSet::new();
 
             loop {
                 tokio::select! {
@@ -523,6 +524,9 @@ impl NetworkService {
                         let now = Instant::now();
                         let mut remove: Vec<PeerId> = Vec::new();
                         for (peer, state) in redial.iter_mut() {
+                            if dialing_peers.contains(peer) {
+                                continue;
+                            }
                             if now < state.next_attempt_at {
                                 continue;
                             }
@@ -538,6 +542,7 @@ impl NetworkService {
                             state.next_attempt_at = now + backoff;
 
                             if dial_peer_best_effort(&mut swarm, *peer, &known_addrs) {
+                                dialing_peers.insert(*peer);
                                 tracing::debug!("redial attempt {} to {}", state.attempts, peer);
                             }
                         }
@@ -577,15 +582,26 @@ impl NetworkService {
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Mdns(ev)) => match ev {
                                 mdns::Event::Discovered(list) => {
+                                    let mut discovered_peers: HashSet<PeerId> = HashSet::new();
                                     for (peer, addr) in list {
                                         let base = strip_p2p_component(&addr);
                                         known_addrs.entry(peer).or_default().insert(base.clone());
                                         swarm.behaviour_mut().kademlia.add_address(&peer, base);
-                                        if connected_peers_local.contains(&peer) {
+                                        discovered_peers.insert(peer);
+                                    }
+                                    for peer in discovered_peers {
+                                        if peer == peer_id {
+                                            continue;
+                                        }
+                                        if connected_peers_local.contains(&peer)
+                                            || dialing_peers.contains(&peer)
+                                        {
                                             continue;
                                         }
                                         tracing::info!("mDNS discovered peer {}, attempting dial", peer);
-                                        let _ = dial_peer_best_effort(&mut swarm, peer, &known_addrs);
+                                        if dial_peer_best_effort(&mut swarm, peer, &known_addrs) {
+                                            dialing_peers.insert(peer);
+                                        }
                                     }
                                 }
                                 mdns::Event::Expired(list) => {
@@ -687,6 +703,13 @@ impl NetworkService {
                                 }
                                 let established_to_peer = num_established.get();
                                 if established_to_peer as usize > max_connections_per_peer {
+                                    if connected_peers_local.insert(peer_id) {
+                                        swarm
+                                            .behaviour_mut()
+                                            .gossipsub
+                                            .add_explicit_peer(&peer_id);
+                                    }
+                                    dialing_peers.remove(&peer_id);
                                     tracing::warn!(
                                         "dropping extra connection to {}: per-peer limit reached ({}/{})",
                                         peer_id,
@@ -724,13 +747,13 @@ impl NetworkService {
 
                                 redial.remove(&peer_id);
 
-                                if established_to_peer == 1 {
+                                if connected_peers_local.insert(peer_id) {
                                     swarm
                                         .behaviour_mut()
                                         .gossipsub
                                         .add_explicit_peer(&peer_id);
-                                    connected_peers_local.insert(peer_id);
                                 }
+                                dialing_peers.remove(&peer_id);
 
                                 if endpoint.is_dialer() {
                                     swarm
@@ -739,7 +762,7 @@ impl NetworkService {
                                         .add_address(
                                             &peer_id,
                                             endpoint.get_remote_address().clone(),
-                                        );
+                                    );
                                     let _ = swarm.behaviour_mut().kademlia.bootstrap();
                                 }
 
@@ -764,6 +787,22 @@ impl NetworkService {
                                         peer_id
                                     );
                                 }
+                            }
+                            SwarmEvent::Dialing { peer_id: Some(peer), .. } => {
+                                dialing_peers.insert(peer);
+                            }
+                            SwarmEvent::OutgoingConnectionError {
+                                peer_id: Some(peer),
+                                error,
+                                connection_id,
+                                ..
+                            } => {
+                                dialing_peers.remove(&peer);
+                                tracing::debug!(
+                                    "outgoing connection error to {}: {error:?} ({:?})",
+                                    peer,
+                                    connection_id
+                                );
                             }
                             SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint: _endpoint, num_established, cause, .. } => {
                                 if counted_connections.remove(&connection_id) {
@@ -815,6 +854,7 @@ impl NetworkService {
                                 }
 
                                 if num_established == 0 {
+                                    dialing_peers.remove(&peer_id);
                                     swarm
                                         .behaviour_mut()
                                         .gossipsub
@@ -889,6 +929,9 @@ impl NetworkService {
                                             }
 
                                             if connected_peers_local.contains(&pid) {
+                                                continue;
+                                            }
+                                            if dialing_peers.contains(&pid) {
                                                 continue;
                                             }
 

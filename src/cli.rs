@@ -11,6 +11,7 @@ use futures::{StreamExt, TryStreamExt};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use indicatif::{ProgressBar, ProgressStyle};
+use libp2p::multiaddr::Protocol;
 use libp2p::Multiaddr;
 use reqwest::Body;
 use rpassword::prompt_password;
@@ -161,6 +162,48 @@ fn parse_bootnode_str(raw: &str) -> Option<Multiaddr> {
     None
 }
 
+fn normalize_quic_v1_multiaddr(addr: Multiaddr) -> Multiaddr {
+    if addr
+        .iter()
+        .any(|p| matches!(p, Protocol::QuicV1 | Protocol::Quic))
+    {
+        return addr;
+    }
+
+    let mut has_tcp = false;
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Ip4(_)
+            | Protocol::Ip6(_)
+            | Protocol::Dns(_)
+            | Protocol::Dns4(_)
+            | Protocol::Dns6(_)
+            | Protocol::Tcp(_)
+            | Protocol::P2p(_) => {}
+            _ => return addr,
+        }
+        if matches!(proto, Protocol::Tcp(_)) {
+            has_tcp = true;
+        }
+    }
+
+    if !has_tcp {
+        return addr;
+    }
+
+    let mut out = Multiaddr::empty();
+    for proto in addr.iter() {
+        match proto {
+            Protocol::Tcp(port) => {
+                out.push(Protocol::Udp(port));
+                out.push(Protocol::QuicV1);
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn prompt_for_passphrase() -> Result<String> {
     let pass = prompt_password("Identity passphrase: ").context("reading passphrase")?;
     if pass.is_empty() {
@@ -248,7 +291,7 @@ pub enum Commands {
     RunNode {
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
-        #[arg(long, default_value = "/ip4/0.0.0.0/tcp/37000")]
+        #[arg(long, default_value = "/ip4/0.0.0.0/udp/37000/quic-v1")]
         listen: String,
         #[arg(long, default_value = "127.0.0.1:8080", alias = "api")]
         rpc: String,
@@ -597,6 +640,7 @@ pub async fn run() -> Result<()> {
             let listen_addr: Multiaddr = listen
                 .parse()
                 .with_context(|| format!("invalid listen multiaddr {listen}"))?;
+            let listen_addr = normalize_quic_v1_multiaddr(listen_addr);
             let rpc_endpoint = normalize_rpc_endpoint(&rpc);
             let rpc_addr: SocketAddr = rpc_endpoint
                 .trim_start_matches("http://")
@@ -636,6 +680,10 @@ pub async fn run() -> Result<()> {
             if dev {
                 onvm_cfg.network.enable_mdns = true;
                 onvm_cfg.rpc_auth.enable = false;
+                onvm_cfg.network.keep_alive.enable = true;
+                onvm_cfg.network.keep_alive.ping_interval_secs = 1;
+                onvm_cfg.network.keep_alive.ping_timeout_secs = 2;
+                onvm_cfg.network.keep_alive.max_failures = 1;
                 println!("Dev mode: RPC auth disabled regardless of config.toml");
             }
             let bootnodes = if !bootnode.is_empty() {
@@ -646,7 +694,7 @@ pub async fn run() -> Result<()> {
             let parsed_bootnodes: Vec<Multiaddr> = bootnodes
                 .iter()
                 .filter_map(|addr| match parse_bootnode_str(addr) {
-                    Some(ma) => Some(ma),
+                    Some(ma) => Some(normalize_quic_v1_multiaddr(ma)),
                     None => {
                         tracing::warn!("skipping invalid bootnode {addr}");
                         None
@@ -696,6 +744,7 @@ pub async fn run() -> Result<()> {
                 rpc_server.bound
             );
             signal::ctrl_c().await?;
+            node.network.shutdown().await;
         }
         Commands::GenerateProject {
             rpc,

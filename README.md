@@ -116,12 +116,12 @@ Generates Ed25519 identity keys in `./data/identity` and a default `config.toml`
 ```bash
 cargo run -- run-node \
   --data-dir ./data \
-  --listen /ip4/0.0.0.0/tcp/37000 \
+  --listen /ip4/0.0.0.0/udp/37000/quic-v1 \
   --rpc 127.0.0.1:8080 \
   --min-peers 1 \
   --blob-sync-mode full
 ```
-- `--listen`: P2P multiaddr (will auto-increment port on conflict). Logs now include the peer ID with the p2p suffix, e.g. `/ip4/192.168.1.100/tcp/37000/p2p/<peerid>`.
+- `--listen`: P2P multiaddr (will auto-increment port on conflict). Logs now include the peer ID with the p2p suffix, e.g. `/ip4/192.168.1.100/udp/37000/quic-v1/p2p/<peerid>`.
 - `--rpc`: HTTP API bind address (`:8080` shorthand supported)
 - `--min-peers`: minimum connected peers before accepting executions
 - `--blob-sync-mode`: `full` (replicate data) or `metadata` (index only)
@@ -389,7 +389,7 @@ Override by editing `./data/config.toml` after `init`.
 - **Kademlia DHT**: Provider records for content discovery
 - **mDNS**: Local peer discovery (auto-dials LAN nodes)
 - **Request-Response**: Direct blob/program/state/receipt transfer between peers
-- **Multiaddr**: `/ip4/0.0.0.0/tcp/37000/p2p/<peerid>` or custom (auto-increments on bind conflict)
+- **Multiaddr**: `/ip4/0.0.0.0/udp/37000/quic-v1/p2p/<peerid>` or custom (auto-increments port on bind conflict)
 
 ---
 

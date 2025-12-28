@@ -125,7 +125,7 @@ impl Node {
             {
                 Ok(s) => break s,
                 Err(err) => {
-                    if let Some(next) = bump_tcp_port(&listen_addr) {
+                    if let Some(next) = bump_listen_port(&listen_addr) {
                         tracing::warn!(
                             "listen {} failed ({err}); trying next port {}",
                             listen_addr,
@@ -217,16 +217,16 @@ impl Node {
     }
 }
 
-fn bump_tcp_port(addr: &Multiaddr) -> Option<Multiaddr> {
+fn bump_listen_port(addr: &Multiaddr) -> Option<Multiaddr> {
     let mut new = Multiaddr::empty();
     let mut bumped = false;
     for proto in addr.iter() {
         match proto {
-            Protocol::Tcp(port) => {
+            Protocol::Udp(port) => {
                 if port == u16::MAX {
                     return None;
                 }
-                new.push(Protocol::Tcp(port + 1));
+                new.push(Protocol::Udp(port + 1));
                 bumped = true;
             }
             other => new.push(other),
@@ -241,6 +241,7 @@ fn bump_tcp_port(addr: &Multiaddr) -> Option<Multiaddr> {
 
 fn port_from_multiaddr(addr: &Multiaddr) -> Option<u16> {
     addr.iter().find_map(|p| match p {
+        Protocol::Udp(p) => Some(p),
         Protocol::Tcp(p) => Some(p),
         _ => None,
     })

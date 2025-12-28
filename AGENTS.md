@@ -13,7 +13,7 @@ This document is a concise guide for contributing to the ONVM Rust codebase. It 
 - `cargo clippy --all-targets --all-features` — lint with warnings treated seriously; fix or `#[allow]` with rationale.
 - `cargo test --all-targets` — run unit/integration tests; add focused filters during development (e.g., `cargo test runtime`).
 - `cargo build` (or `--release`) — compile the node.
-- `cargo run -- --help` to inspect CLI; typical flows: `cargo run -- init --data-dir ./data` then `cargo run -- run-node --data-dir ./data --listen /ip4/0.0.0.0/tcp/37000 --rpc 127.0.0.1:8080`.
+- `cargo run -- --help` to inspect CLI; typical flows: `cargo run -- init --data-dir ./data` then `cargo run -- run-node --data-dir ./data --listen /ip4/0.0.0.0/udp/37000/quic-v1 --rpc 127.0.0.1:8080`.
 
 ## Coding Style & Naming Conventions
 - Rust 2021 with 4-space indentation and `snake_case` for functions/modules; structs and enums use `PascalCase`.

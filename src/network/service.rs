@@ -17,16 +17,15 @@ use libp2p::kad::{
     RecordKey,
 };
 use libp2p::mdns;
-use libp2p::noise;
 use libp2p::request_response::{cbor, ProtocolSupport, ResponseChannel};
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
-use libp2p::yamux;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{interval, Instant};
 
 #[derive(Debug, Clone)]
@@ -56,6 +55,7 @@ pub struct NetworkHandle {
     cmd: mpsc::UnboundedSender<KadCommand>,
     transfer_req: mpsc::UnboundedSender<TransferJob>,
     transfer_resp: mpsc::UnboundedSender<TransferResponseJob>,
+    shutdown: mpsc::UnboundedSender<oneshot::Sender<()>>,
     peers: Arc<RwLock<HashSet<PeerId>>>,
 }
 
@@ -85,6 +85,14 @@ impl NetworkHandle {
     pub async fn get_connected_peers(&self) -> Vec<PeerId> {
         let peers = self.peers.read().await;
         peers.iter().copied().collect()
+    }
+
+    pub async fn shutdown(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.shutdown.send(tx).is_err() {
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
     }
 }
 
@@ -163,16 +171,6 @@ fn strip_p2p_component(addr: &Multiaddr) -> Multiaddr {
     out
 }
 
-fn ensure_p2p_component(mut addr: Multiaddr, peer: &PeerId) -> Multiaddr {
-    let has_p2p = addr
-        .iter()
-        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_)));
-    if !has_p2p {
-        addr.push(libp2p::multiaddr::Protocol::P2p((*peer).into()));
-    }
-    addr
-}
-
 fn dial_peer_best_effort(
     swarm: &mut libp2p::Swarm<Behaviour>,
     peer: PeerId,
@@ -180,8 +178,15 @@ fn dial_peer_best_effort(
 ) -> bool {
     if let Some(addrs) = known_addrs.get(&peer) {
         for addr in addrs.iter().take(4) {
-            let dial_addr = ensure_p2p_component(addr.clone(), &peer);
-            match swarm.dial(dial_addr) {
+            let base = strip_p2p_component(addr);
+            // Dialing a `Multiaddr` uses `PeerCondition::Always` (unknown peer), which can create
+            // duplicate dials and excess connections. Ensure we always dial as a known peer with
+            // the default `DisconnectedAndNotDialing` condition.
+            let opts = DialOpts::peer_id(peer)
+                .condition(PeerCondition::DisconnectedAndNotDialing)
+                .addresses(vec![base])
+                .build();
+            match swarm.dial(opts) {
                 Ok(_) => return true,
                 Err(err) => {
                     tracing::debug!("dial {} via addr failed: {}", peer, err);
@@ -210,13 +215,72 @@ fn is_expected_eof(err: &std::io::Error) -> bool {
 }
 
 fn is_expected_disconnect_io(err: &std::io::Error) -> bool {
-    matches!(
+    if matches!(
         err.kind(),
         std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::NotConnected
     ) || is_expected_eof(err)
+    {
+        return true;
+    }
+
+    // QUIC (via Quinn) often reports intentional connection closes as an `Other` IO error with a
+    // message like "closed by peer: 0". Treat these as expected disconnects to avoid noisy logs
+    // during normal reconnection / connection limit enforcement.
+    let msg = err.to_string().to_lowercase();
+    msg.contains("closed by peer")
+}
+
+async fn mark_peer_disconnected_and_schedule_redial(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    peer: PeerId,
+    connected_peers_local: &mut HashSet<PeerId>,
+    peers: &Arc<RwLock<HashSet<PeerId>>>,
+    handshake_inflight: &mut HashSet<PeerId>,
+    handshake_pending: &mut HashMap<libp2p::request_response::OutboundRequestId, PeerId>,
+    transfer_ready: &mut HashSet<PeerId>,
+    transfer_blocked: &mut HashSet<PeerId>,
+    transfer_buffer: &mut HashMap<PeerId, VecDeque<TransferJob>>,
+    ping_inflight: &mut HashSet<PeerId>,
+    ping_failures: &mut HashMap<PeerId, u32>,
+    ping_pending: &mut HashMap<libp2p::request_response::OutboundRequestId, PeerId>,
+    transfer_failures: &mut HashMap<PeerId, u32>,
+    redial: &mut HashMap<PeerId, RedialState>,
+    allow_redial: bool,
+    event_tx: &mpsc::UnboundedSender<NetworkEvent>,
+) {
+    let was_connected = connected_peers_local.remove(&peer);
+
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .remove_explicit_peer(&peer);
+    peers.write().await.remove(&peer);
+
+    handshake_inflight.remove(&peer);
+    handshake_pending.retain(|_, p| *p != peer);
+
+    transfer_ready.remove(&peer);
+    transfer_blocked.remove(&peer);
+    transfer_buffer.remove(&peer);
+    transfer_failures.remove(&peer);
+
+    ping_inflight.remove(&peer);
+    ping_failures.remove(&peer);
+    ping_pending.retain(|_, p| *p != peer);
+
+    if allow_redial {
+        redial.entry(peer).or_insert(RedialState {
+            next_attempt_at: Instant::now() + Duration::from_millis(250),
+            attempts: 0,
+        });
+    }
+
+    if was_connected {
+        let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+    }
 }
 
 impl NetworkService {
@@ -230,7 +294,7 @@ impl NetworkService {
 
         if !config.require_encryption {
             tracing::warn!(
-                "require_encryption=false is insecure; ONVM will still enforce noise/tls transports"
+                "require_encryption=false is insecure; ONVM will still enforce QUIC+TLS encryption"
             );
         }
 
@@ -320,17 +384,39 @@ impl NetworkService {
             transfer,
         };
 
+        let swarm_idle_timeout = Duration::from_secs(10 * 60);
+        let quic_max_idle_timeout_ms = swarm_idle_timeout.as_millis().min(u32::MAX as u128) as u32;
+        let quic_stream_limit = (config.max_inbound_streams as u32)
+            .saturating_mul(4)
+            .saturating_add(64)
+            .max(256);
+        let quic_max_stream_data = (crate::storage::CHUNK_SIZE_MAX as u64)
+            .saturating_mul(2)
+            .max(config.max_gossip_bytes as u64)
+            .max(8 * 1024 * 1024)
+            .min(u32::MAX as u64) as u32;
+        let quic_max_connection_data = (quic_max_stream_data as u64)
+            .saturating_mul(8)
+            .max(64 * 1024 * 1024)
+            .min(u32::MAX as u64) as u32;
+
         let mut swarm = SwarmBuilder::with_existing_identity(local_key)
             .with_tokio()
-            .with_tcp(
-                libp2p::tcp::Config::default().nodelay(true),
-                (libp2p::tls::Config::new, noise::Config::new),
-                yamux::Config::default,
-            )?
+            .with_quic_config(|mut quic| {
+                quic.handshake_timeout = Duration::from_secs(10);
+                quic.max_idle_timeout = quic_max_idle_timeout_ms;
+                quic.keep_alive_interval =
+                    Duration::from_secs(config.keep_alive.ping_interval_secs.max(1));
+                quic.max_concurrent_stream_limit = quic_stream_limit;
+                quic.max_stream_data = quic_max_stream_data;
+                quic.max_connection_data = quic_max_connection_data;
+                quic
+            })
             .with_behaviour(|_| behaviour)?
-            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(Duration::from_secs(10 * 60)))
+            .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(swarm_idle_timeout))
             .build();
         let peer_id = *swarm.local_peer_id();
+        let local_peer_id = peer_id;
 
         tracing::info!("libp2p node initialized as {}", peer_id);
 
@@ -339,13 +425,20 @@ impl NetworkService {
             .context("listen_on")?;
 
         for addr in &config.bootnodes {
-            match swarm.dial(addr.clone()) {
-                Ok(_) => {
-                    tracing::info!("dialing bootnode {}", addr);
-                }
-                Err(e) => {
-                    tracing::warn!("failed to dial bootnode {}: {}", addr, e);
-                }
+            let result = if let Some(peer) = peer_id_from_multiaddr(addr) {
+                let base = strip_p2p_component(addr);
+                let opts = DialOpts::peer_id(peer)
+                    .condition(PeerCondition::DisconnectedAndNotDialing)
+                    .addresses(vec![base])
+                    .build();
+                swarm.dial(opts)
+            } else {
+                swarm.dial(addr.clone())
+            };
+
+            match result {
+                Ok(_) => tracing::info!("dialing bootnode {}", addr),
+                Err(e) => tracing::warn!("failed to dial bootnode {}: {}", addr, e),
             }
         }
 
@@ -355,6 +448,7 @@ impl NetworkService {
         let (transfer_tx, mut transfer_rx) = mpsc::unbounded_channel::<TransferJob>();
         let (transfer_resp_tx, mut transfer_resp_rx) =
             mpsc::unbounded_channel::<TransferResponseJob>();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<oneshot::Sender<()>>();
         let mut pending_queries: HashMap<QueryId, ProviderKind> = HashMap::new();
 
         let peers_shared = Arc::new(RwLock::new(HashSet::new()));
@@ -370,11 +464,15 @@ impl NetworkService {
         let bootnodes = config.bootnodes.clone();
 
         tokio::spawn(async move {
+            let mut shutting_down = false;
+            let mut shutdown_deadline: Option<Instant> = None;
+            let mut shutdown_complete: Option<oneshot::Sender<()>> = None;
             let mut handshake_pending: HashMap<
                 libp2p::request_response::OutboundRequestId,
                 PeerId,
             > = HashMap::new();
             let mut handshake_inflight: HashSet<PeerId> = HashSet::new();
+            let mut handshake_tick = interval(Duration::from_secs(2));
             let mut transfer_ready: HashSet<PeerId> = HashSet::new();
             let mut transfer_blocked: HashSet<PeerId> = HashSet::new();
             let mut transfer_buffer: HashMap<PeerId, VecDeque<TransferJob>> = HashMap::new();
@@ -384,6 +482,11 @@ impl NetworkService {
             let mut inbound_connections: usize = 0;
             let mut counted_connections: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
             let mut counted_inbound: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
+            let mut per_peer_connections: HashMap<PeerId, VecDeque<libp2p::swarm::ConnectionId>> =
+                HashMap::new();
+            let mut closing_connections: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
+            let mut connection_is_dialer: HashMap<libp2p::swarm::ConnectionId, bool> =
+                HashMap::new();
 
             let mut sys = sysinfo::System::new();
             let mut memory_pressure = false;
@@ -416,6 +519,7 @@ impl NetworkService {
             let mut ping_inflight: HashSet<PeerId> = HashSet::new();
             let mut ping_failures: HashMap<PeerId, u32> = HashMap::new();
             let mut connected_peers_local: HashSet<PeerId> = HashSet::new();
+            let mut transfer_failures: HashMap<PeerId, u32> = HashMap::new();
 
             loop {
                 tokio::select! {
@@ -439,6 +543,9 @@ impl NetworkService {
                         }
                     }
                     _ = ping_tick.tick() => {
+                        if shutting_down {
+                            continue;
+                        }
                         if keep_alive_cfg.enable {
                             let peers: Vec<PeerId> = connected_peers_local.iter().copied().collect();
                             for peer in peers {
@@ -452,7 +559,40 @@ impl NetworkService {
                             }
                         }
                     }
+                    _ = handshake_tick.tick() => {
+                        if shutting_down {
+                            continue;
+                        }
+                        let peers: Vec<PeerId> = connected_peers_local.iter().copied().collect();
+                        for peer_id in peers {
+                            if transfer_ready.contains(&peer_id)
+                                || handshake_inflight.contains(&peer_id)
+                                || transfer_blocked.contains(&peer_id)
+                            {
+                                continue;
+                            }
+                            let req = HandshakeRequest {
+                                node_version: env!("CARGO_PKG_VERSION").to_string(),
+                                transfer_protocol: TRANSFER_PROTOCOL.to_string(),
+                                transfer_codec_fingerprint: transfer_codec_fingerprint(),
+                            };
+                            let req_id = swarm
+                                .behaviour_mut()
+                                .handshake
+                                .send_request(&peer_id, req);
+                            handshake_pending.insert(req_id, peer_id);
+                            handshake_inflight.insert(peer_id);
+                            tracing::debug!(
+                                "sent handshake request {:?} to {} (retry)",
+                                req_id,
+                                peer_id
+                            );
+                        }
+                    }
                     _ = pex_tick.tick() => {
+                        if shutting_down {
+                            continue;
+                        }
                         if pex_cfg.enable {
                             let peer_count = connected_peers_local.len();
                             if peer_count < pex_cfg.target_peers && !memory_pressure {
@@ -465,6 +605,9 @@ impl NetworkService {
                         }
                     }
                     _ = redial_tick.tick() => {
+                        if shutting_down {
+                            continue;
+                        }
                         let now = Instant::now();
                         let mut remove: Vec<PeerId> = Vec::new();
                         for (peer, state) in redial.iter_mut() {
@@ -522,15 +665,23 @@ impl NetworkService {
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Mdns(ev)) => match ev {
                                 mdns::Event::Discovered(list) => {
+                                    let mut discovered_peers: HashSet<PeerId> = HashSet::new();
                                     for (peer, addr) in list {
                                         let base = strip_p2p_component(&addr);
                                         known_addrs.entry(peer).or_default().insert(base.clone());
                                         swarm.behaviour_mut().kademlia.add_address(&peer, base);
+                                        discovered_peers.insert(peer);
+                                    }
+                                    for peer in discovered_peers {
                                         if connected_peers_local.contains(&peer) {
                                             continue;
                                         }
-                                        tracing::info!("mDNS discovered peer {}, attempting dial", peer);
-                                        let _ = dial_peer_best_effort(&mut swarm, peer, &known_addrs);
+                                        if dial_peer_best_effort(&mut swarm, peer, &known_addrs) {
+                                            tracing::info!(
+                                                "mDNS discovered peer {}, dialing",
+                                                peer
+                                            );
+                                        }
                                     }
                                 }
                                 mdns::Event::Expired(list) => {
@@ -561,11 +712,9 @@ impl NetworkService {
                             SwarmEvent::Behaviour(BehaviourEvent::Identify(ev)) => match ev {
                                 identify::Event::Received { peer_id: remote, info, .. }
                                 | identify::Event::Pushed { peer_id: remote, info, .. } => {
-                                    let mut addrs = info.listen_addrs;
-                                    addrs.push(info.observed_addr);
                                     let validated = match crate::network::pex::validate_peer_addrs(
                                         &remote,
-                                        &addrs,
+                                        &info.listen_addrs,
                                         &pex_policy,
                                     ) {
                                         Ok(v) => v,
@@ -631,15 +780,68 @@ impl NetworkService {
                                     continue;
                                 }
                                 let established_to_peer = num_established.get();
-                                if established_to_peer as usize > max_connections_per_peer {
-                                    tracing::warn!(
-                                        "dropping extra connection to {}: per-peer limit reached ({}/{})",
-                                        peer_id,
-                                        established_to_peer,
-                                        max_connections_per_peer
-                                    );
-                                    let _ = swarm.close_connection(connection_id);
-                                    continue;
+                                connection_is_dialer.insert(connection_id, endpoint.is_dialer());
+
+                                // Track established connections per peer so we can deterministically keep a
+                                // single QUIC connection (stream-multiplexed) and aggressively retire stale
+                                // connections (e.g. after a peer restarts).
+                                per_peer_connections
+                                    .entry(peer_id)
+                                    .or_default()
+                                    .push_back(connection_id);
+
+                                // QUIC gives us multiplexed streams and per-stream flow control; keep a single
+                                // connection per peer to avoid request routing over stale parallel connections.
+                                let target_connections_per_peer = 1usize.min(max_connections_per_peer);
+                                if established_to_peer as usize > target_connections_per_peer {
+                                    let entry = per_peer_connections.entry(peer_id).or_default();
+                                    let preferred_is_dialer =
+                                        local_peer_id.to_bytes() < peer_id.to_bytes();
+
+                                    let mut keep: Option<libp2p::swarm::ConnectionId> = None;
+                                    for cid in entry.iter().rev().copied() {
+                                        if closing_connections.contains(&cid) {
+                                            continue;
+                                        }
+                                        if matches!(
+                                            connection_is_dialer.get(&cid),
+                                            Some(v) if *v == preferred_is_dialer
+                                        ) {
+                                            keep = Some(cid);
+                                            break;
+                                        }
+                                    }
+                                    if keep.is_none() {
+                                        keep = entry
+                                            .iter()
+                                            .rev()
+                                            .copied()
+                                            .find(|cid| !closing_connections.contains(cid));
+                                    }
+
+                                    if let Some(keep) = keep {
+                                        let mut closed = 0usize;
+                                        for cid in entry.iter().copied() {
+                                            if cid == keep || closing_connections.contains(&cid) {
+                                                continue;
+                                            }
+                                            closing_connections.insert(cid);
+                                            let _ = swarm.close_connection(cid);
+                                            closed = closed.saturating_add(1);
+                                        }
+
+                                        if closed > 0 {
+                                            tracing::debug!(
+                                                "closing {} extra connection(s) to {} to enforce single QUIC connection",
+                                                closed,
+                                                peer_id
+                                            );
+                                        }
+                                    }
+
+                                    if closing_connections.contains(&connection_id) {
+                                        continue;
+                                    }
                                 }
 
                                 counted_connections.insert(connection_id);
@@ -656,6 +858,7 @@ impl NetworkService {
                                     established_to_peer,
                                     total_connections
                                 );
+                                transfer_failures.remove(&peer_id);
 
                                 // Only treat `Dialer` endpoints as dialable addresses. For inbound connections the
                                 // "remote address" is a send-back address (often an ephemeral port) and is usually
@@ -666,16 +869,15 @@ impl NetworkService {
                                         .or_default()
                                         .insert(endpoint.get_remote_address().clone());
                                 }
-
+                                
                                 redial.remove(&peer_id);
 
-                                if established_to_peer == 1 {
+                                if connected_peers_local.insert(peer_id) {
                                     swarm
                                         .behaviour_mut()
                                         .gossipsub
                                         .add_explicit_peer(&peer_id);
                                     peers_clone.write().await.insert(peer_id);
-                                    connected_peers_local.insert(peer_id);
                                     let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
                                 }
 
@@ -719,8 +921,28 @@ impl NetworkService {
                                 if counted_inbound.remove(&connection_id) {
                                     inbound_connections = inbound_connections.saturating_sub(1);
                                 }
+                                let initiated_close = closing_connections.remove(&connection_id);
+                                connection_is_dialer.remove(&connection_id);
+                                let should_remove_peer = if let Some(entry) =
+                                    per_peer_connections.get_mut(&peer_id)
+                                {
+                                    entry.retain(|id| *id != connection_id);
+                                    entry.is_empty()
+                                } else {
+                                    false
+                                };
+                                if should_remove_peer {
+                                    per_peer_connections.remove(&peer_id);
+                                }
 
-                                if let Some(cause) = &cause {
+                                if initiated_close && num_established > 0 {
+                                    tracing::debug!(
+                                        "closed extra connection with peer {} (remaining_connections={} total_conns={})",
+                                        peer_id,
+                                        num_established,
+                                        total_connections
+                                    );
+                                } else if let Some(cause) = &cause {
                                     match cause {
                                         libp2p::swarm::ConnectionError::IO(err)
                                             if is_expected_disconnect_io(err) =>
@@ -762,27 +984,25 @@ impl NetworkService {
                                 }
 
                                 if num_established == 0 {
-                                    swarm
-                                        .behaviour_mut()
-                                        .gossipsub
-                                        .remove_explicit_peer(&peer_id);
-                                    peers_clone.write().await.remove(&peer_id);
-                                    connected_peers_local.remove(&peer_id);
-                                    handshake_inflight.remove(&peer_id);
-                                    handshake_pending.retain(|_, peer| *peer != peer_id);
-                                    transfer_ready.remove(&peer_id);
-                                    transfer_blocked.remove(&peer_id);
-                                    transfer_buffer.remove(&peer_id);
-                                    ping_inflight.remove(&peer_id);
-                                    ping_failures.remove(&peer_id);
-                                    ping_pending.retain(|_, peer| *peer != peer_id);
-
-                                    redial.entry(peer_id).or_insert(RedialState {
-                                        next_attempt_at: Instant::now() + Duration::from_millis(250),
-                                        attempts: 0,
-                                    });
-
-                                    let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
+                                    mark_peer_disconnected_and_schedule_redial(
+                                        &mut swarm,
+                                        peer_id,
+                                        &mut connected_peers_local,
+                                        &peers_clone,
+                                        &mut handshake_inflight,
+                                        &mut handshake_pending,
+                                        &mut transfer_ready,
+                                        &mut transfer_blocked,
+                                        &mut transfer_buffer,
+                                        &mut ping_inflight,
+                                        &mut ping_failures,
+                                        &mut ping_pending,
+                                        &mut transfer_failures,
+                                        &mut redial,
+                                        !shutting_down,
+                                        &event_tx,
+                                    )
+                                    .await;
                                 } else if !transfer_ready.contains(&peer_id)
                                     && !transfer_blocked.contains(&peer_id)
                                 {
@@ -792,7 +1012,7 @@ impl NetworkService {
                                 }
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Pex(event)) => match event {
-                                libp2p::request_response::Event::Message { peer: _, message } => match message {
+                                libp2p::request_response::Event::Message { peer: _, message, .. } => match message {
                                     libp2p::request_response::Message::Request { request, channel, .. } => {
                                         let response = crate::network::pex::build_response(
                                             &known_addrs,
@@ -845,17 +1065,17 @@ impl NetworkService {
                                         }
                                     }
                                 },
-                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
+                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id, .. } => {
                                     pex_pending.remove(&request_id);
                                     tracing::debug!("PEX outbound failure to {}: {error:?} ({:?})", peer, request_id);
                                 }
-                                libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
+                                libp2p::request_response::Event::InboundFailure { peer, error, request_id, .. } => {
                                     tracing::debug!("PEX inbound failure from {}: {error:?} ({:?})", peer, request_id);
                                 }
                                 libp2p::request_response::Event::ResponseSent { .. } => {}
                             },
                             SwarmEvent::Behaviour(BehaviourEvent::PingPng(event)) => match event {
-                                libp2p::request_response::Event::Message { peer: _, message } => match message {
+                                libp2p::request_response::Event::Message { peer: _, message, .. } => match message {
                                     libp2p::request_response::Message::Request { request, channel, .. } => {
                                         let pong = crate::network::ping_png::PongResponse {
                                             nonce: request.nonce,
@@ -871,24 +1091,82 @@ impl NetworkService {
                                         ping_failures.remove(&peer);
                                     }
                                 },
-                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
+                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id, connection_id, .. } => {
                                     ping_pending.remove(&request_id);
                                     ping_inflight.remove(&peer);
-                                    let failures = ping_failures.entry(peer).or_insert(0);
-                                    *failures = failures.saturating_add(1);
+                                    if !connected_peers_local.contains(&peer) {
+                                        continue;
+                                    }
+                                    if closing_connections.contains(&connection_id) {
+                                        tracing::debug!(
+                                            "ping outbound failure on closing connection {:?} to {}: {error:?} ({:?})",
+                                            connection_id,
+                                            peer,
+                                            request_id
+                                        );
+                                        continue;
+                                    }
+                                    let active_conns = per_peer_connections
+                                        .get(&peer)
+                                        .map(|conns| {
+                                            conns.iter()
+                                                .filter(|cid| !closing_connections.contains(cid))
+                                                .count()
+                                        })
+                                        .unwrap_or(0);
+                                    if active_conns > 1 {
+                                        tracing::debug!(
+                                            "ping outbound failure to {} while {} connections are active; ignoring",
+                                            peer,
+                                            active_conns
+                                        );
+                                        continue;
+                                    }
+                                    let threshold_reached = {
+                                        let failures = ping_failures.entry(peer).or_insert(0);
+                                        *failures = failures.saturating_add(1);
+                                        *failures >= keep_alive_cfg.max_failures
+                                    };
                                     tracing::debug!("ping outbound failure to {}: {error:?} ({:?})", peer, request_id);
-                                    if *failures >= keep_alive_cfg.max_failures {
-                                        tracing::warn!("ping failure threshold reached for {}; disconnecting", peer);
+                                    if threshold_reached {
+                                        tracing::warn!("ping failure threshold reached for {}; forcing disconnect", peer);
+                                        // Close all known connections for this peer to ensure we stop considering it
+                                        // connected even if the remote went offline without a clean shutdown.
+                                        if let Some(conns) = per_peer_connections.get(&peer) {
+                                            for cid in conns.iter().copied() {
+                                                closing_connections.insert(cid);
+                                                let _ = swarm.close_connection(cid);
+                                            }
+                                        }
                                         let _ = swarm.disconnect_peer_id(peer);
+                                        mark_peer_disconnected_and_schedule_redial(
+                                            &mut swarm,
+                                            peer,
+                                            &mut connected_peers_local,
+                                            &peers_clone,
+                                            &mut handshake_inflight,
+                                            &mut handshake_pending,
+                                            &mut transfer_ready,
+                                            &mut transfer_blocked,
+                                            &mut transfer_buffer,
+                                            &mut ping_inflight,
+                                            &mut ping_failures,
+                                            &mut ping_pending,
+                                            &mut transfer_failures,
+                                            &mut redial,
+                                            !shutting_down,
+                                            &event_tx,
+                                        )
+                                        .await;
                                     }
                                 }
-                                libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
+                                libp2p::request_response::Event::InboundFailure { peer, error, request_id, .. } => {
                                     tracing::debug!("ping inbound failure from {}: {error:?} ({:?})", peer, request_id);
                                 }
                                 libp2p::request_response::Event::ResponseSent { .. } => {}
                             },
                             SwarmEvent::Behaviour(BehaviourEvent::Handshake(event)) => match event {
-                                libp2p::request_response::Event::Message { peer, message } => match message {
+                                libp2p::request_response::Event::Message { peer, message, .. } => match message {
                                     libp2p::request_response::Message::Request { request, channel, .. } => {
                                         let local_fp = transfer_codec_fingerprint();
                                         let ok = request.transfer_protocol == TRANSFER_PROTOCOL
@@ -991,40 +1269,56 @@ impl NetworkService {
                                         }
                                     }
                                 },
-                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
+                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id, .. } => {
                                     handshake_pending.remove(&request_id);
                                     handshake_inflight.remove(&peer);
-                                    if matches!(error, libp2p::request_response::OutboundFailure::UnsupportedProtocols) {
-                                        tracing::debug!(
-                                            "handshake unsupported by {} ({}): {:?}",
-                                            peer,
-                                            HANDSHAKE_PROTOCOL,
-                                            request_id
-                                        );
-                                    } else {
-                                        tracing::debug!(
-                                            "handshake outbound failure to {}: {error:?} ({:?})",
-                                            peer,
-                                            request_id
-                                        );
-                                    }
                                     transfer_ready.remove(&peer);
-                                    transfer_blocked.insert(peer);
-                                    transfer_buffer.remove(&peer);
+                                    match &error {
+                                        libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
+                                            tracing::debug!(
+                                                "handshake unsupported by {} ({}): {:?}",
+                                                peer,
+                                                HANDSHAKE_PROTOCOL,
+                                                request_id
+                                            );
+                                            transfer_blocked.insert(peer);
+                                            transfer_buffer.remove(&peer);
+                                        }
+                                        libp2p::request_response::OutboundFailure::Io(err)
+                                            if err.kind() == std::io::ErrorKind::InvalidData =>
+                                        {
+                                            tracing::warn!(
+                                                "handshake decode failure from {} ({}): {:?} (peer may be running an incompatible ONVM version)",
+                                                peer,
+                                                HANDSHAKE_PROTOCOL,
+                                                request_id
+                                            );
+                                            transfer_blocked.insert(peer);
+                                            transfer_buffer.remove(&peer);
+                                        }
+                                        _ => {
+                                            tracing::debug!(
+                                                "handshake outbound failure to {}: {error:?} ({:?})",
+                                                peer,
+                                                request_id
+                                            );
+                                        }
+                                    }
                                 }
-                                libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
+                                libp2p::request_response::Event::InboundFailure { peer, error, request_id, .. } => {
                                     tracing::debug!(
                                         "handshake inbound failure from {}: {error:?} ({:?})",
                                         peer,
                                         request_id
                                     );
                                 }
-                                libp2p::request_response::Event::ResponseSent { peer, request_id } => {
+                                libp2p::request_response::Event::ResponseSent { peer, request_id, .. } => {
                                     tracing::trace!("handshake response sent to {} ({:?})", peer, request_id);
                                 }
                             },
                             SwarmEvent::Behaviour(BehaviourEvent::Transfer(event)) => match event {
-                                libp2p::request_response::Event::Message { peer, message } => {
+                                libp2p::request_response::Event::Message { peer, message, .. } => {
+                                    transfer_failures.remove(&peer);
                                     match message {
                                         libp2p::request_response::Message::Request { request, channel, .. } => {
                                             let _ = event_tx.send(NetworkEvent::TransferRequest(peer, request, channel));
@@ -1034,7 +1328,35 @@ impl NetworkService {
                                         }
                                     }
                                 }
-                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
+                                libp2p::request_response::Event::OutboundFailure { peer, error, request_id, connection_id, .. } => {
+                                    if !connected_peers_local.contains(&peer) {
+                                        continue;
+                                    }
+                                    if closing_connections.contains(&connection_id) {
+                                        tracing::debug!(
+                                            "transfer outbound failure on closing connection {:?} to {}: {error:?} ({:?})",
+                                            connection_id,
+                                            peer,
+                                            request_id
+                                        );
+                                        continue;
+                                    }
+                                    let active_conns = per_peer_connections
+                                        .get(&peer)
+                                        .map(|conns| {
+                                            conns.iter()
+                                                .filter(|cid| !closing_connections.contains(cid))
+                                                .count()
+                                        })
+                                        .unwrap_or(0);
+                                    if active_conns > 1 {
+                                        tracing::debug!(
+                                            "transfer outbound failure to {} while {} connections are active; ignoring",
+                                            peer,
+                                            active_conns
+                                        );
+                                        continue;
+                                    }
                                     match &error {
                                         libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
                                             tracing::debug!(
@@ -1063,10 +1385,57 @@ impl NetworkService {
                                                 peer,
                                                 request_id
                                             );
+                                            if matches!(
+                                                error,
+                                                libp2p::request_response::OutboundFailure::Timeout
+                                                    | libp2p::request_response::OutboundFailure::ConnectionClosed
+                                                    | libp2p::request_response::OutboundFailure::DialFailure
+                                            ) {
+                                                let should_disconnect = {
+                                                    let failures =
+                                                        transfer_failures.entry(peer).or_insert(0);
+                                                    *failures = failures.saturating_add(1);
+                                                    *failures >= 1
+                                                };
+                                                if should_disconnect {
+                                                    tracing::warn!(
+                                                        "transfer to {} repeatedly failing; forcing disconnect",
+                                                        peer
+                                                    );
+                                                    if let Some(conns) =
+                                                        per_peer_connections.get(&peer)
+                                                    {
+                                                        for cid in conns.iter().copied() {
+                                                            closing_connections.insert(cid);
+                                                            let _ = swarm.close_connection(cid);
+                                                        }
+                                                    }
+                                                    let _ = swarm.disconnect_peer_id(peer);
+                                                    mark_peer_disconnected_and_schedule_redial(
+                                                        &mut swarm,
+                                                        peer,
+                                                        &mut connected_peers_local,
+                                                        &peers_clone,
+                                                        &mut handshake_inflight,
+                                                        &mut handshake_pending,
+                                                        &mut transfer_ready,
+                                                        &mut transfer_blocked,
+                                                        &mut transfer_buffer,
+                                                        &mut ping_inflight,
+                                                        &mut ping_failures,
+                                                        &mut ping_pending,
+                                                        &mut transfer_failures,
+                                                        &mut redial,
+                                                        !shutting_down,
+                                                        &event_tx,
+                                                    )
+                                                    .await;
+                                                }
+                                            }
                                         }
                                     }
                                 }
-                                libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
+                                libp2p::request_response::Event::InboundFailure { peer, error, request_id, .. } => {
                                     match &error {
                                         libp2p::request_response::InboundFailure::UnsupportedProtocols => {
                                             tracing::debug!(
@@ -1098,11 +1467,64 @@ impl NetworkService {
                                         }
                                     }
                                 }
-                                libp2p::request_response::Event::ResponseSent { peer, request_id } => {
+                                libp2p::request_response::Event::ResponseSent { peer, request_id, .. } => {
                                     tracing::trace!("transfer response sent to {} ({:?})", peer, request_id);
                                 }
                             },
                             _ => {}
+                        }
+                    }
+                    Some(done_tx) = shutdown_rx.recv() => {
+                        if shutdown_complete.is_none() {
+                            shutting_down = true;
+                            shutdown_deadline = Some(Instant::now() + Duration::from_secs(2));
+                            shutdown_complete = Some(done_tx);
+
+                            redial.clear();
+                            handshake_inflight.clear();
+                            handshake_pending.clear();
+                            transfer_ready.clear();
+                            transfer_blocked.clear();
+                            transfer_buffer.clear();
+                            ping_inflight.clear();
+                            ping_failures.clear();
+                            ping_pending.clear();
+                            transfer_failures.clear();
+
+                            let all_conns: Vec<_> = per_peer_connections
+                                .values()
+                                .flat_map(|conns| conns.iter().copied())
+                                .collect();
+                            for cid in all_conns {
+                                closing_connections.insert(cid);
+                                let _ = swarm.close_connection(cid);
+                            }
+
+                            let peers: Vec<_> = connected_peers_local.iter().copied().collect();
+                            for peer in peers {
+                                let _ = swarm.disconnect_peer_id(peer);
+                                mark_peer_disconnected_and_schedule_redial(
+                                    &mut swarm,
+                                    peer,
+                                    &mut connected_peers_local,
+                                    &peers_clone,
+                                    &mut handshake_inflight,
+                                    &mut handshake_pending,
+                                    &mut transfer_ready,
+                                    &mut transfer_blocked,
+                                    &mut transfer_buffer,
+                                    &mut ping_inflight,
+                                    &mut ping_failures,
+                                    &mut ping_pending,
+                                    &mut transfer_failures,
+                                    &mut redial,
+                                    false,
+                                    &event_tx,
+                                )
+                                .await;
+                            }
+                        } else {
+                            let _ = done_tx.send(());
                         }
                     }
                     Some(cmd) = cmd_rx.recv() => {
@@ -1181,6 +1603,19 @@ impl NetworkService {
                         }
                     }
                 }
+
+                if shutting_down {
+                    let deadline_reached = match shutdown_deadline {
+                        Some(deadline) => Instant::now() >= deadline,
+                        None => false,
+                    };
+                    if total_connections == 0 || deadline_reached {
+                        if let Some(done) = shutdown_complete.take() {
+                            let _ = done.send(());
+                        }
+                        break;
+                    }
+                }
             }
         });
 
@@ -1191,6 +1626,7 @@ impl NetworkService {
                 cmd: cmd_tx,
                 transfer_req: transfer_tx,
                 transfer_resp: transfer_resp_tx,
+                shutdown: shutdown_tx,
                 peers: peers_shared,
             },
             events: event_rx,

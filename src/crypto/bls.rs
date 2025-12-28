@@ -7,7 +7,7 @@ use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use serde::de::Error as DeError;
+use serde::de::{Error as DeError, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Sha256;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,73 @@ pub struct BlsSignature(pub [u8; 48]);
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlsSecretKey(pub [u8; 32]);
 
+fn deserialize_fixed_bytes<'de, const N: usize, D>(
+    deserializer: D,
+    type_name: &'static str,
+) -> Result<[u8; N], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct FixedBytesVisitor<const N: usize> {
+        type_name: &'static str,
+    }
+
+    impl<'de, const N: usize> Visitor<'de> for FixedBytesVisitor<N> {
+        type Value = [u8; N];
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{N} bytes for {}", self.type_name)
+        }
+
+        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+        where
+            E: DeError,
+        {
+            if v.len() != N {
+                return Err(E::invalid_length(v.len(), &self));
+            }
+            let mut out = [0u8; N];
+            out.copy_from_slice(v);
+            Ok(out)
+        }
+
+        fn visit_borrowed_bytes<E>(self, v: &'de [u8]) -> Result<Self::Value, E>
+        where
+            E: DeError,
+        {
+            self.visit_bytes(v)
+        }
+
+        fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: DeError,
+        {
+            self.visit_bytes(&v)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut out = [0u8; N];
+            for i in 0..N {
+                match seq.next_element::<u8>()? {
+                    Some(b) => out[i] = b,
+                    None => return Err(A::Error::invalid_length(i, &self)),
+                }
+            }
+
+            if seq.next_element::<IgnoredAny>()?.is_some() {
+                return Err(A::Error::invalid_length(N + 1, &self));
+            }
+
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_bytes(FixedBytesVisitor::<N> { type_name })
+}
+
 impl Serialize for BlsPublicKey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -41,13 +108,10 @@ impl<'de> Deserialize<'de> for BlsPublicKey {
     where
         D: Deserializer<'de>,
     {
-        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-        if bytes.len() != 96 {
-            return Err(D::Error::custom("invalid bls public key length"));
-        }
-        let mut arr = [0u8; 96];
-        arr.copy_from_slice(&bytes);
-        Ok(BlsPublicKey(arr))
+        Ok(BlsPublicKey(deserialize_fixed_bytes::<96, _>(
+            deserializer,
+            "bls public key",
+        )?))
     }
 }
 
@@ -65,13 +129,10 @@ impl<'de> Deserialize<'de> for BlsSignature {
     where
         D: Deserializer<'de>,
     {
-        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-        if bytes.len() != 48 {
-            return Err(D::Error::custom("invalid bls signature length"));
-        }
-        let mut arr = [0u8; 48];
-        arr.copy_from_slice(&bytes);
-        Ok(BlsSignature(arr))
+        Ok(BlsSignature(deserialize_fixed_bytes::<48, _>(
+            deserializer,
+            "bls signature",
+        )?))
     }
 }
 
@@ -89,13 +150,10 @@ impl<'de> Deserialize<'de> for BlsSecretKey {
     where
         D: Deserializer<'de>,
     {
-        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-        if bytes.len() != 32 {
-            return Err(D::Error::custom("invalid bls secret key length"));
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(BlsSecretKey(arr))
+        Ok(BlsSecretKey(deserialize_fixed_bytes::<32, _>(
+            deserializer,
+            "bls secret key",
+        )?))
     }
 }
 

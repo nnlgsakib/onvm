@@ -18,7 +18,7 @@ use libp2p::kad::{
 };
 use libp2p::mdns;
 use libp2p::noise;
-use libp2p::request_response::{cbor, ProtocolSupport, ResponseChannel};
+use libp2p::request_response::{cbor, OutboundRequestId, ProtocolSupport, ResponseChannel};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::yamux;
@@ -28,6 +28,60 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Instant};
+
+fn describe_transfer_request(req: &TransferRequest) -> String {
+    match req {
+        TransferRequest::Program(id) => format!("program({id})"),
+        TransferRequest::ProgramChunk { id, chunk_idx } => {
+            format!("program_chunk(id={id}, idx={chunk_idx})")
+        }
+        TransferRequest::Blob(id) => format!("blob({id})"),
+        TransferRequest::BlobChunk { id, chunk_idx } => {
+            format!("blob_chunk(id={id}, idx={chunk_idx})")
+        }
+        TransferRequest::Execution(id) => format!("execution({})", hex::encode(id)),
+        TransferRequest::PushProgram(p) => format!("push_program({})", p.meta.id),
+        TransferRequest::PushProgramChunk { id, chunk_idx, .. } => {
+            format!("push_program_chunk(id={id}, idx={chunk_idx})")
+        }
+        TransferRequest::PushBlob(b) => format!("push_blob({})", b.meta.id),
+        TransferRequest::PushExecution(_) => "push_execution".to_string(),
+        TransferRequest::Sync(s) => format!(
+            "sync(programs={}, executions={})",
+            s.programs.len(),
+            s.executions.len()
+        ),
+        TransferRequest::Unified(u) => match u {
+            crate::network::unified_protocol::UnifiedRequest::GetManifest(r) => {
+                format!("unified:get_manifest({})", r.object_id)
+            }
+            crate::network::unified_protocol::UnifiedRequest::GetChunk(r) => {
+                format!("unified:get_chunk({})", r.chunk_id)
+            }
+            crate::network::unified_protocol::UnifiedRequest::GetChunks(r) => {
+                format!("unified:get_chunks(n={})", r.chunk_ids.len())
+            }
+            crate::network::unified_protocol::UnifiedRequest::GetObjectAvailability(r) => {
+                format!("unified:get_object_availability({})", r.object_id)
+            }
+            crate::network::unified_protocol::UnifiedRequest::GetObjectMetadata(r) => {
+                format!("unified:get_object_metadata({})", r.object_id)
+            }
+            crate::network::unified_protocol::UnifiedRequest::GetFinalizedTransition(r) => format!(
+                "unified:get_finalized_transition(program={}, height={})",
+                r.program_id, r.height
+            ),
+            crate::network::unified_protocol::UnifiedRequest::ExecuteViaLeader(r) => {
+                format!("unified:execute_via_leader(program={})", r.program_id)
+            }
+            crate::network::unified_protocol::UnifiedRequest::GetProgramManifest(r) => {
+                format!("unified:get_program_manifest({})", r.program_id)
+            }
+        },
+        TransferRequest::StateRequest(r) => format!("state_request({})", r.program_id),
+        TransferRequest::InventoryRequest => "inventory_request".to_string(),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct RedialState {
@@ -378,6 +432,7 @@ impl NetworkService {
             let mut transfer_ready: HashSet<PeerId> = HashSet::new();
             let mut transfer_blocked: HashSet<PeerId> = HashSet::new();
             let mut transfer_buffer: HashMap<PeerId, VecDeque<TransferJob>> = HashMap::new();
+            let mut transfer_pending: HashMap<OutboundRequestId, (PeerId, String)> = HashMap::new();
             let mut redial: HashMap<PeerId, RedialState> = HashMap::new();
             let mut redial_tick = interval(Duration::from_secs(2));
             let mut total_connections: usize = 0;
@@ -768,6 +823,7 @@ impl NetworkService {
                                     connected_peers_local.remove(&peer_id);
                                     handshake_inflight.remove(&peer_id);
                                     handshake_pending.retain(|_, peer| *peer != peer_id);
+                                    transfer_pending.retain(|_, (peer, _)| *peer != peer_id);
                                     transfer_ready.remove(&peer_id);
                                     transfer_blocked.remove(&peer_id);
                                     transfer_buffer.remove(&peer_id);
@@ -789,6 +845,7 @@ impl NetworkService {
                                     // If we still have a connection but handshake was on the closed one, allow resending.
                                     handshake_inflight.remove(&peer_id);
                                     handshake_pending.retain(|_, peer| *peer != peer_id);
+                                    transfer_pending.retain(|_, (peer, _)| *peer != peer_id);
                                 }
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Pex(event)) => match event {
@@ -924,6 +981,7 @@ impl NetworkService {
                                             transfer_ready.insert(peer);
                                             if let Some(mut queued) = transfer_buffer.remove(&peer) {
                                                 while let Some(job) = queued.pop_front() {
+                                                    let desc = describe_transfer_request(&job.req);
                                                     let req_id = swarm
                                                         .behaviour_mut()
                                                         .transfer
@@ -933,6 +991,7 @@ impl NetworkService {
                                                         req_id,
                                                         job.peer
                                                     );
+                                                    transfer_pending.insert(req_id, (job.peer, desc));
                                                 }
                                             }
                                         } else {
@@ -998,6 +1057,7 @@ impl NetworkService {
 
                                         if let Some(mut queued) = transfer_buffer.remove(&peer) {
                                             while let Some(job) = queued.pop_front() {
+                                                let desc = describe_transfer_request(&job.req);
                                                 let req_id = swarm
                                                     .behaviour_mut()
                                                     .transfer
@@ -1007,6 +1067,7 @@ impl NetworkService {
                                                     req_id,
                                                     job.peer
                                                 );
+                                                transfer_pending.insert(req_id, (job.peer, desc));
                                             }
                                         }
                                     }
@@ -1053,12 +1114,17 @@ impl NetworkService {
                                         libp2p::request_response::Message::Request { request, channel, .. } => {
                                             let _ = event_tx.send(NetworkEvent::TransferRequest(peer, request, channel));
                                         }
-                                        libp2p::request_response::Message::Response { response, .. } => {
+                                        libp2p::request_response::Message::Response { response, request_id } => {
+                                            transfer_pending.remove(&request_id);
                                             let _ = event_tx.send(NetworkEvent::TransferResponse(peer, response));
                                         }
                                     }
                                 }
                                 libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
+                                    let req_desc = transfer_pending
+                                        .remove(&request_id)
+                                        .map(|(_, d)| d)
+                                        .unwrap_or_else(|| "<unknown>".to_string());
                                     match &error {
                                         libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
                                             tracing::debug!(
@@ -1072,10 +1138,11 @@ impl NetworkService {
                                             if err.kind() == std::io::ErrorKind::InvalidData =>
                                         {
                                             tracing::warn!(
-                                                "transfer decode failure from {} ({}): {:?} ({}) (peer may be running an incompatible ONVM version)",
+                                                "transfer decode failure from {} ({}): {:?} req={} ({}) (peer may be running an incompatible ONVM version)",
                                                 peer,
                                                 TRANSFER_PROTOCOL,
                                                 request_id,
+                                                req_desc,
                                                 err
                                             );
                                             let was_ready = peers_clone.write().await.remove(&peer);
@@ -1163,7 +1230,9 @@ impl NetworkService {
                             queue.push_back(job);
                             continue;
                         }
+                        let desc = describe_transfer_request(&job.req);
                         let req_id = swarm.behaviour_mut().transfer.send_request(&job.peer, job.req);
+                        transfer_pending.insert(req_id, (job.peer, desc));
                         tracing::debug!("sent transfer request {:?} to {}", req_id, job.peer);
                     }
                     Some(resp) = transfer_resp_rx.recv() => {

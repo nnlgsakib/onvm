@@ -1,5 +1,8 @@
 use crate::crypto::keys::NodeKeys;
-use crate::types::{BlobId, BlobMetadata, ComputeOp, ProgramId, ProgramMetadata};
+use crate::types::{
+    BlobId, BlobMetadata, ChunkDescriptor, ChunkId, ComputeOp, Manifest, ManifestId, NodeId,
+    Object, ObjectId, ObjectType, ProgramId, ProgramMetadata, StateWrite,
+};
 use anyhow::{anyhow, Context, Result};
 use blake3;
 use ed25519_dalek::{PublicKey as EdPublicKey, Signature as EdSignature};
@@ -20,27 +23,371 @@ pub fn transfer_codec_fingerprint() -> [u8; 32] {
     *FINGERPRINT.get_or_init(|| {
         let mut hasher = blake3::Hasher::new();
 
-        let dummy_program = ProgramId([0u8; 32]);
-        let req = TransferRequest::StateRequest(StateRequest {
-            program_id: dummy_program,
-        });
-        let resp = TransferResponse::Ack;
-
-        match bincode::serde::encode_to_vec(&req, bincode::config::standard()) {
-            Ok(bytes) => {
-                hasher.update(&bytes);
-            }
-            Err(_) => {
-                hasher.update(b"req-encode-error");
+        fn hash_transfer_wire<T: Serialize>(hasher: &mut blake3::Hasher, label: &[u8], value: &T) {
+            hasher.update(label);
+            // Fingerprint must match the *actual transfer wire codec*.
+            match cbor4ii::serde::to_vec(Vec::new(), value) {
+                Ok(bytes) => {
+                    hasher.update(&bytes);
+                }
+                Err(_) => {
+                    hasher.update(b"encode-error");
+                }
             }
         }
-        match bincode::serde::encode_to_vec(&resp, bincode::config::standard()) {
-            Ok(bytes) => {
-                hasher.update(&bytes);
-            }
-            Err(_) => {
-                hasher.update(b"resp-encode-error");
-            }
+
+        // Include the protocol name itself so any intentional protocol bump
+        // necessarily yields a different fingerprint.
+        hasher.update(TRANSFER_PROTOCOL.as_bytes());
+
+        let program_id = ProgramId([0u8; 32]);
+        let blob_id = BlobId([1u8; 32]);
+        let publisher = NodeId([2u8; 32]);
+        let object_id = ObjectId([3u8; 32]);
+        let manifest_id = ManifestId([4u8; 32]);
+        let chunk_id = ChunkId([5u8; 32]);
+        let exec_id = [6u8; 32];
+
+        let blob_meta = BlobMetadata {
+            id: blob_id.clone(),
+            publisher: publisher.clone(),
+            size: 1,
+            mime: Some("application/octet-stream".to_string()),
+            chunk_sizes: vec![1],
+            chunk_hashes: vec![[7u8; 32]],
+            merkle_root: [8u8; 32],
+            data_shards: 1,
+            parity_shards: 1,
+        };
+        let blob_broadcast = BlobBroadcast { meta: blob_meta };
+
+        let program_meta = ProgramMetadata {
+            id: program_id.clone(),
+            publisher: publisher.clone(),
+            size: 1,
+            entrypoint: "main".to_string(),
+            blob_refs: vec![blob_id.clone()],
+            deploy_salt: vec![9u8],
+        };
+        let program_broadcast = ProgramBroadcast {
+            meta: program_meta,
+            wasm: vec![0x00],
+        };
+
+        let compute_op = ComputeOp {
+            program_id: program_id.clone(),
+            input: blob_id.clone(),
+            output: BlobMetadata {
+                id: blob_id.clone(),
+                publisher: publisher.clone(),
+                size: 1,
+                mime: None,
+                chunk_sizes: vec![1],
+                chunk_hashes: vec![[10u8; 32]],
+                merkle_root: [11u8; 32],
+                data_shards: 1,
+                parity_shards: 1,
+            },
+            fuel_used: 1,
+            state_root: [12u8; 32],
+            state_writes: vec![StateWrite {
+                key: vec![0x01],
+                value: Some(vec![0x02]),
+            }],
+        };
+        let exec_broadcast = ExecutionBroadcast {
+            dag_id: exec_id,
+            op: compute_op,
+        };
+
+        let sync_snapshot = SyncSnapshot {
+            programs: vec![program_id.clone()],
+            executions: vec![exec_id],
+        };
+        let sync_delta = SyncDelta {
+            missing_programs: vec![program_id.clone()],
+            missing_executions: vec![exec_id],
+        };
+
+        let state_resp = StateResponse {
+            program_id: program_id.clone(),
+            state_root: [13u8; 32],
+            state_entries: vec![(vec![0xAA], vec![0xBB])],
+        };
+
+        let inventory = DagInventory {
+            programs: vec![[14u8; 32]],
+            program_bloom: Some(BloomFilter {
+                bits: vec![0u8, 1u8, 2u8],
+                k: 3,
+                salt: [0u8; 32],
+            }),
+            blobs: vec![BlobInventoryEntry {
+                id: [15u8; 32],
+                has_data: true,
+                locations: vec!["local".to_string()],
+            }],
+            executions: vec![[16u8; 32]],
+        };
+
+        let object = Object {
+            id: object_id,
+            object_type: ObjectType::WasmProgram {
+                entrypoint: "main".to_string(),
+                wasm_version: Some("v1".to_string()),
+                source_language: Some("rust".to_string()),
+                compiler: Some("rustc".to_string()),
+                blob_refs: vec![ObjectId([17u8; 32])],
+                deploy_salt: vec![0x01, 0x02],
+            },
+            total_size: 1,
+            chunk_count: 1,
+            manifest_id,
+            publisher,
+            created_at: 1,
+        };
+        let manifest = Manifest {
+            object_id,
+            content_hash: [18u8; 32],
+            chunks: vec![ChunkDescriptor {
+                chunk_id,
+                size: 1,
+                offset: 0,
+            }],
+            version: 1,
+        };
+
+        let unified_requests = [
+            crate::network::unified_protocol::UnifiedRequest::GetObjectMetadata(
+                crate::network::unified_protocol::ObjectMetadataRequest { object_id },
+            ),
+            crate::network::unified_protocol::UnifiedRequest::GetManifest(
+                crate::network::unified_protocol::ManifestRequest { object_id },
+            ),
+            crate::network::unified_protocol::UnifiedRequest::GetChunk(
+                crate::network::unified_protocol::ChunkRequest { chunk_id },
+            ),
+            crate::network::unified_protocol::UnifiedRequest::GetChunks(
+                crate::network::unified_protocol::BatchChunkRequest {
+                    chunk_ids: vec![chunk_id],
+                },
+            ),
+            crate::network::unified_protocol::UnifiedRequest::GetObjectAvailability(
+                crate::network::unified_protocol::ObjectAvailabilityRequest { object_id },
+            ),
+            crate::network::unified_protocol::UnifiedRequest::GetFinalizedTransition(
+                crate::network::unified_protocol::FinalizedTransitionRequest {
+                    program_id: program_id.clone(),
+                    height: 1,
+                },
+            ),
+            crate::network::unified_protocol::UnifiedRequest::ExecuteViaLeader(
+                crate::network::unified_protocol::LeaderExecutionRequest {
+                    request_id: [19u8; 32],
+                    program_id: program_id.clone(),
+                    calldata: vec![0x01],
+                },
+            ),
+            crate::network::unified_protocol::UnifiedRequest::GetProgramManifest(
+                crate::network::unified_protocol::ProgramManifestRequest {
+                    program_id: program_id.clone(),
+                },
+            ),
+        ];
+
+        let unified_responses = [
+            crate::network::unified_protocol::UnifiedResponse::ObjectMetadata(
+                crate::network::unified_protocol::ObjectMetadataResponse {
+                    object_id,
+                    metadata: Some(object.clone()),
+                },
+            ),
+            crate::network::unified_protocol::UnifiedResponse::Manifest(
+                crate::network::unified_protocol::ManifestResponse {
+                    manifest: Some(manifest.clone()),
+                },
+            ),
+            crate::network::unified_protocol::UnifiedResponse::Chunk(
+                crate::network::unified_protocol::ChunkResponse {
+                    chunk_id,
+                    data: Some(vec![0x01, 0x02]),
+                },
+            ),
+            crate::network::unified_protocol::UnifiedResponse::Chunks(
+                crate::network::unified_protocol::BatchChunkResponse {
+                    chunks: vec![(chunk_id, Some(vec![0x03]))],
+                },
+            ),
+            crate::network::unified_protocol::UnifiedResponse::ObjectAvailability(
+                crate::network::unified_protocol::ObjectAvailabilityResponse {
+                    object_id,
+                    has_object: true,
+                    has_manifest: true,
+                    available_chunks: vec![chunk_id],
+                    missing_chunks: vec![ChunkId([20u8; 32])],
+                    metadata: Some(object.clone()),
+                },
+            ),
+            crate::network::unified_protocol::UnifiedResponse::FinalizedTransition(
+                crate::network::unified_protocol::FinalizedTransitionResponse {
+                    program_id: program_id.clone(),
+                    height: 1,
+                    bundle: None,
+                },
+            ),
+            crate::network::unified_protocol::UnifiedResponse::ExecuteViaLeader(
+                crate::network::unified_protocol::LeaderExecutionResponse {
+                    request_id: [19u8; 32],
+                    outcome: None,
+                    redirect: None,
+                    error: Some("not available".to_string()),
+                },
+            ),
+            crate::network::unified_protocol::UnifiedResponse::ProgramManifest(
+                crate::network::unified_protocol::ProgramManifestResponse {
+                    program_id: program_id.clone(),
+                    manifest: None,
+                },
+            ),
+        ];
+
+        // Requests
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:program",
+            &TransferRequest::Program(program_id.clone()),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:program_chunk",
+            &TransferRequest::ProgramChunk {
+                id: program_id.clone(),
+                chunk_idx: 1,
+            },
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:blob",
+            &TransferRequest::Blob(blob_id.clone()),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:blob_chunk",
+            &TransferRequest::BlobChunk {
+                id: blob_id.clone(),
+                chunk_idx: 1,
+            },
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:execution",
+            &TransferRequest::Execution(exec_id),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:push_program",
+            &TransferRequest::PushProgram(program_broadcast.clone()),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:push_program_chunk",
+            &TransferRequest::PushProgramChunk {
+                id: program_id.clone(),
+                chunk_idx: 1,
+                chunk_data: vec![0x01, 0x02],
+            },
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:push_blob",
+            &TransferRequest::PushBlob(blob_broadcast.clone()),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:push_execution",
+            &TransferRequest::PushExecution(exec_broadcast.clone()),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:sync",
+            &TransferRequest::Sync(sync_snapshot),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:state_request",
+            &TransferRequest::StateRequest(StateRequest {
+                program_id: program_id.clone(),
+            }),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"req:inventory_request",
+            &TransferRequest::InventoryRequest,
+        );
+        for (idx, req) in unified_requests.iter().enumerate() {
+            hash_transfer_wire(
+                &mut hasher,
+                format!("req:unified:{idx}").as_bytes(),
+                &TransferRequest::Unified(req.clone()),
+            );
+        }
+
+        // Responses
+        hash_transfer_wire(
+            &mut hasher,
+            b"resp:program",
+            &TransferResponse::Program(Some(program_broadcast.clone())),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"resp:program_chunk",
+            &TransferResponse::ProgramChunk {
+                id: program_id.clone(),
+                chunk_idx: 1,
+                chunk_data: Some(vec![0x01]),
+            },
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"resp:blob",
+            &TransferResponse::Blob(Some(blob_broadcast.clone())),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"resp:blob_chunk",
+            &TransferResponse::BlobChunk {
+                id: blob_id.clone(),
+                chunk_idx: 1,
+                shards: Some(vec![(0u8, vec![0x01]), (1u8, vec![0x02])]),
+            },
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"resp:execution",
+            &TransferResponse::Execution(Some(exec_broadcast)),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"resp:sync",
+            &TransferResponse::Sync(sync_delta),
+        );
+        hash_transfer_wire(&mut hasher, b"resp:ack", &TransferResponse::Ack);
+        hash_transfer_wire(
+            &mut hasher,
+            b"resp:state_response",
+            &TransferResponse::StateResponse(state_resp),
+        );
+        hash_transfer_wire(
+            &mut hasher,
+            b"resp:inventory",
+            &TransferResponse::Inventory(inventory),
+        );
+        for (idx, resp) in unified_responses.iter().enumerate() {
+            hash_transfer_wire(
+                &mut hasher,
+                format!("resp:unified:{idx}").as_bytes(),
+                &TransferResponse::Unified(resp.clone()),
+            );
         }
 
         let hash = hasher.finalize();
@@ -239,14 +586,16 @@ pub struct StateResponse {
     pub state_entries: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct BlobInventoryEntry {
     pub id: [u8; 32],
     pub has_data: bool,
     pub locations: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct DagInventory {
     pub programs: Vec<[u8; 32]>,
     pub program_bloom: Option<BloomFilter>,

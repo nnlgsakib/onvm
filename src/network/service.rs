@@ -674,9 +674,7 @@ impl NetworkService {
                                         .behaviour_mut()
                                         .gossipsub
                                         .add_explicit_peer(&peer_id);
-                                    peers_clone.write().await.insert(peer_id);
                                     connected_peers_local.insert(peer_id);
-                                    let _ = event_tx.send(NetworkEvent::PeerConnected(peer_id));
                                 }
 
                                 if endpoint.is_dialer() {
@@ -766,7 +764,7 @@ impl NetworkService {
                                         .behaviour_mut()
                                         .gossipsub
                                         .remove_explicit_peer(&peer_id);
-                                    peers_clone.write().await.remove(&peer_id);
+                                    let was_ready = peers_clone.write().await.remove(&peer_id);
                                     connected_peers_local.remove(&peer_id);
                                     handshake_inflight.remove(&peer_id);
                                     handshake_pending.retain(|_, peer| *peer != peer_id);
@@ -782,7 +780,9 @@ impl NetworkService {
                                         attempts: 0,
                                     });
 
-                                    let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
+                                    if was_ready {
+                                        let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
+                                    }
                                 } else if !transfer_ready.contains(&peer_id)
                                     && !transfer_blocked.contains(&peer_id)
                                 {
@@ -916,6 +916,10 @@ impl NetworkService {
                                             .send_response(channel, response);
 
                                         if ok {
+                                            let is_new = peers_clone.write().await.insert(peer);
+                                            if is_new {
+                                                let _ = event_tx.send(NetworkEvent::PeerConnected(peer));
+                                            }
                                             transfer_blocked.remove(&peer);
                                             transfer_ready.insert(peer);
                                             if let Some(mut queued) = transfer_buffer.remove(&peer) {
@@ -932,6 +936,10 @@ impl NetworkService {
                                                 }
                                             }
                                         } else {
+                                            let was_ready = peers_clone.write().await.remove(&peer);
+                                            if was_ready {
+                                                let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+                                            }
                                             transfer_ready.remove(&peer);
                                             transfer_blocked.insert(peer);
                                             transfer_buffer.remove(&peer);
@@ -949,6 +957,10 @@ impl NetworkService {
                                                 peer,
                                                 response.message.as_deref().unwrap_or("no details")
                                             );
+                                            let was_ready = peers_clone.write().await.remove(&peer);
+                                            if was_ready {
+                                                let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+                                            }
                                             transfer_ready.remove(&peer);
                                             transfer_blocked.insert(peer);
                                             transfer_buffer.remove(&peer);
@@ -967,12 +979,20 @@ impl NetworkService {
                                                 TRANSFER_PROTOCOL,
                                                 hex::encode(local_fp)
                                             );
+                                            let was_ready = peers_clone.write().await.remove(&peer);
+                                            if was_ready {
+                                                let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+                                            }
                                             transfer_ready.remove(&peer);
                                             transfer_blocked.insert(peer);
                                             transfer_buffer.remove(&peer);
                                             continue;
                                         }
 
+                                        let is_new = peers_clone.write().await.insert(peer);
+                                        if is_new {
+                                            let _ = event_tx.send(NetworkEvent::PeerConnected(peer));
+                                        }
                                         transfer_blocked.remove(&peer);
                                         transfer_ready.insert(peer);
 
@@ -1007,6 +1027,10 @@ impl NetworkService {
                                             peer,
                                             request_id
                                         );
+                                    }
+                                    let was_ready = peers_clone.write().await.remove(&peer);
+                                    if was_ready {
+                                        let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
                                     }
                                     transfer_ready.remove(&peer);
                                     transfer_blocked.insert(peer);
@@ -1048,11 +1072,16 @@ impl NetworkService {
                                             if err.kind() == std::io::ErrorKind::InvalidData =>
                                         {
                                             tracing::warn!(
-                                                "transfer decode failure from {} ({}): {:?} (peer may be running an incompatible ONVM version)",
+                                                "transfer decode failure from {} ({}): {:?} ({}) (peer may be running an incompatible ONVM version)",
                                                 peer,
                                                 TRANSFER_PROTOCOL,
-                                                request_id
+                                                request_id,
+                                                err
                                             );
+                                            let was_ready = peers_clone.write().await.remove(&peer);
+                                            if was_ready {
+                                                let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+                                            }
                                             transfer_ready.remove(&peer);
                                             transfer_blocked.insert(peer);
                                             transfer_buffer.remove(&peer);
@@ -1080,11 +1109,16 @@ impl NetworkService {
                                             if err.kind() == std::io::ErrorKind::InvalidData =>
                                         {
                                             tracing::warn!(
-                                                "transfer decode failure from {} ({}): {:?} (peer may be running an incompatible ONVM version)",
+                                                "transfer decode failure from {} ({}): {:?} ({}) (peer may be running an incompatible ONVM version)",
                                                 peer,
                                                 TRANSFER_PROTOCOL,
-                                                request_id
+                                                request_id,
+                                                err
                                             );
+                                            let was_ready = peers_clone.write().await.remove(&peer);
+                                            if was_ready {
+                                                let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+                                            }
                                             transfer_ready.remove(&peer);
                                             transfer_blocked.insert(peer);
                                             transfer_buffer.remove(&peer);

@@ -18,6 +18,7 @@ hex = "0.4"
 bincode = { version = "2.0", features = ["serde"] }
 base64 = "0.22"
 fastcdc = "3.2"
+cbor4ii = { version = "0.3.3", features = ["serde1"] }
 libp2p = { version = "0.53", default-features = false, features = [
     "tcp",
     "dns",

@@ -5,6 +5,7 @@ use crate::network::codec::{
     TransferResponse, HANDSHAKE_PROTOCOL, TOPIC_BLOBS, TOPIC_BLOCKS, TOPIC_PROGRAMS,
     TRANSFER_PROTOCOL,
 };
+use crate::network::peer_cache::{PeerCache, PEER_CACHE_MAX_AGE_MS};
 use anyhow::{anyhow, Context, Result};
 use blake3;
 use futures::StreamExt;
@@ -23,7 +24,10 @@ use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{NetworkBehaviour, StreamProtocol, SwarmEvent};
 use libp2p::yamux;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
+use rand::seq::SliceRandom;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -161,6 +165,8 @@ pub struct NetworkConfig {
     pub pex: crate::config::PexConfig,
     pub keep_alive: crate::config::KeepAliveConfig,
     pub memory_throttle: crate::config::MemoryThrottleConfig,
+    pub peer_cache_path: Option<PathBuf>,
+    pub public_peer_db_path: Option<PathBuf>,
 }
 
 enum KadCommand {
@@ -218,12 +224,12 @@ fn strip_p2p_component(addr: &Multiaddr) -> Multiaddr {
 }
 
 fn ensure_p2p_component(mut addr: Multiaddr, peer: &PeerId) -> Multiaddr {
-    let has_p2p = addr
-        .iter()
-        .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_)));
-    if !has_p2p {
-        addr.push(libp2p::multiaddr::Protocol::P2p((*peer).into()));
+    if let Some(last) = addr.pop() {
+        if !matches!(last, libp2p::multiaddr::Protocol::P2p(_)) {
+            addr.push(last);
+        }
     }
+    addr.push(libp2p::multiaddr::Protocol::P2p((*peer).into()));
     addr
 }
 
@@ -417,6 +423,8 @@ impl NetworkService {
         let pex_cfg = config.pex.clone();
         let keep_alive_cfg = config.keep_alive.clone();
         let mem_cfg = config.memory_throttle.clone();
+        let peer_cache_path = config.peer_cache_path.clone();
+        let public_peer_db_path = config.public_peer_db_path.clone();
         let max_total_connections = config.max_total_connections.max(1);
         let max_connections_per_peer = config.max_connections_per_peer.max(1);
         let max_inbound_connections = config.max_inbound_connections.max(1);
@@ -459,9 +467,60 @@ impl NetworkService {
                     swarm.behaviour_mut().kademlia.add_address(&peer, base);
                 }
             }
+
+            let mut peer_cache = PeerCache::new(
+                peer_id,
+                &bootnodes,
+                peer_cache_path.clone(),
+                public_peer_db_path.clone(),
+                pex_policy.clone(),
+            );
+            match peer_cache.load(&mut known_addrs).await {
+                Ok(stats) => {
+                    if let Some(path) = peer_cache_path.as_ref() {
+                        if stats.peer_cache_peers > 0 {
+                            tracing::info!(
+                                "loaded {} peers from peer cache {}",
+                                stats.peer_cache_peers,
+                                path.display()
+                            );
+                        }
+                    }
+                    if let Some(path) = public_peer_db_path.as_ref() {
+                        if stats.public_db_peers > 0 {
+                            tracing::info!(
+                                "loaded {} public peers from public peer db {}",
+                                stats.public_db_peers,
+                                path.display()
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("failed to load peer cache: {}", err);
+                }
+            }
+
+            for (pid, addrs) in known_addrs.iter() {
+                if *pid == peer_id {
+                    continue;
+                }
+                for addr in addrs {
+                    swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(pid, addr.clone());
+                }
+            }
+
+            let mut peer_cache_tick = interval(Duration::from_secs(60));
+            let mut discovery_dial_tick = interval(Duration::from_secs(3));
+            let mut public_peer_prune_tick = interval(Duration::from_secs(300));
+
             let mut pex_tick = interval(Duration::from_secs(pex_cfg.request_interval_secs.max(1)));
             let mut pex_pending: HashMap<libp2p::request_response::OutboundRequestId, PeerId> =
                 HashMap::new();
+            let mut pex_inflight: HashSet<PeerId> = HashSet::new();
 
             let mut ping_tick = interval(Duration::from_secs(
                 keep_alive_cfg.ping_interval_secs.max(1),
@@ -471,7 +530,48 @@ impl NetworkService {
             let mut ping_inflight: HashSet<PeerId> = HashSet::new();
             let mut ping_failures: HashMap<PeerId, u32> = HashMap::new();
             let mut connected_peers_local: HashSet<PeerId> = HashSet::new();
-            let mut dialing_peers: HashSet<PeerId> = HashSet::new();
+            let mut dialing_peers: HashSet<PeerId> = bootnodes
+                .iter()
+                .filter_map(peer_id_from_multiaddr)
+                .collect();
+
+            if !memory_pressure && !known_addrs.is_empty() {
+                let effective_max_total = max_total_connections.max(1);
+                if total_connections < effective_max_total {
+                    let now_ms = crate::network::ping_png::now_ms();
+                    let mut candidates: Vec<(PeerId, u64)> = known_addrs
+                        .keys()
+                        .cloned()
+                        .filter_map(|pid| {
+                            if pid == peer_id {
+                                return None;
+                            }
+                            if dialing_peers.contains(&pid) {
+                                return None;
+                            }
+                            let Some(seen_ms) = peer_cache.last_seen_ms(&pid) else {
+                                return None;
+                            };
+                            if now_ms.saturating_sub(seen_ms) > PEER_CACHE_MAX_AGE_MS {
+                                return None;
+                            }
+                            Some((pid, seen_ms))
+                        })
+                        .collect();
+                    candidates.sort_by_key(|(_, seen)| Reverse(*seen));
+
+                    for (pid, _) in candidates.into_iter().take(3) {
+                        if dial_peer_best_effort(&mut swarm, pid, &known_addrs) {
+                            dialing_peers.insert(pid);
+                        } else {
+                            redial.entry(pid).or_insert(RedialState {
+                                next_attempt_at: Instant::now() + Duration::from_millis(250),
+                                attempts: 0,
+                            });
+                        }
+                    }
+                }
+            }
 
             loop {
                 tokio::select! {
@@ -494,6 +594,92 @@ impl NetworkService {
                             }
                         }
                     }
+                    _ = peer_cache_tick.tick() => {
+                        if let Err(err) = peer_cache.persist_tick(&known_addrs).await {
+                            tracing::warn!("peer cache persist failed: {}", err);
+                        }
+                    }
+                    _ = public_peer_prune_tick.tick() => {
+                        let removed = peer_cache.prune_public_peer_db();
+                        if removed > 0 {
+                            tracing::debug!(
+                                "pruned {} stale peers from public peer db",
+                                removed
+                            );
+                        }
+                    }
+                    _ = discovery_dial_tick.tick() => {
+                        if memory_pressure {
+                            continue;
+                        }
+
+                        let effective_max_total = if mem_cfg.enable && memory_pressure {
+                            mem_cfg.max_total_connections_under_pressure
+                        } else {
+                            max_total_connections
+                        }
+                        .max(1);
+
+                        if total_connections >= effective_max_total {
+                            continue;
+                        }
+
+                        let needed = pex_cfg.target_peers.saturating_sub(connected_peers_local.len());
+                        if needed == 0 {
+                            continue;
+                        }
+
+                        let now_ms = crate::network::ping_png::now_ms();
+                        let mut candidates: Vec<(PeerId, u64)> = known_addrs
+                            .iter()
+                            .filter_map(|(pid, addrs)| {
+                                if *pid == peer_id {
+                                    return None;
+                                }
+                                if addrs.is_empty() {
+                                    return None;
+                                }
+                                if connected_peers_local.contains(pid) {
+                                    return None;
+                                }
+                                if dialing_peers.contains(pid) {
+                                    return None;
+                                }
+                                if transfer_blocked.contains(pid) {
+                                    return None;
+                                }
+                                if redial.contains_key(pid) {
+                                    return None;
+                                }
+
+                                let last_seen_ms = peer_cache.last_seen_ms(pid).unwrap_or(0);
+                                if last_seen_ms == 0 {
+                                    return None;
+                                }
+                                if now_ms.saturating_sub(last_seen_ms) > PEER_CACHE_MAX_AGE_MS {
+                                    return None;
+                                }
+
+                                Some((*pid, last_seen_ms))
+                            })
+                            .collect();
+
+                        candidates.sort_by_key(|(_, seen)| Reverse(*seen));
+                        candidates.truncate(32);
+                        candidates.shuffle(&mut rand::thread_rng());
+
+                        let dial_attempts = needed.min(2).min(candidates.len());
+                        for (pid, _) in candidates.into_iter().take(dial_attempts) {
+                            if dial_peer_best_effort(&mut swarm, pid, &known_addrs) {
+                                dialing_peers.insert(pid);
+                            } else {
+                                redial.entry(pid).or_insert(RedialState {
+                                    next_attempt_at: Instant::now() + Duration::from_millis(250),
+                                    attempts: 0,
+                                });
+                            }
+                        }
+                    }
                     _ = ping_tick.tick() => {
                         if keep_alive_cfg.enable {
                             let peers: Vec<PeerId> = connected_peers_local.iter().copied().collect();
@@ -510,13 +696,24 @@ impl NetworkService {
                     }
                     _ = pex_tick.tick() => {
                         if pex_cfg.enable {
-                            let peer_count = connected_peers_local.len();
-                            if peer_count < pex_cfg.target_peers && !memory_pressure {
-                                for peer in connected_peers_local.iter().copied().take(3) {
-                                    let req = crate::network::pex::PexRequest { want: pex_cfg.want_peers as u32 };
-                                    let req_id = swarm.behaviour_mut().pex.send_request(&peer, req);
-                                    pex_pending.insert(req_id, peer);
+                            if memory_pressure || connected_peers_local.is_empty() {
+                                continue;
+                            }
+
+                            let mut peers: Vec<PeerId> =
+                                connected_peers_local.iter().copied().collect();
+                            peers.shuffle(&mut rand::thread_rng());
+
+                            for peer in peers.into_iter().take(3) {
+                                if pex_inflight.contains(&peer) {
+                                    continue;
                                 }
+                                let req = crate::network::pex::PexRequest {
+                                    want: pex_cfg.want_peers as u32,
+                                };
+                                let req_id = swarm.behaviour_mut().pex.send_request(&peer, req);
+                                pex_pending.insert(req_id, peer);
+                                pex_inflight.insert(peer);
                             }
                         }
                     }
@@ -632,8 +829,10 @@ impl NetworkService {
                             SwarmEvent::Behaviour(BehaviourEvent::Identify(ev)) => match ev {
                                 identify::Event::Received { peer_id: remote, info, .. }
                                 | identify::Event::Pushed { peer_id: remote, info, .. } => {
-                                    let mut addrs = info.listen_addrs;
-                                    addrs.push(info.observed_addr);
+                                    let addrs = crate::network::pex::rewrite_unspecified_listen_addrs(
+                                        info.listen_addrs,
+                                        &info.observed_addr,
+                                    );
                                     let validated = match crate::network::pex::validate_peer_addrs(
                                         &remote,
                                         &addrs,
@@ -650,11 +849,21 @@ impl NetworkService {
                                         }
                                     };
                                     if !validated.is_empty() {
-                                        let entry = known_addrs.entry(remote).or_default();
-                                        for addr in validated {
-                                            entry.insert(addr.clone());
-                                            swarm.behaviour_mut().kademlia.add_address(&remote, addr);
+                                        {
+                                            let entry = known_addrs.entry(remote).or_default();
+                                            for addr in validated {
+                                                let base = strip_p2p_component(&addr);
+                                                entry.insert(base.clone());
+                                                swarm.behaviour_mut().kademlia.add_address(&remote, base);
+                                            }
                                         }
+
+                                        let now_ms = crate::network::ping_png::now_ms();
+                                        peer_cache.note_peer_addresses_updated(
+                                            remote,
+                                            now_ms,
+                                            &known_addrs,
+                                        );
                                     }
                                 }
                                 identify::Event::Error { peer_id: remote, error, .. } => {
@@ -735,15 +944,17 @@ impl NetworkService {
                                     total_connections
                                 );
 
+                                let now_ms = crate::network::ping_png::now_ms();
+
                                 // Only treat `Dialer` endpoints as dialable addresses. For inbound connections the
                                 // "remote address" is a send-back address (often an ephemeral port) and is usually
                                 // not dialable. We rely on Identify to learn listen addrs.
                                 if endpoint.is_dialer() {
-                                    known_addrs
-                                        .entry(peer_id)
-                                        .or_default()
-                                        .insert(endpoint.get_remote_address().clone());
+                                    let base = strip_p2p_component(endpoint.get_remote_address());
+                                    known_addrs.entry(peer_id).or_default().insert(base.clone());
                                 }
+
+                                peer_cache.note_peer_addresses_updated(peer_id, now_ms, &known_addrs);
 
                                 redial.remove(&peer_id);
 
@@ -756,13 +967,11 @@ impl NetworkService {
                                 dialing_peers.remove(&peer_id);
 
                                 if endpoint.is_dialer() {
+                                    let base = strip_p2p_component(endpoint.get_remote_address());
                                     swarm
                                         .behaviour_mut()
                                         .kademlia
-                                        .add_address(
-                                            &peer_id,
-                                            endpoint.get_remote_address().clone(),
-                                    );
+                                        .add_address(&peer_id, base);
                                     let _ = swarm.behaviour_mut().kademlia.bootstrap();
                                 }
 
@@ -803,6 +1012,16 @@ impl NetworkService {
                                     peer,
                                     connection_id
                                 );
+
+                                if !memory_pressure
+                                    && connected_peers_local.len() < pex_cfg.target_peers
+                                    && !transfer_blocked.contains(&peer)
+                                {
+                                    redial.entry(peer).or_insert(RedialState {
+                                        next_attempt_at: Instant::now() + Duration::from_millis(250),
+                                        attempts: 0,
+                                    });
+                                }
                             }
                             SwarmEvent::ConnectionClosed { peer_id, connection_id, endpoint: _endpoint, num_established, cause, .. } => {
                                 if counted_connections.remove(&connection_id) {
@@ -889,18 +1108,22 @@ impl NetworkService {
                                 }
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Pex(event)) => match event {
-                                libp2p::request_response::Event::Message { peer: _, message } => match message {
+                                libp2p::request_response::Event::Message { peer, message } => match message {
                                     libp2p::request_response::Message::Request { request, channel, .. } => {
                                         let response = crate::network::pex::build_response(
                                             &known_addrs,
                                             &pex_policy,
                                             request.want as usize,
                                             peer_id,
+                                            peer,
                                         );
                                         let _ = swarm.behaviour_mut().pex.send_response(channel, response);
                                     }
                                     libp2p::request_response::Message::Response { response, request_id } => {
-                                        let _ = pex_pending.remove(&request_id);
+                                        let from_peer = pex_pending.remove(&request_id);
+                                        if let Some(peer) = from_peer.as_ref() {
+                                            pex_inflight.remove(peer);
+                                        }
                                         let discovered = crate::network::pex::parse_response(
                                             response,
                                             &pex_policy,
@@ -910,6 +1133,16 @@ impl NetworkService {
                                             continue;
                                         }
 
+                                        let now_ms = crate::network::ping_png::now_ms();
+
+                                        if let Some(from) = from_peer.as_ref() {
+                                            tracing::info!(
+                                                "PEX discovered {} peers via {}",
+                                                discovered.len(),
+                                                from
+                                            );
+                                        }
+
                                         let effective_max_total = if mem_cfg.enable && memory_pressure {
                                             mem_cfg.max_total_connections_under_pressure
                                         } else {
@@ -917,14 +1150,53 @@ impl NetworkService {
                                         }
                                         .max(1);
 
+                                        let mut dial_budget = if memory_pressure
+                                            || total_connections >= effective_max_total
+                                        {
+                                            0usize
+                                        } else {
+                                            pex_cfg
+                                                .target_peers
+                                                .saturating_sub(connected_peers_local.len())
+                                                .min(4)
+                                        };
+
                                         for (pid, addrs) in discovered {
-                                            let entry = known_addrs.entry(pid).or_default();
-                                            for addr in addrs {
-                                                entry.insert(addr.clone());
-                                                swarm.behaviour_mut().kademlia.add_address(&pid, addr);
+                                            let is_new_peer = match known_addrs.get(&pid) {
+                                                None => true,
+                                                Some(existing) => existing.is_empty(),
+                                            };
+
+                                            {
+                                                let entry = known_addrs.entry(pid).or_default();
+                                                for addr in addrs {
+                                                    let base = strip_p2p_component(&addr);
+                                                    entry.insert(base.clone());
+                                                    swarm
+                                                        .behaviour_mut()
+                                                        .kademlia
+                                                        .add_address(&pid, base);
+                                                }
                                             }
 
-                                            if memory_pressure || total_connections >= effective_max_total {
+                                            peer_cache.note_pex_discovered_peer(pid, now_ms, &known_addrs);
+
+                                            if is_new_peer {
+                                                if let Some(from) = from_peer.as_ref() {
+                                                    tracing::info!(
+                                                        "discovered new peer {} from {} via pex",
+                                                        pid,
+                                                        from
+                                                    );
+                                                } else {
+                                                    tracing::info!(
+                                                        "discovered new peer {} via pex",
+                                                        pid
+                                                    );
+                                                }
+                                            }
+
+                                            if dial_budget == 0 {
                                                 continue;
                                             }
 
@@ -940,13 +1212,22 @@ impl NetworkService {
                                                 continue;
                                             }
                                             if dial_peer_best_effort(&mut swarm, pid, &known_addrs) {
+                                                dialing_peers.insert(pid);
+                                                dial_budget = dial_budget.saturating_sub(1);
                                                 tracing::debug!("PEX dialing discovered peer {}", pid);
+                                            } else {
+                                                redial.entry(pid).or_insert(RedialState {
+                                                    next_attempt_at: Instant::now()
+                                                        + Duration::from_millis(250),
+                                                    attempts: 0,
+                                                });
                                             }
                                         }
                                     }
                                 },
                                 libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
                                     pex_pending.remove(&request_id);
+                                    pex_inflight.remove(&peer);
                                     tracing::debug!("PEX outbound failure to {}: {error:?} ({:?})", peer, request_id);
                                 }
                                 libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
@@ -1022,6 +1303,20 @@ impl NetworkService {
                                             }
                                             transfer_blocked.remove(&peer);
                                             transfer_ready.insert(peer);
+
+                                            if pex_cfg.enable && !memory_pressure && !pex_inflight.contains(&peer)
+                                            {
+                                                let req = crate::network::pex::PexRequest {
+                                                    want: pex_cfg.want_peers as u32,
+                                                };
+                                                let req_id = swarm
+                                                    .behaviour_mut()
+                                                    .pex
+                                                    .send_request(&peer, req);
+                                                pex_pending.insert(req_id, peer);
+                                                pex_inflight.insert(peer);
+                                            }
+
                                             if let Some(mut queued) = transfer_buffer.remove(&peer) {
                                                 while let Some(job) = queued.pop_front() {
                                                     let desc = describe_transfer_request(&job.req);
@@ -1097,6 +1392,16 @@ impl NetworkService {
                                         }
                                         transfer_blocked.remove(&peer);
                                         transfer_ready.insert(peer);
+
+                                        if pex_cfg.enable && !memory_pressure && !pex_inflight.contains(&peer)
+                                        {
+                                            let req = crate::network::pex::PexRequest {
+                                                want: pex_cfg.want_peers as u32,
+                                            };
+                                            let req_id = swarm.behaviour_mut().pex.send_request(&peer, req);
+                                            pex_pending.insert(req_id, peer);
+                                            pex_inflight.insert(peer);
+                                        }
 
                                         if let Some(mut queued) = transfer_buffer.remove(&peer) {
                                             while let Some(job) = queued.pop_front() {

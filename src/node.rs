@@ -119,6 +119,8 @@ impl Node {
                     pex: config.network.pex.clone(),
                     keep_alive: config.network.keep_alive.clone(),
                     memory_throttle: config.network.memory_throttle.clone(),
+                    peer_cache_path: Some(config.data_dir.join("peers.json")),
+                    public_peer_db_path: Some(config.data_dir.join("public_peers_db")),
                 },
             )
             .await

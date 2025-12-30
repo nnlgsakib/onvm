@@ -2,6 +2,7 @@ mod chunk_distributor;
 pub mod codec;
 pub mod coordination;
 pub mod dht;
+pub mod peer_cache;
 pub mod pex;
 pub mod ping_png;
 mod service;

@@ -29,7 +29,7 @@ The ONVM unified protocol treats WASM programs and data blobs as identical primi
 
 - **Unified data model**: Single protocol for programs and blobs
 - **Content addressing**: Objects identified by BLAKE3 hash of full content
-- **Chunk-based distribution**: Variable-size chunking with FastCDC (256 KiB - 4 MiB)
+- **Chunk-based distribution**: Fixed-size 2-layer chunking (2 MiB chunks + 250 KiB transport parts; ≤2 MiB uses 250 KiB chunks)
 - **Lazy fetching**: On-demand chunk retrieval via P2P request-response
 - **Strong verification**: Per-chunk and full-object hash verification
 - **Local execution only**: All WASM execution happens locally after full object assembly
@@ -175,19 +175,17 @@ WebAssembly module with execution metadata. Blob references enable:
 
 ### 3.3 Chunking Strategy
 
-**FastCDC (Content-Defined Chunking)**
+**Fixed-Size Two-Layer Chunking**
 
 ```rust
-CHUNK_SIZE_MIN: 256 KiB
-CHUNK_SIZE_AVG: 1 MiB (target)
-CHUNK_SIZE_MAX: 4 MiB
+TOP_LEVEL_SMALL: 250 KiB   // when total_size <= 2 MiB
+TOP_LEVEL_LARGE: 2 MiB     // when total_size  > 2 MiB
+TRANSPORT_PART: 250 KiB    // range-requests for large top-level chunks
 
-Algorithm: FastCDC v2020
 Rationale:
-  - Content-defined boundaries enable cross-object deduplication
-  - Variable size adapts to content structure
-  - Max 4 MiB fits within single network messages
-  - Min 256 KiB prevents excessive chunk overhead
+  - Predictable chunk counts for large objects
+  - Bounded request/response payload sizes (avoids outbound stream exhaustion)
+  - Still verifies at the top-level chunk hash (ChunkId = BLAKE3(chunk_bytes))
 ```
 
 **Chunking Process:**
@@ -196,12 +194,13 @@ Rationale:
 Input: data (Vec<u8>)
 Output: Vec<Chunk>
 
-1. Run FastCDC chunker with min/avg/max parameters
-2. For each chunk boundary:
-   a. Extract chunk_data = data[offset..offset+length]
-   b. Compute chunk_id = BLAKE3(chunk_data)
-   c. Create Chunk { id: chunk_id, data: chunk_data }
-3. Return Vec<Chunk>
+1. Choose top-level chunk size:
+   - If data.len() > 2 MiB: use 2 MiB
+   - Else: use 250 KiB
+2. Split data into fixed-size top-level chunks
+3. For each chunk:
+   a. Compute chunk_id = BLAKE3(chunk_data)
+   b. Create Chunk { id: chunk_id, data: chunk_data }
 ```
 
 ### 3.4 Manifest Structure
@@ -499,7 +498,7 @@ Parallelism strategy:
 
 3. Node processes deployment:
    a. Decode WASM bytes
-   b. Chunk data with FastCDC
+   b. Chunk data with fixed-size 2-layer chunking
    c. Build manifest
    d. Compute ObjectId = BLAKE3(wasm_bytes)
    e. Create Object with WasmProgram type
@@ -533,7 +532,8 @@ Parallelism strategy:
 
 5. Fetch chunks in parallel:
    For each chunk in missing:
-     - Request from provider
+     - If chunk.size <= 250 KiB: request full chunk
+     - Else: request chunk parts (ranges of 250 KiB) and reassemble
      - Verify: ChunkId == BLAKE3(chunk_data)
      - Store locally
 
@@ -605,13 +605,14 @@ src/types.rs
 
 src/storage/unified_store.rs
   - UnifiedStore: unified storage layer
-  - chunk_data(): FastCDC chunking
+  - chunk_data(): fixed-size chunking
   - put_object(), get_object()
 
 src/network/unified_protocol.rs
   - ObjectAnnouncement
   - ManifestRequest/Response
   - ChunkRequest/Response
+  - ChunkPartRequest/Response
   - UnifiedRequest/Response
 
 src/network/chunk_distributor.rs

@@ -167,6 +167,13 @@ pub fn transfer_codec_fingerprint() -> [u8; 32] {
             crate::network::unified_protocol::UnifiedRequest::GetChunk(
                 crate::network::unified_protocol::ChunkRequest { chunk_id },
             ),
+            crate::network::unified_protocol::UnifiedRequest::GetChunkPart(
+                crate::network::unified_protocol::ChunkPartRequest {
+                    chunk_id,
+                    offset: 0,
+                    length: 1,
+                },
+            ),
             crate::network::unified_protocol::UnifiedRequest::GetChunks(
                 crate::network::unified_protocol::BatchChunkRequest {
                     chunk_ids: vec![chunk_id],
@@ -211,6 +218,13 @@ pub fn transfer_codec_fingerprint() -> [u8; 32] {
                 crate::network::unified_protocol::ChunkResponse {
                     chunk_id,
                     data: Some(vec![0x01, 0x02]),
+                },
+            ),
+            crate::network::unified_protocol::UnifiedResponse::ChunkPart(
+                crate::network::unified_protocol::ChunkPartResponse {
+                    chunk_id,
+                    offset: 0,
+                    data: Some(vec![0x04]),
                 },
             ),
             crate::network::unified_protocol::UnifiedResponse::Chunks(

@@ -1,30 +1,34 @@
 use crate::network::dht;
-use crate::network::unified_protocol::{ChunkRequest, ObjectAnnouncement};
-use crate::network::{NetworkHandle, ProviderKind};
-use crate::storage::UnifiedStore;
-use crate::types::{Chunk, ChunkId, Object, ObjectId};
-use anyhow::{anyhow, Result};
+use crate::network::unified_protocol::{
+    ChunkPartRequest, ChunkPartResponse, ChunkRequest, ChunkResponse, ManifestRequest,
+    ManifestResponse, ObjectAnnouncement, ObjectMetadataRequest, ObjectMetadataResponse,
+    UnifiedRequest, UnifiedResponse,
+};
+use crate::network::{NetworkHandle, ProviderKind, TransferRequest, TransferResponse};
+use crate::storage::{UnifiedStore, CHUNK_SIZE_SMALL};
+use crate::types::{Chunk, ChunkDescriptor, ChunkId, Manifest, Object, ObjectId};
+use anyhow::{anyhow, Context, Result};
+use futures::{stream, TryStreamExt};
 use libp2p::PeerId;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::Instant;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, Instant};
 
-const MAX_CONCURRENT_CHUNK_FETCHES: usize = 16;
+const SUBCHUNK_SIZE_BYTES: usize = CHUNK_SIZE_SMALL;
+const MAX_CONCURRENT_CHUNK_FETCHES: usize = 8;
+const MAX_PROVIDER_TRIES_PER_CHUNK: usize = 3;
+const MAX_PROVIDER_TRIES_PER_PART: usize = 3;
+const MAX_CHUNK_FETCH_ATTEMPTS: usize = 4;
+
+const METADATA_RR_TIMEOUT: Duration = Duration::from_secs(5);
+const MANIFEST_RR_TIMEOUT: Duration = Duration::from_secs(10);
+const CHUNK_RR_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct ChunkDistributor {
     store: Arc<UnifiedStore>,
     network: NetworkHandle,
-    pending_objects: Arc<RwLock<HashMap<ObjectId, PendingObject>>>,
     pub provider_map: Arc<RwLock<HashMap<ObjectId, HashSet<PeerId>>>>,
-    chunk_requests: Arc<RwLock<HashMap<ChunkId, Vec<PeerId>>>>,
-}
-
-struct PendingObject {
-    missing_chunks: VecDeque<ChunkId>,
-    in_flight: HashSet<ChunkId>,
-    retries: HashMap<ChunkId, u32>,
 }
 
 impl ChunkDistributor {
@@ -32,9 +36,7 @@ impl ChunkDistributor {
         Self {
             store,
             network,
-            pending_objects: Arc::new(RwLock::new(HashMap::new())),
             provider_map: Arc::new(RwLock::new(HashMap::new())),
-            chunk_requests: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -64,7 +66,7 @@ impl ChunkDistributor {
             return self.store.get_object(object_id);
         }
 
-        let object = match self.store.get_object_metadata(object_id)? {
+        let _object = match self.store.get_object_metadata(object_id)? {
             Some(obj) => obj,
             None => {
                 tracing::info!("object metadata not found locally, requesting from peers");
@@ -72,47 +74,250 @@ impl ChunkDistributor {
             }
         };
 
-        // Try manifest and missing chunks before hitting the network for providers.
-        if let Some(manifest) = self.store.get_manifest_by_object(object_id)? {
-            let missing_chunks = self.store.get_missing_chunks(&manifest)?;
-            if missing_chunks.is_empty() {
-                return self.store.get_object(object_id);
+        let manifest = match self.store.get_manifest_by_object(object_id)? {
+            Some(m) => m,
+            None => {
+                tracing::info!("manifest not found locally, requesting from peers");
+                self.fetch_manifest(object_id, provider_kind).await?
             }
+        };
+
+        manifest.validate()?;
+
+        let mut missing = Vec::new();
+        for desc in &manifest.chunks {
+            if !self.store.has_chunk(&desc.chunk_id)? {
+                missing.push(desc.clone());
+            }
+        }
+
+        if missing.is_empty() {
+            let data = self.store.get_object(object_id)?;
+            self.network.provide(&object_id.0);
+            return Ok(data);
         }
 
         self.ensure_providers_for_object(object_id, provider_kind)
             .await;
 
-        let manifest = match self.store.get_manifest_by_object(object_id)? {
-            Some(m) => m,
-            None => {
-                tracing::info!("manifest not found locally, requesting from peers");
-                self.fetch_manifest(object_id, &object.manifest_id, provider_kind)
-                    .await?
+        let distributor = self.clone_arc();
+        let oid = *object_id;
+
+        stream::iter(missing.into_iter().map(|d| Ok::<_, anyhow::Error>(d)))
+            .try_for_each_concurrent(MAX_CONCURRENT_CHUNK_FETCHES, move |desc| {
+                let distributor = distributor.clone();
+                async move {
+                    distributor
+                        .fetch_single_chunk(&oid, desc, provider_kind)
+                        .await
+                }
+            })
+            .await?;
+
+        let data = self
+            .store
+            .get_object(object_id)
+            .context("reassembling object after chunk fetch")?;
+
+        self.network.provide(&object_id.0);
+
+        Ok(data)
+    }
+
+    async fn fetch_single_chunk(
+        self: Arc<Self>,
+        object_id: &ObjectId,
+        chunk_desc: ChunkDescriptor,
+        provider_kind: ProviderKind,
+    ) -> Result<()> {
+        let chunk_id = chunk_desc.chunk_id;
+
+        if self.store.has_chunk(&chunk_id)? {
+            return Ok(());
+        }
+
+        let chunk_size = chunk_desc.size as usize;
+
+        for attempt in 0..MAX_CHUNK_FETCH_ATTEMPTS {
+            let mut providers = self.get_providers_for_object(object_id).await;
+            if providers.is_empty() {
+                self.ensure_providers_for_object(object_id, provider_kind)
+                    .await;
+                providers = self.get_providers_for_object(object_id).await;
             }
+            if providers.is_empty() {
+                providers = self.get_all_connected_peers().await;
+            }
+
+            if providers.is_empty() {
+                return Err(anyhow!("no providers available for {}", object_id));
+            }
+
+            match self
+                .fetch_chunk_data_from_providers(&providers, chunk_id, chunk_size)
+                .await
+            {
+                Ok(data) => {
+                    let chunk = Chunk { id: chunk_id, data };
+                    chunk.verify().context("chunk verification failed")?;
+                    self.store.store_chunk(&chunk)?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "chunk {} fetch attempt {}/{} failed: {e:?}",
+                        chunk_id,
+                        attempt + 1,
+                        MAX_CHUNK_FETCH_ATTEMPTS
+                    );
+                    if attempt + 1 < MAX_CHUNK_FETCH_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Err(anyhow!("chunk {} exceeded max retries", chunk_id))
+    }
+
+    async fn fetch_chunk_data_from_providers(
+        &self,
+        providers: &[PeerId],
+        chunk_id: ChunkId,
+        chunk_size: usize,
+    ) -> Result<Vec<u8>> {
+        if chunk_size <= SUBCHUNK_SIZE_BYTES {
+            for peer in providers.iter().take(MAX_PROVIDER_TRIES_PER_CHUNK) {
+                match self.request_chunk_from_peer(*peer, chunk_id).await {
+                    Ok(data) => return Ok(data),
+                    Err(e) => {
+                        tracing::debug!("chunk request to {} failed: {e:?}", peer);
+                        continue;
+                    }
+                }
+            }
+            return Err(anyhow!("all providers failed for chunk {}", chunk_id));
+        }
+
+        let mut out = vec![0u8; chunk_size];
+        let mut offset = 0usize;
+        while offset < chunk_size {
+            let want_len = std::cmp::min(SUBCHUNK_SIZE_BYTES, chunk_size - offset);
+            let mut got = None;
+
+            for peer in providers.iter().take(MAX_PROVIDER_TRIES_PER_PART) {
+                match self
+                    .request_chunk_part_from_peer(*peer, chunk_id, offset, want_len)
+                    .await
+                {
+                    Ok(part) => {
+                        if part.len() != want_len {
+                            tracing::debug!(
+                                "provider {} returned wrong part length for {} off={}: expected {}, got {}",
+                                peer,
+                                chunk_id,
+                                offset,
+                                want_len,
+                                part.len()
+                            );
+                            continue;
+                        }
+                        got = Some(part);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "chunk part request to {} failed (chunk {} off={}): {e:?}",
+                            peer,
+                            chunk_id,
+                            offset
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            let Some(part) = got else {
+                return Err(anyhow!(
+                    "all providers failed for chunk {} part off={}",
+                    chunk_id,
+                    offset
+                ));
+            };
+
+            out[offset..offset + want_len].copy_from_slice(&part);
+            offset += want_len;
+        }
+
+        Ok(out)
+    }
+
+    async fn request_chunk_from_peer(&self, peer: PeerId, chunk_id: ChunkId) -> Result<Vec<u8>> {
+        let resp = self
+            .request_unified(
+                peer,
+                UnifiedRequest::GetChunk(ChunkRequest { chunk_id }),
+                CHUNK_RR_TIMEOUT,
+            )
+            .await?;
+
+        let UnifiedResponse::Chunk(ChunkResponse {
+            chunk_id: got_id,
+            data,
+        }) = resp
+        else {
+            return Err(anyhow!("unexpected response for GetChunk"));
         };
 
-        let missing_chunks = self.store.get_missing_chunks(&manifest)?;
-
-        if missing_chunks.is_empty() {
-            return self.store.get_object(object_id);
+        if got_id != chunk_id {
+            return Err(anyhow!("chunk id mismatch in response"));
         }
 
-        {
-            let mut pending = self.pending_objects.write().await;
-            pending.insert(
-                *object_id,
-                PendingObject {
-                    missing_chunks: missing_chunks.into_iter().collect(),
-                    in_flight: HashSet::new(),
-                    retries: HashMap::new(),
-                },
-            );
+        data.ok_or_else(|| anyhow!("chunk not found on peer"))
+    }
+
+    async fn request_chunk_part_from_peer(
+        &self,
+        peer: PeerId,
+        chunk_id: ChunkId,
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        let resp = self
+            .request_unified(
+                peer,
+                UnifiedRequest::GetChunkPart(ChunkPartRequest {
+                    chunk_id,
+                    offset: offset as u32,
+                    length: length as u32,
+                }),
+                CHUNK_RR_TIMEOUT,
+            )
+            .await?;
+
+        let UnifiedResponse::ChunkPart(ChunkPartResponse {
+            chunk_id: got_id,
+            offset: got_offset,
+            data,
+        }) = resp
+        else {
+            return Err(anyhow!("unexpected response for GetChunkPart"));
+        };
+
+        if got_id != chunk_id {
+            return Err(anyhow!("chunk id mismatch in part response"));
+        }
+        if got_offset as usize != offset {
+            return Err(anyhow!(
+                "chunk part offset mismatch: expected {}, got {}",
+                offset,
+                got_offset
+            ));
         }
 
-        self.fetch_chunks_loop(object_id).await?;
-
-        self.store.get_object(object_id)
+        data.ok_or_else(|| anyhow!("chunk part not found on peer"))
     }
 
     async fn ensure_providers_for_object(&self, object_id: &ObjectId, kind: ProviderKind) {
@@ -160,7 +365,7 @@ impl ChunkDistributor {
         &self,
         object_id: &ObjectId,
         kind: ProviderKind,
-    ) -> Result<crate::types::Object> {
+    ) -> Result<Object> {
         self.network.find_providers(&object_id.0, kind);
 
         let deadline = Instant::now() + dht::FIND_PROVIDERS_MAX_WAIT;
@@ -174,52 +379,21 @@ impl ChunkDistributor {
             tokio::time::sleep(dht::FIND_PROVIDERS_POLL_INTERVAL).await;
         }
 
-        let providers = self.get_providers_for_object(object_id).await;
-
-        if providers.is_empty() {
-            tracing::warn!("no DHT providers found, trying all connected peers");
-            return self.fetch_metadata_from_any_peer(object_id).await;
+        let mut peers = self.get_providers_for_object(object_id).await;
+        if peers.is_empty() {
+            peers = self.get_all_connected_peers().await;
         }
-
-        for provider in providers.iter().take(3) {
-            match self.request_metadata_from_peer(provider, object_id).await {
-                Ok(object) => {
-                    self.store.store_object(&object)?;
-                    return Ok(object);
-                }
-                Err(e) => {
-                    tracing::debug!("metadata request to {} failed: {e:?}", provider);
-                    continue;
-                }
-            }
-        }
-
-        Err(anyhow!("all metadata providers failed"))
-    }
-
-    async fn fetch_metadata_from_any_peer(
-        &self,
-        object_id: &ObjectId,
-    ) -> Result<crate::types::Object> {
-        if let Some(object) = self.store.get_object_metadata(object_id)? {
-            tracing::debug!("metadata already available locally");
-            return Ok(object);
-        }
-
-        let all_peers = self.get_all_connected_peers().await;
-        if all_peers.is_empty() {
+        if peers.is_empty() {
             return Err(anyhow!("no connected peers"));
         }
 
-        tracing::info!(
-            "requesting metadata from {} connected peers via request-response",
-            all_peers.len()
-        );
-
-        for peer in all_peers.iter().take(5) {
-            match self.request_metadata_from_peer(peer, object_id).await {
+        for peer in peers.iter().take(5) {
+            match self
+                .request_object_metadata_from_peer(*peer, object_id)
+                .await
+            {
                 Ok(object) => {
-                    tracing::info!("received metadata from peer {}", peer);
+                    self.store.store_object(&object)?;
                     return Ok(object);
                 }
                 Err(e) => {
@@ -229,120 +403,96 @@ impl ChunkDistributor {
             }
         }
 
-        tracing::info!("request-response failed, falling back to gossipsub broadcast");
+        tracing::info!("request-response metadata failed; falling back to gossipsub broadcast");
 
         let metadata_req_msg =
             crate::network::unified_protocol::UnifiedProtocolMessage::ObjectMetadataRequest(
-                crate::network::unified_protocol::ObjectMetadataRequest {
+                ObjectMetadataRequest {
                     object_id: *object_id,
                 },
             );
-
         let network_msg = crate::network::NetworkMessage::UnifiedProtocol(metadata_req_msg);
         let _ = self.network.publisher.send(network_msg);
 
         for i in 0..6 {
             tokio::time::sleep(Duration::from_secs(1)).await;
-
             if let Some(object) = self.store.get_object_metadata(object_id)? {
                 tracing::info!("received metadata via gossipsub after {} seconds", i + 1);
                 return Ok(object);
             }
         }
 
-        tracing::error!("no peer provided metadata after request-response and gossipsub attempts");
         Err(anyhow!("no peer provided metadata"))
     }
 
-    async fn request_metadata_from_peer(
+    async fn request_object_metadata_from_peer(
         &self,
-        peer: &PeerId,
+        peer: PeerId,
         object_id: &ObjectId,
-    ) -> Result<crate::types::Object> {
-        let req = crate::network::unified_protocol::ObjectMetadataRequest {
-            object_id: *object_id,
+    ) -> Result<Object> {
+        let resp = self
+            .request_unified(
+                peer,
+                UnifiedRequest::GetObjectMetadata(ObjectMetadataRequest {
+                    object_id: *object_id,
+                }),
+                METADATA_RR_TIMEOUT,
+            )
+            .await?;
+
+        let UnifiedResponse::ObjectMetadata(ObjectMetadataResponse { metadata, .. }) = resp else {
+            return Err(anyhow!("unexpected response for GetObjectMetadata"));
         };
 
-        let tx_req = crate::network::TransferRequest::Unified(
-            crate::network::unified_protocol::UnifiedRequest::GetObjectMetadata(req),
-        );
-
-        self.network.request_transfer(*peer, tx_req);
-
-        for _ in 0..10 {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if let Some(object) = self.store.get_object_metadata(object_id)? {
-                return Ok(object);
-            }
-        }
-
-        Err(anyhow!("metadata not received from peer"))
+        metadata.ok_or_else(|| anyhow!("peer returned no metadata"))
     }
 
-    async fn fetch_manifest(
-        &self,
-        object_id: &ObjectId,
-        _manifest_id: &crate::types::ManifestId,
-        kind: ProviderKind,
-    ) -> Result<crate::types::Manifest> {
+    async fn fetch_manifest(&self, object_id: &ObjectId, kind: ProviderKind) -> Result<Manifest> {
         self.network.find_providers(&object_id.0, kind);
 
         let deadline = Instant::now() + dht::FIND_PROVIDERS_MAX_WAIT;
-        let providers = loop {
-            let providers = self.get_providers_for_object(object_id).await;
-            if !providers.is_empty() {
-                break providers;
+        loop {
+            if !self.get_providers_for_object(object_id).await.is_empty() {
+                break;
             }
             if Instant::now() >= deadline {
-                break providers;
+                break;
             }
             tokio::time::sleep(dht::FIND_PROVIDERS_POLL_INTERVAL).await;
-        };
-
-        if providers.is_empty() {
-            tracing::info!("no DHT providers for manifest yet, trying gossipsub broadcast");
-            return self.fetch_manifest_from_any_peer(object_id).await;
         }
 
-        for provider in providers.iter().take(3) {
-            match self.request_manifest_from_peer(provider, object_id).await {
+        let mut peers = self.get_providers_for_object(object_id).await;
+        if peers.is_empty() {
+            peers = self.get_all_connected_peers().await;
+        }
+
+        for peer in peers.iter().take(5) {
+            match self.request_manifest_from_peer(*peer, object_id).await {
                 Ok(manifest) => {
                     self.store.store_manifest(&manifest)?;
-                    self.network.provide(&object_id.0);
                     return Ok(manifest);
                 }
                 Err(e) => {
-                    tracing::debug!("manifest request to {} failed: {e:?}", provider);
+                    tracing::debug!("manifest request to {} failed: {e:?}", peer);
                     continue;
                 }
             }
         }
 
-        Err(anyhow!("all manifest providers failed"))
-    }
-
-    async fn fetch_manifest_from_any_peer(
-        &self,
-        object_id: &ObjectId,
-    ) -> Result<crate::types::Manifest> {
         tracing::info!("broadcasting manifest request via gossipsub");
 
         let manifest_req_msg =
             crate::network::unified_protocol::UnifiedProtocolMessage::ManifestRequest(
-                crate::network::unified_protocol::ManifestRequest {
+                ManifestRequest {
                     object_id: *object_id,
                 },
             );
-
         let network_msg = crate::network::NetworkMessage::UnifiedProtocol(manifest_req_msg);
         let _ = self.network.publisher.send(network_msg);
 
-        for i in 0..10 {
+        for _ in 0..10 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-
             if let Some(manifest) = self.store.get_manifest_by_object(object_id)? {
-                tracing::info!("received manifest after {} attempts", i + 1);
-                self.network.provide(&object_id.0);
                 return Ok(manifest);
             }
         }
@@ -352,177 +502,45 @@ impl ChunkDistributor {
 
     async fn request_manifest_from_peer(
         &self,
-        peer: &PeerId,
+        peer: PeerId,
         object_id: &ObjectId,
-    ) -> Result<crate::types::Manifest> {
-        let req = crate::network::unified_protocol::ManifestRequest {
-            object_id: *object_id,
+    ) -> Result<Manifest> {
+        let resp = self
+            .request_unified(
+                peer,
+                UnifiedRequest::GetManifest(ManifestRequest {
+                    object_id: *object_id,
+                }),
+                MANIFEST_RR_TIMEOUT,
+            )
+            .await?;
+
+        let UnifiedResponse::Manifest(ManifestResponse { manifest }) = resp else {
+            return Err(anyhow!("unexpected response for GetManifest"));
         };
 
-        let tx_req = crate::network::TransferRequest::Unified(
-            crate::network::unified_protocol::UnifiedRequest::GetManifest(req),
-        );
-
-        self.network.request_transfer(*peer, tx_req);
-
-        let wait_duration = Duration::from_secs(5);
-        tokio::time::sleep(wait_duration).await;
-
-        if let Some(manifest) = self.store.get_manifest_by_object(object_id)? {
-            return Ok(manifest);
-        }
-
-        Err(anyhow!("manifest not received"))
+        manifest.ok_or_else(|| anyhow!("peer returned no manifest"))
     }
 
-    async fn fetch_chunks_loop(&self, object_id: &ObjectId) -> Result<()> {
-        let mut tick = interval(Duration::from_millis(500));
-        let max_iterations = 120;
-        let mut iterations = 0;
+    async fn request_unified(
+        &self,
+        peer: PeerId,
+        req: UnifiedRequest,
+        timeout: Duration,
+    ) -> Result<UnifiedResponse> {
+        let rx = self
+            .network
+            .request_transfer_oneshot(peer, TransferRequest::Unified(req))?;
+        let resp = tokio::time::timeout(timeout, rx)
+            .await
+            .with_context(|| format!("transfer request timed out (peer={peer})"))?
+            .with_context(|| format!("transfer response channel closed (peer={peer})"))??;
 
-        loop {
-            tick.tick().await;
-            iterations += 1;
-
-            if iterations > max_iterations {
-                return Err(anyhow!(
-                    "chunk fetch timeout after {} iterations",
-                    iterations
-                ));
-            }
-
-            let (missing_count, in_flight_count) = {
-                let pending = self.pending_objects.read().await;
-                if let Some(obj) = pending.get(object_id) {
-                    (obj.missing_chunks.len(), obj.in_flight.len())
-                } else {
-                    return Err(anyhow!("pending object disappeared"));
-                }
-            };
-
-            if missing_count == 0 && in_flight_count == 0 {
-                break;
-            }
-
-            let available_slots = MAX_CONCURRENT_CHUNK_FETCHES.saturating_sub(in_flight_count);
-
-            for _ in 0..available_slots {
-                let chunk_id = {
-                    let mut pending = self.pending_objects.write().await;
-                    if let Some(obj) = pending.get_mut(object_id) {
-                        if let Some(chunk_id) = obj.missing_chunks.pop_front() {
-                            obj.in_flight.insert(chunk_id);
-                            chunk_id
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                };
-
-                let distributor = self.clone_arc();
-                let oid = *object_id;
-                tokio::spawn(async move {
-                    if let Err(e) = distributor.fetch_single_chunk(&oid, &chunk_id).await {
-                        tracing::warn!("chunk fetch failed: {e:?}");
-                        distributor.mark_chunk_failed(&oid, &chunk_id).await;
-                    }
-                });
-            }
-        }
-
-        let mut pending = self.pending_objects.write().await;
-        pending.remove(object_id);
-
-        Ok(())
-    }
-
-    async fn fetch_single_chunk(&self, object_id: &ObjectId, chunk_id: &ChunkId) -> Result<()> {
-        let mut providers = self.get_providers_for_object(object_id).await;
-
-        if providers.is_empty() {
-            tracing::debug!(
-                "no providers in map for object {}, requesting from any peer",
-                object_id
-            );
-            let all_peers: Vec<_> = self
-                .provider_map
-                .read()
-                .await
-                .values()
-                .flat_map(|peers| peers.iter().copied())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-
-            if !all_peers.is_empty() {
-                providers = all_peers;
-                tracing::debug!("using {} connected peers as fallback", providers.len());
-            } else {
-                return Err(anyhow!("no providers available"));
-            }
-        }
-
-        for provider in providers.iter().take(3) {
-            match self.request_chunk_from_peer(provider, chunk_id).await {
-                Ok(chunk) => {
-                    self.store.store_chunk(&chunk)?;
-                    self.mark_chunk_completed(object_id, chunk_id).await;
-                    return Ok(());
-                }
-                Err(e) => {
-                    tracing::debug!("chunk request to {} failed: {e:?}", provider);
-                    continue;
-                }
-            }
-        }
-
-        Err(anyhow!("all providers failed"))
-    }
-
-    async fn request_chunk_from_peer(&self, peer: &PeerId, chunk_id: &ChunkId) -> Result<Chunk> {
-        let req = ChunkRequest {
-            chunk_id: *chunk_id,
+        let TransferResponse::Unified(unified) = resp else {
+            return Err(anyhow!("unexpected transfer response type"));
         };
 
-        let tx_req = crate::network::TransferRequest::Unified(
-            crate::network::unified_protocol::UnifiedRequest::GetChunk(req),
-        );
-
-        self.network.request_transfer(*peer, tx_req);
-
-        let wait_duration = Duration::from_secs(5);
-        tokio::time::sleep(wait_duration).await;
-
-        if let Some(chunk) = self.store.get_chunk(chunk_id)? {
-            return Ok(chunk);
-        }
-
-        Err(anyhow!("chunk not received"))
-    }
-
-    async fn mark_chunk_completed(&self, object_id: &ObjectId, chunk_id: &ChunkId) {
-        let mut pending = self.pending_objects.write().await;
-        if let Some(obj) = pending.get_mut(object_id) {
-            obj.in_flight.remove(chunk_id);
-        }
-    }
-
-    async fn mark_chunk_failed(&self, object_id: &ObjectId, chunk_id: &ChunkId) {
-        let mut pending = self.pending_objects.write().await;
-        if let Some(obj) = pending.get_mut(object_id) {
-            obj.in_flight.remove(chunk_id);
-
-            let retries = obj.retries.entry(*chunk_id).or_insert(0);
-            *retries += 1;
-
-            if *retries < 5 {
-                obj.missing_chunks.push_back(*chunk_id);
-            } else {
-                tracing::error!("chunk {} exceeded max retries", chunk_id);
-            }
-        }
+        Ok(unified)
     }
 
     async fn get_providers_for_object(&self, object_id: &ObjectId) -> Vec<PeerId> {
@@ -552,9 +570,7 @@ impl ChunkDistributor {
         Arc::new(Self {
             store: Arc::clone(&self.store),
             network: self.network.clone(),
-            pending_objects: Arc::clone(&self.pending_objects),
             provider_map: Arc::clone(&self.provider_map),
-            chunk_requests: Arc::clone(&self.chunk_requests),
         })
     }
 

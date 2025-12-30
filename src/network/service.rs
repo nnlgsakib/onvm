@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{interval, Instant};
 
 fn describe_transfer_request(req: &TransferRequest) -> String {
@@ -62,6 +62,10 @@ fn describe_transfer_request(req: &TransferRequest) -> String {
             crate::network::unified_protocol::UnifiedRequest::GetChunk(r) => {
                 format!("unified:get_chunk({})", r.chunk_id)
             }
+            crate::network::unified_protocol::UnifiedRequest::GetChunkPart(r) => format!(
+                "unified:get_chunk_part({}, off={}, len={})",
+                r.chunk_id, r.offset, r.length
+            ),
             crate::network::unified_protocol::UnifiedRequest::GetChunks(r) => {
                 format!("unified:get_chunks(n={})", r.chunk_ids.len())
             }
@@ -127,7 +131,27 @@ impl NetworkHandle {
     }
 
     pub fn request_transfer(&self, peer: PeerId, req: TransferRequest) {
-        let _ = self.transfer_req.send(TransferJob { peer, req });
+        let _ = self.transfer_req.send(TransferJob {
+            peer,
+            req,
+            reply: None,
+        });
+    }
+
+    pub fn request_transfer_oneshot(
+        &self,
+        peer: PeerId,
+        req: TransferRequest,
+    ) -> Result<oneshot::Receiver<Result<TransferResponse>>> {
+        let (tx, rx) = oneshot::channel();
+        self.transfer_req
+            .send(TransferJob {
+                peer,
+                req,
+                reply: Some(tx),
+            })
+            .map_err(|_| anyhow!("failed to submit transfer request"))?;
+        Ok(rx)
     }
 
     pub fn respond_transfer(
@@ -174,10 +198,11 @@ enum KadCommand {
     FindProviders(Vec<u8>, ProviderKind),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct TransferJob {
     peer: PeerId,
     req: TransferRequest,
+    reply: Option<oneshot::Sender<Result<TransferResponse>>>,
 }
 
 #[derive(Debug)]
@@ -440,7 +465,14 @@ impl NetworkService {
             let mut transfer_ready: HashSet<PeerId> = HashSet::new();
             let mut transfer_blocked: HashSet<PeerId> = HashSet::new();
             let mut transfer_buffer: HashMap<PeerId, VecDeque<TransferJob>> = HashMap::new();
-            let mut transfer_pending: HashMap<OutboundRequestId, (PeerId, String)> = HashMap::new();
+            let mut transfer_pending: HashMap<
+                OutboundRequestId,
+                (
+                    PeerId,
+                    String,
+                    Option<oneshot::Sender<Result<TransferResponse>>>,
+                ),
+            > = HashMap::new();
             let mut redial: HashMap<PeerId, RedialState> = HashMap::new();
             let mut redial_tick = interval(Duration::from_secs(2));
             let mut total_connections: usize = 0;
@@ -1119,7 +1151,7 @@ impl NetworkService {
                                     connected_peers_local.remove(&peer_id);
                                     handshake_inflight.remove(&peer_id);
                                     handshake_pending.retain(|_, peer| *peer != peer_id);
-                                    transfer_pending.retain(|_, (peer, _)| *peer != peer_id);
+                                    transfer_pending.retain(|_, (peer, _, _)| *peer != peer_id);
                                     transfer_ready.remove(&peer_id);
                                     transfer_buffer.remove(&peer_id);
                                     ping_inflight.remove(&peer_id);
@@ -1146,7 +1178,7 @@ impl NetworkService {
                                     // If we still have a connection but handshake was on the closed one, allow resending.
                                     handshake_inflight.remove(&peer_id);
                                     handshake_pending.retain(|_, peer| *peer != peer_id);
-                                    transfer_pending.retain(|_, (peer, _)| *peer != peer_id);
+                                    transfer_pending.retain(|_, (peer, _, _)| *peer != peer_id);
                                 }
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Pex(event)) => match event {
@@ -1434,7 +1466,8 @@ impl NetworkService {
                                                         req_id,
                                                         job.peer
                                                     );
-                                                    transfer_pending.insert(req_id, (job.peer, desc));
+                                                    transfer_pending
+                                                        .insert(req_id, (job.peer, desc, job.reply));
                                                 }
                                             }
                                         } else {
@@ -1523,7 +1556,8 @@ impl NetworkService {
                                                     req_id,
                                                     job.peer
                                                 );
-                                                transfer_pending.insert(req_id, (job.peer, desc));
+                                                transfer_pending
+                                                    .insert(req_id, (job.peer, desc, job.reply));
                                             }
                                         }
                                     }
@@ -1571,16 +1605,30 @@ impl NetworkService {
                                             let _ = event_tx.send(NetworkEvent::TransferRequest(peer, request, channel));
                                         }
                                         libp2p::request_response::Message::Response { response, request_id } => {
-                                            transfer_pending.remove(&request_id);
-                                            let _ = event_tx.send(NetworkEvent::TransferResponse(peer, response));
+                                            let pending = transfer_pending.remove(&request_id);
+                                            if let Some((_peer, _desc, reply)) = pending {
+                                                if let Some(reply) = reply {
+                                                    let _ = reply.send(Ok(response));
+                                                } else {
+                                                    let _ = event_tx.send(NetworkEvent::TransferResponse(peer, response));
+                                                }
+                                            } else {
+                                                let _ = event_tx.send(NetworkEvent::TransferResponse(peer, response));
+                                            }
                                         }
                                     }
                                 }
                                 libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
-                                    let req_desc = transfer_pending
+                                    let (req_desc, reply) = transfer_pending
                                         .remove(&request_id)
-                                        .map(|(_, d)| d)
-                                        .unwrap_or_else(|| "<unknown>".to_string());
+                                        .map(|(_peer, d, reply)| (d, reply))
+                                        .unwrap_or_else(|| ("<unknown>".to_string(), None));
+                                    if let Some(reply) = reply {
+                                        let _ = reply.send(Err(anyhow!(
+                                            "transfer outbound failure to {}: {error:?}",
+                                            peer
+                                        )));
+                                    }
                                     match &error {
                                         libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
                                             tracing::debug!(
@@ -1686,10 +1734,14 @@ impl NetworkService {
                             queue.push_back(job);
                             continue;
                         }
+                        let peer = job.peer;
                         let desc = describe_transfer_request(&job.req);
-                        let req_id = swarm.behaviour_mut().transfer.send_request(&job.peer, job.req);
-                        transfer_pending.insert(req_id, (job.peer, desc));
-                        tracing::debug!("sent transfer request {:?} to {}", req_id, job.peer);
+                        let req_id = swarm
+                            .behaviour_mut()
+                            .transfer
+                            .send_request(&peer, job.req);
+                        tracing::debug!("sent transfer request {:?} to {}", req_id, peer);
+                        transfer_pending.insert(req_id, (peer, desc, job.reply));
                     }
                     Some(resp) = transfer_resp_rx.recv() => {
                         let _ = swarm

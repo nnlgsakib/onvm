@@ -45,13 +45,7 @@ impl DagEngine {
         let mut announced = 0usize;
 
         for object in objects {
-            if self
-                .unified_store
-                .get_manifest_by_object(&object.id)
-                .ok()
-                .flatten()
-                .is_some()
-            {
+            if self.unified_store.is_complete(&object.id).unwrap_or(false) {
                 self.network.provide(&object.id.0);
                 announced += 1;
             }
@@ -148,7 +142,6 @@ impl DagEngine {
                         if let Some(manifest) = manifest_resp.manifest {
                             tracing::info!("received manifest for object {}", manifest.object_id);
                             let _ = self.unified_store.store_manifest(&manifest);
-                            self.network.provide(&manifest.object_id.0);
                         }
                     }
                     UnifiedResponse::Chunk(chunk_resp) => {
@@ -158,6 +151,15 @@ impl DagEngine {
                                 data,
                             };
                             tracing::debug!("received chunk {}", chunk_resp.chunk_id);
+                            let _ = self.unified_store.store_chunk(&chunk);
+                        }
+                    }
+                    UnifiedResponse::Chunks(batch_resp) => {
+                        for (chunk_id, data) in batch_resp.chunks {
+                            let Some(data) = data else {
+                                continue;
+                            };
+                            let chunk = crate::types::Chunk { id: chunk_id, data };
                             let _ = self.unified_store.store_chunk(&chunk);
                         }
                     }
@@ -454,11 +456,14 @@ impl DagEngine {
             crate::network::unified_protocol::UnifiedProtocolMessage::ObjectAnnouncement(
                 announcement,
             ) => {
+                let subchunk_count =
+                    crate::storage::subchunk_count_for_total_size(announcement.total_size);
                 tracing::info!(
-                    "received object announcement: {} ({} bytes, {} chunks)",
+                    "received object announcement: {} ({} bytes, {} chunks, {} subchunks)",
                     announcement.object_id,
                     announcement.total_size,
-                    announcement.chunk_count
+                    announcement.chunk_count,
+                    subchunk_count
                 );
 
                 if let Some(ref distributor) = self.chunk_distributor {
@@ -547,6 +552,15 @@ impl DagEngine {
             }
             crate::network::unified_protocol::UnifiedProtocolMessage::ManifestRequest(req) => {
                 tracing::debug!("received manifest request for object {}", req.object_id);
+
+                if !self
+                    .unified_store
+                    .is_complete(&req.object_id)
+                    .unwrap_or(false)
+                {
+                    tracing::debug!("ignoring manifest request for incomplete {}", req.object_id);
+                    return Ok(());
+                }
 
                 if let Ok(Some(manifest)) =
                     self.unified_store.get_manifest_by_object(&req.object_id)
@@ -1233,10 +1247,45 @@ impl DagEngine {
                     data: chunk_data.map(|c| c.data),
                 }))
             }
+            UnifiedRequest::GetChunkPart(part_req) => {
+                let max_len = crate::storage::CHUNK_SIZE_SMALL as u32;
+                if part_req.length == 0 || part_req.length > max_len {
+                    return Ok(UnifiedResponse::ChunkPart(ChunkPartResponse {
+                        chunk_id: part_req.chunk_id,
+                        offset: part_req.offset,
+                        data: None,
+                    }));
+                }
+
+                let chunk = self.unified_store.get_chunk(&part_req.chunk_id)?;
+                let data = chunk.and_then(|c| {
+                    let start = part_req.offset as usize;
+                    if start >= c.data.len() {
+                        return None;
+                    }
+
+                    let max_len = part_req.length as usize;
+                    let end = std::cmp::min(start.saturating_add(max_len), c.data.len());
+                    Some(c.data[start..end].to_vec())
+                });
+
+                Ok(UnifiedResponse::ChunkPart(ChunkPartResponse {
+                    chunk_id: part_req.chunk_id,
+                    offset: part_req.offset,
+                    data,
+                }))
+            }
             UnifiedRequest::GetManifest(manifest_req) => {
-                let manifest = self
+                let manifest = if self
                     .unified_store
-                    .get_manifest_by_object(&manifest_req.object_id)?;
+                    .is_complete(&manifest_req.object_id)
+                    .unwrap_or(false)
+                {
+                    self.unified_store
+                        .get_manifest_by_object(&manifest_req.object_id)?
+                } else {
+                    None
+                };
                 Ok(UnifiedResponse::Manifest(ManifestResponse { manifest }))
             }
             UnifiedRequest::GetChunks(batch_req) => {
@@ -1297,11 +1346,18 @@ impl DagEngine {
                 ))
             }
             UnifiedRequest::GetObjectMetadata(metadata_req) => {
-                let metadata = self
+                let metadata = if self
                     .unified_store
-                    .get_object_metadata(&metadata_req.object_id)
-                    .ok()
-                    .flatten();
+                    .is_complete(&metadata_req.object_id)
+                    .unwrap_or(false)
+                {
+                    self.unified_store
+                        .get_object_metadata(&metadata_req.object_id)
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
                 Ok(UnifiedResponse::ObjectMetadata(ObjectMetadataResponse {
                     object_id: metadata_req.object_id,
                     metadata,

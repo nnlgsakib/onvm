@@ -2,12 +2,62 @@ use crate::types::{
     Chunk, ChunkDescriptor, ChunkId, Manifest, ManifestId, Object, ObjectId, ObjectType,
 };
 use anyhow::{anyhow, Result};
-use fastcdc::v2020::FastCDC;
 use sled::Db;
 
-pub const CHUNK_SIZE_MIN: usize = 256 * 1024;
-pub const CHUNK_SIZE_AVG: usize = 1024 * 1024;
-pub const CHUNK_SIZE_MAX: usize = 4 * 1024 * 1024;
+/// Fixed transport subchunk size (250 KiB).
+///
+/// - For objects <= 2 MiB, this is the primary (top-level) chunk size.
+/// - For objects > 2 MiB, top-level chunks are 2 MiB and are fetched as 250 KiB subchunks.
+pub const CHUNK_SIZE_SMALL: usize = 250 * 1024;
+
+/// Fixed top-level chunk size for large objects (2 MiB).
+pub const CHUNK_SIZE_LARGE: usize = 2 * 1024 * 1024;
+
+/// Objects strictly larger than this threshold use `CHUNK_SIZE_LARGE` top-level chunks.
+pub const LARGE_OBJECT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
+
+pub fn top_level_chunk_count_for_total_size(total_size: u64) -> u64 {
+    if total_size == 0 {
+        return 0;
+    }
+
+    if total_size > LARGE_OBJECT_THRESHOLD_BYTES as u64 {
+        div_ceil_u64(total_size, CHUNK_SIZE_LARGE as u64)
+    } else {
+        div_ceil_u64(total_size, CHUNK_SIZE_SMALL as u64)
+    }
+}
+
+pub fn subchunk_count_for_total_size(total_size: u64) -> u64 {
+    if total_size == 0 {
+        return 0;
+    }
+
+    let small = CHUNK_SIZE_SMALL as u64;
+
+    if total_size > LARGE_OBJECT_THRESHOLD_BYTES as u64 {
+        let large = CHUNK_SIZE_LARGE as u64;
+
+        let full_chunks = total_size / large;
+        let remainder = total_size % large;
+
+        let subchunks_per_full_chunk = div_ceil_u64(large, small);
+        let mut total = full_chunks * subchunks_per_full_chunk;
+        if remainder != 0 {
+            total += div_ceil_u64(remainder, small);
+        }
+        total
+    } else {
+        div_ceil_u64(total_size, small)
+    }
+}
+
+fn div_ceil_u64(n: u64, d: u64) -> u64 {
+    if d == 0 {
+        return 0;
+    }
+    n / d + u64::from(n % d != 0)
+}
 
 pub struct UnifiedStore {
     db: Db,
@@ -268,18 +318,14 @@ pub fn chunk_data(data: &[u8]) -> Vec<Chunk> {
         return Vec::new();
     }
 
-    let chunker = FastCDC::new(
-        data,
-        CHUNK_SIZE_MIN as u32,
-        CHUNK_SIZE_AVG as u32,
-        CHUNK_SIZE_MAX as u32,
-    );
+    let top_level_chunk_size = if data.len() > LARGE_OBJECT_THRESHOLD_BYTES {
+        CHUNK_SIZE_LARGE
+    } else {
+        CHUNK_SIZE_SMALL
+    };
 
-    chunker
-        .map(|entry| {
-            let chunk_data = data[entry.offset..entry.offset + entry.length].to_vec();
-            Chunk::new(chunk_data)
-        })
+    data.chunks(top_level_chunk_size)
+        .map(|chunk| Chunk::new(chunk.to_vec()))
         .collect()
 }
 
@@ -357,5 +403,52 @@ mod tests {
         manifest.validate()?;
 
         Ok(())
+    }
+
+    #[test]
+    fn fixed_chunking_threshold_behavior() {
+        let threshold = LARGE_OBJECT_THRESHOLD_BYTES;
+
+        let exact = vec![0u8; threshold];
+        let exact_chunks = chunk_data(&exact);
+        assert_eq!(
+            exact_chunks.len() as u64,
+            top_level_chunk_count_for_total_size(exact.len() as u64)
+        );
+        assert!(exact_chunks
+            .iter()
+            .all(|c| c.data.len() <= CHUNK_SIZE_SMALL));
+
+        let over = vec![0u8; threshold + 1];
+        let over_chunks = chunk_data(&over);
+        assert_eq!(
+            over_chunks.len() as u64,
+            top_level_chunk_count_for_total_size(over.len() as u64)
+        );
+        assert_eq!(over_chunks.len(), 2);
+        assert_eq!(over_chunks[0].data.len(), CHUNK_SIZE_LARGE);
+        assert_eq!(over_chunks[1].data.len(), 1);
+    }
+
+    #[test]
+    fn fixed_subchunk_count_calculation() {
+        assert_eq!(subchunk_count_for_total_size(0), 0);
+
+        // Small object: subchunks == top-level chunks (250 KiB pieces).
+        let small = 1000u64;
+        assert_eq!(subchunk_count_for_total_size(small), 1);
+        assert_eq!(
+            subchunk_count_for_total_size(small),
+            top_level_chunk_count_for_total_size(small)
+        );
+
+        // Large object: top-level 2 MiB chunks, transported as 250 KiB parts.
+        // 3 MiB => 1 full (2 MiB) + 1 MiB remainder.
+        // Full chunk parts: ceil(2 MiB / 250 KiB) = 9
+        // Remainder parts: ceil(1 MiB / 250 KiB) = 5
+        assert_eq!(subchunk_count_for_total_size(3 * 1024 * 1024), 14);
+
+        // 4 MiB => 2 full chunks => 2 * 9 = 18 subchunks.
+        assert_eq!(subchunk_count_for_total_size(4 * 1024 * 1024), 18);
     }
 }

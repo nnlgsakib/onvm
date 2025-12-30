@@ -10,4 +10,7 @@ pub use index::{BlobIndex, BlobRecord, ProgramIndex, ProgramRecord};
 pub use peer_cache_db::{PeerCacheDb, PeerCacheRecord};
 pub use program_catalog::ProgramCatalog;
 pub use state_store::StateStore;
-pub use unified_store::{chunk_data, UnifiedStore, CHUNK_SIZE_AVG, CHUNK_SIZE_MAX, CHUNK_SIZE_MIN};
+pub use unified_store::{
+    chunk_data, subchunk_count_for_total_size, top_level_chunk_count_for_total_size, UnifiedStore,
+    CHUNK_SIZE_LARGE, CHUNK_SIZE_SMALL, LARGE_OBJECT_THRESHOLD_BYTES,
+};

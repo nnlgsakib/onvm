@@ -41,6 +41,25 @@ pub struct ChunkResponse {
     pub data: Option<Vec<u8>>,
 }
 
+/// Chunk part request (range within a chunk), used for fixed-size subchunk transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkPartRequest {
+    pub chunk_id: ChunkId,
+    /// Byte offset within the chunk.
+    pub offset: u32,
+    /// Requested length in bytes (peers should cap this to a safe maximum).
+    pub length: u32,
+}
+
+/// Chunk part response (range within a chunk).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkPartResponse {
+    pub chunk_id: ChunkId,
+    /// Byte offset within the chunk for this response.
+    pub offset: u32,
+    pub data: Option<Vec<u8>>,
+}
+
 /// Batch chunk request (fetch multiple chunks in one round-trip)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchChunkRequest {
@@ -173,6 +192,7 @@ pub enum UnifiedProtocolMessage {
 pub enum UnifiedRequest {
     GetManifest(ManifestRequest),
     GetChunk(ChunkRequest),
+    GetChunkPart(ChunkPartRequest),
     GetChunks(BatchChunkRequest),
     GetObjectAvailability(ObjectAvailabilityRequest),
     GetObjectMetadata(ObjectMetadataRequest),
@@ -185,6 +205,7 @@ pub enum UnifiedRequest {
 pub enum UnifiedResponse {
     Manifest(ManifestResponse),
     Chunk(ChunkResponse),
+    ChunkPart(ChunkPartResponse),
     Chunks(BatchChunkResponse),
     ObjectAvailability(ObjectAvailabilityResponse),
     ObjectMetadata(ObjectMetadataResponse),

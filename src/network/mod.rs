@@ -24,10 +24,10 @@ pub use coordination::{
 };
 pub use service::{NetworkConfig, NetworkEvent, NetworkHandle, NetworkService, NetworkStreams};
 pub use unified_protocol::{
-    AggregatedReceiptBundle, BatchChunkRequest, BatchChunkResponse, ChunkRequest, ChunkResponse,
-    FinalizedTransitionRequest, FinalizedTransitionResponse, LeaderExecutionRequest,
-    LeaderExecutionResponse, ManifestRequest, ManifestResponse, ObjectAnnouncement,
-    ObjectAvailabilityRequest, ObjectAvailabilityResponse, ProgramHead, ProgramManifestRequest,
-    ProgramManifestResponse, StateTransitionProposal, StateTransitionVote, UnifiedProtocolMessage,
-    UnifiedRequest, UnifiedResponse,
+    AggregatedReceiptBundle, BatchChunkRequest, BatchChunkResponse, ChunkPartRequest,
+    ChunkPartResponse, ChunkRequest, ChunkResponse, FinalizedTransitionRequest,
+    FinalizedTransitionResponse, LeaderExecutionRequest, LeaderExecutionResponse, ManifestRequest,
+    ManifestResponse, ObjectAnnouncement, ObjectAvailabilityRequest, ObjectAvailabilityResponse,
+    ProgramHead, ProgramManifestRequest, ProgramManifestResponse, StateTransitionProposal,
+    StateTransitionVote, UnifiedProtocolMessage, UnifiedRequest, UnifiedResponse,
 };

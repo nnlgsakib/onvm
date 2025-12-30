@@ -101,6 +101,24 @@ flowchart TD
 - Rust **1.82+** (edition 2021)
 - `cargo`, `cargo-fmt`, `cargo-clippy`
 
+### Docker
+Build and run a node via Docker Compose:
+```bash
+cp .env.example .env
+# edit .env and set ONVM_IDENTITY_PASSPHRASE
+docker compose up --build
+```
+This starts a node with a persistent volume at `/data` and binds RPC to `127.0.0.1:8080` on the host.
+
+Generate an RPC project credential (prints `project_id=` and `project_secret=`):
+```bash
+docker compose exec onvm sh -lc 'onvm generate-project --rpc 127.0.0.1:8080 --identity-passphrase "$ONVM_IDENTITY_PASSPHRASE"'
+```
+
+Environment variables (see `docker/entrypoint.sh`):
+- `ONVM_DATA_DIR`, `ONVM_LISTEN`, `ONVM_RPC_BIND`, `ONVM_MIN_PEERS`, `ONVM_BLOB_SYNC_MODE`, `ONVM_CONFIG`
+- `ONVM_BOOTNODES` (comma-separated), `ONVM_DEV`, `ONVM_ALLOW_PLAINTEXT_IDENTITY`, `ONVM_INIT_ENABLE_MDNS`
+
 ### Build
 ```bash
 cargo build --release

@@ -1,5 +1,6 @@
 /target
 /node*
+.env
 # wasm_programs/
 # onvm-sdk/
 plans/

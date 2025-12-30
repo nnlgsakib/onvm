@@ -1,0 +1,26 @@
+services:
+  onvm:
+    build:
+      context: .
+    image: onvm:local
+    restart: unless-stopped
+    environment:
+      ONVM_DATA_DIR: /data
+      ONVM_LISTEN: ${ONVM_LISTEN:-/ip4/0.0.0.0/tcp/37000}
+      ONVM_RPC_BIND: ${ONVM_RPC_BIND:-0.0.0.0:8080}
+      ONVM_MIN_PEERS: ${ONVM_MIN_PEERS:-1}
+      ONVM_BLOB_SYNC_MODE: ${ONVM_BLOB_SYNC_MODE:-full}
+      ONVM_CONFIG: ${ONVM_CONFIG:-config.toml}
+      ONVM_BOOTNODES: ${ONVM_BOOTNODES:-}
+      ONVM_DEV: ${ONVM_DEV:-0}
+      ONVM_ALLOW_PLAINTEXT_IDENTITY: ${ONVM_ALLOW_PLAINTEXT_IDENTITY:-0}
+      ONVM_INIT_ENABLE_MDNS: ${ONVM_INIT_ENABLE_MDNS:-0}
+      ONVM_IDENTITY_PASSPHRASE: ${ONVM_IDENTITY_PASSPHRASE:?set ONVM_IDENTITY_PASSPHRASE in .env}
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "37000:37000"
+    volumes:
+      - onvm_data:/data
+
+volumes:
+  onvm_data:

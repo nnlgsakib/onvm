@@ -33,6 +33,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{interval, Instant};
 
+const MAX_OUTBOUND_TRANSFER_STREAMS_PER_PEER_MIN: usize = 2;
+const MAX_OUTBOUND_TRANSFER_STREAMS_PER_PEER_CAP: usize = 32;
+const MAX_OUTBOUND_TRANSFER_STREAMS_TOTAL_CAP: usize = 256;
+const MAX_OUTBOUND_TRANSFER_QUEUE_PER_PEER: usize = 256;
+
 fn describe_transfer_request(req: &TransferRequest) -> String {
     match req {
         TransferRequest::Program(id) => format!("program({id})"),
@@ -453,6 +458,23 @@ impl NetworkService {
         let max_total_connections = config.max_total_connections.max(1);
         let max_connections_per_peer = config.max_connections_per_peer.max(1);
         let max_inbound_connections = config.max_inbound_connections.max(1);
+        let max_outbound_transfer_streams_per_peer = {
+            let mut v = config.max_inbound_streams / 4;
+            if v < MAX_OUTBOUND_TRANSFER_STREAMS_PER_PEER_MIN {
+                v = MAX_OUTBOUND_TRANSFER_STREAMS_PER_PEER_MIN;
+            }
+            if v > MAX_OUTBOUND_TRANSFER_STREAMS_PER_PEER_CAP {
+                v = MAX_OUTBOUND_TRANSFER_STREAMS_PER_PEER_CAP;
+            }
+            v
+        };
+        let max_outbound_transfer_streams_total = std::cmp::max(
+            max_outbound_transfer_streams_per_peer,
+            std::cmp::min(
+                MAX_OUTBOUND_TRANSFER_STREAMS_TOTAL_CAP,
+                max_outbound_transfer_streams_per_peer.saturating_mul(8),
+            ),
+        );
 
         let bootnodes = config.bootnodes.clone();
 
@@ -473,12 +495,81 @@ impl NetworkService {
                     Option<oneshot::Sender<Result<TransferResponse>>>,
                 ),
             > = HashMap::new();
+            let mut transfer_queue: HashMap<PeerId, VecDeque<TransferJob>> = HashMap::new();
+            let mut transfer_outbound_inflight_total: usize = 0;
+            let mut transfer_outbound_inflight_per_peer: HashMap<PeerId, usize> = HashMap::new();
             let mut redial: HashMap<PeerId, RedialState> = HashMap::new();
             let mut redial_tick = interval(Duration::from_secs(2));
             let mut total_connections: usize = 0;
             let mut inbound_connections: usize = 0;
             let mut counted_connections: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
             let mut counted_inbound: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
+
+            tracing::info!(
+                "transfer outbound limits: per_peer={} total={}",
+                max_outbound_transfer_streams_per_peer,
+                max_outbound_transfer_streams_total
+            );
+
+            fn drain_transfer_queues(
+                swarm: &mut libp2p::Swarm<Behaviour>,
+                transfer_ready: &HashSet<PeerId>,
+                transfer_blocked: &HashSet<PeerId>,
+                transfer_queue: &mut HashMap<PeerId, VecDeque<TransferJob>>,
+                transfer_pending: &mut HashMap<
+                    OutboundRequestId,
+                    (
+                        PeerId,
+                        String,
+                        Option<oneshot::Sender<Result<TransferResponse>>>,
+                    ),
+                >,
+                transfer_outbound_inflight_total: &mut usize,
+                transfer_outbound_inflight_per_peer: &mut HashMap<PeerId, usize>,
+                max_outbound_transfer_streams_per_peer: usize,
+                max_outbound_transfer_streams_total: usize,
+            ) {
+                if transfer_queue.is_empty() {
+                    return;
+                }
+
+                let peers: Vec<PeerId> = transfer_queue.keys().copied().collect();
+                for peer in peers {
+                    if *transfer_outbound_inflight_total >= max_outbound_transfer_streams_total {
+                        return;
+                    }
+                    if transfer_blocked.contains(&peer) || !transfer_ready.contains(&peer) {
+                        continue;
+                    }
+
+                    loop {
+                        if *transfer_outbound_inflight_total >= max_outbound_transfer_streams_total
+                        {
+                            return;
+                        }
+                        let inflight_peer = transfer_outbound_inflight_per_peer
+                            .get(&peer)
+                            .copied()
+                            .unwrap_or(0);
+                        if inflight_peer >= max_outbound_transfer_streams_per_peer {
+                            break;
+                        }
+
+                        let Some(job) = transfer_queue.get_mut(&peer).and_then(|q| q.pop_front())
+                        else {
+                            transfer_queue.remove(&peer);
+                            break;
+                        };
+
+                        let desc = describe_transfer_request(&job.req);
+                        let req_id = swarm.behaviour_mut().transfer.send_request(&peer, job.req);
+                        transfer_pending.insert(req_id, (peer, desc, job.reply));
+                        *transfer_outbound_inflight_total =
+                            transfer_outbound_inflight_total.saturating_add(1);
+                        *transfer_outbound_inflight_per_peer.entry(peer).or_insert(0) += 1;
+                    }
+                }
+            }
 
             let mut sys = sysinfo::System::new();
             let mut memory_pressure = false;
@@ -1151,9 +1242,29 @@ impl NetworkService {
                                     connected_peers_local.remove(&peer_id);
                                     handshake_inflight.remove(&peer_id);
                                     handshake_pending.retain(|_, peer| *peer != peer_id);
-                                    transfer_pending.retain(|_, (peer, _, _)| *peer != peer_id);
+                                    let mut removed = 0usize;
+                                    transfer_pending.retain(|_, (peer, _desc, reply)| {
+                                        if *peer == peer_id {
+                                            removed = removed.saturating_add(1);
+                                            if let Some(reply) = reply.take() {
+                                                let _ = reply.send(Err(anyhow!(
+                                                    "peer {} disconnected",
+                                                    peer_id
+                                                )));
+                                            }
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    });
+                                    if removed > 0 {
+                                        transfer_outbound_inflight_total =
+                                            transfer_outbound_inflight_total.saturating_sub(removed);
+                                        transfer_outbound_inflight_per_peer.remove(&peer_id);
+                                    }
                                     transfer_ready.remove(&peer_id);
                                     transfer_buffer.remove(&peer_id);
+                                    transfer_queue.remove(&peer_id);
                                     ping_inflight.remove(&peer_id);
                                     ping_failures.remove(&peer_id);
                                     ping_pending.retain(|_, peer| *peer != peer_id);
@@ -1178,7 +1289,26 @@ impl NetworkService {
                                     // If we still have a connection but handshake was on the closed one, allow resending.
                                     handshake_inflight.remove(&peer_id);
                                     handshake_pending.retain(|_, peer| *peer != peer_id);
-                                    transfer_pending.retain(|_, (peer, _, _)| *peer != peer_id);
+                                    let mut removed = 0usize;
+                                    transfer_pending.retain(|_, (peer, _desc, reply)| {
+                                        if *peer == peer_id {
+                                            removed = removed.saturating_add(1);
+                                            if let Some(reply) = reply.take() {
+                                                let _ = reply.send(Err(anyhow!(
+                                                    "peer {} disconnected",
+                                                    peer_id
+                                                )));
+                                            }
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    });
+                                    if removed > 0 {
+                                        transfer_outbound_inflight_total =
+                                            transfer_outbound_inflight_total.saturating_sub(removed);
+                                        transfer_outbound_inflight_per_peer.remove(&peer_id);
+                                    }
                                 }
                             }
                             SwarmEvent::Behaviour(BehaviourEvent::Pex(event)) => match event {
@@ -1455,21 +1585,30 @@ impl NetworkService {
                                             }
 
                                             if let Some(mut queued) = transfer_buffer.remove(&peer) {
+                                                let queue = transfer_queue.entry(peer).or_default();
                                                 while let Some(job) = queued.pop_front() {
-                                                    let desc = describe_transfer_request(&job.req);
-                                                    let req_id = swarm
-                                                        .behaviour_mut()
-                                                        .transfer
-                                                        .send_request(&job.peer, job.req);
-                                                    tracing::debug!(
-                                                        "sent buffered transfer request {:?} to {}",
-                                                        req_id,
-                                                        job.peer
-                                                    );
-                                                    transfer_pending
-                                                        .insert(req_id, (job.peer, desc, job.reply));
+                                                    if queue.len() >= MAX_OUTBOUND_TRANSFER_QUEUE_PER_PEER {
+                                                        if let Some(reply) = job.reply {
+                                                            let _ = reply.send(Err(anyhow!(
+                                                                "transfer queue full"
+                                                            )));
+                                                        }
+                                                        continue;
+                                                    }
+                                                    queue.push_back(job);
                                                 }
                                             }
+                                            drain_transfer_queues(
+                                                &mut swarm,
+                                                &transfer_ready,
+                                                &transfer_blocked,
+                                                &mut transfer_queue,
+                                                &mut transfer_pending,
+                                                &mut transfer_outbound_inflight_total,
+                                                &mut transfer_outbound_inflight_per_peer,
+                                                max_outbound_transfer_streams_per_peer,
+                                                max_outbound_transfer_streams_total,
+                                            );
                                         } else {
                                             let was_ready = peers_clone.write().await.remove(&peer);
                                             if was_ready {
@@ -1478,6 +1617,7 @@ impl NetworkService {
                                             transfer_ready.remove(&peer);
                                             transfer_blocked.insert(peer);
                                             transfer_buffer.remove(&peer);
+                                            transfer_queue.remove(&peer);
                                         }
                                     }
                                     libp2p::request_response::Message::Response { response, request_id } => {
@@ -1499,6 +1639,7 @@ impl NetworkService {
                                             transfer_ready.remove(&peer);
                                             transfer_blocked.insert(peer);
                                             transfer_buffer.remove(&peer);
+                                            transfer_queue.remove(&peer);
                                             continue;
                                         }
 
@@ -1521,6 +1662,7 @@ impl NetworkService {
                                             transfer_ready.remove(&peer);
                                             transfer_blocked.insert(peer);
                                             transfer_buffer.remove(&peer);
+                                            transfer_queue.remove(&peer);
                                             continue;
                                         }
 
@@ -1545,21 +1687,29 @@ impl NetworkService {
                                         }
 
                                         if let Some(mut queued) = transfer_buffer.remove(&peer) {
+                                            let queue = transfer_queue.entry(peer).or_default();
                                             while let Some(job) = queued.pop_front() {
-                                                let desc = describe_transfer_request(&job.req);
-                                                let req_id = swarm
-                                                    .behaviour_mut()
-                                                    .transfer
-                                                    .send_request(&job.peer, job.req);
-                                                tracing::debug!(
-                                                    "sent buffered transfer request {:?} to {}",
-                                                    req_id,
-                                                    job.peer
-                                                );
-                                                transfer_pending
-                                                    .insert(req_id, (job.peer, desc, job.reply));
+                                                if queue.len() >= MAX_OUTBOUND_TRANSFER_QUEUE_PER_PEER {
+                                                    if let Some(reply) = job.reply {
+                                                        let _ =
+                                                            reply.send(Err(anyhow!("transfer queue full")));
+                                                    }
+                                                    continue;
+                                                }
+                                                queue.push_back(job);
                                             }
                                         }
+                                        drain_transfer_queues(
+                                            &mut swarm,
+                                            &transfer_ready,
+                                            &transfer_blocked,
+                                            &mut transfer_queue,
+                                            &mut transfer_pending,
+                                            &mut transfer_outbound_inflight_total,
+                                            &mut transfer_outbound_inflight_per_peer,
+                                            max_outbound_transfer_streams_per_peer,
+                                            max_outbound_transfer_streams_total,
+                                        );
                                     }
                                 },
                                 libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
@@ -1586,6 +1736,7 @@ impl NetworkService {
                                     transfer_ready.remove(&peer);
                                     transfer_blocked.insert(peer);
                                     transfer_buffer.remove(&peer);
+                                    transfer_queue.remove(&peer);
                                 }
                                 libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
                                     tracing::debug!(
@@ -1606,7 +1757,23 @@ impl NetworkService {
                                         }
                                         libp2p::request_response::Message::Response { response, request_id } => {
                                             let pending = transfer_pending.remove(&request_id);
-                                            if let Some((_peer, _desc, reply)) = pending {
+                                            if let Some((pending_peer, _desc, reply)) = pending {
+                                                transfer_outbound_inflight_total =
+                                                    transfer_outbound_inflight_total.saturating_sub(1);
+                                                let should_remove = match transfer_outbound_inflight_per_peer
+                                                    .get_mut(&pending_peer)
+                                                {
+                                                    Some(inflight) => {
+                                                        *inflight = inflight.saturating_sub(1);
+                                                        *inflight == 0
+                                                    }
+                                                    None => false,
+                                                };
+                                                if should_remove {
+                                                    transfer_outbound_inflight_per_peer
+                                                        .remove(&pending_peer);
+                                                }
+
                                                 if let Some(reply) = reply {
                                                     let _ = reply.send(Ok(response));
                                                 } else {
@@ -1615,19 +1782,50 @@ impl NetworkService {
                                             } else {
                                                 let _ = event_tx.send(NetworkEvent::TransferResponse(peer, response));
                                             }
+                                            drain_transfer_queues(
+                                                &mut swarm,
+                                                &transfer_ready,
+                                                &transfer_blocked,
+                                                &mut transfer_queue,
+                                                &mut transfer_pending,
+                                                &mut transfer_outbound_inflight_total,
+                                                &mut transfer_outbound_inflight_per_peer,
+                                                max_outbound_transfer_streams_per_peer,
+                                                max_outbound_transfer_streams_total,
+                                            );
                                         }
                                     }
                                 }
                                 libp2p::request_response::Event::OutboundFailure { peer, error, request_id } => {
-                                    let (req_desc, reply) = transfer_pending
-                                        .remove(&request_id)
-                                        .map(|(_peer, d, reply)| (d, reply))
-                                        .unwrap_or_else(|| ("<unknown>".to_string(), None));
-                                    if let Some(reply) = reply {
-                                        let _ = reply.send(Err(anyhow!(
-                                            "transfer outbound failure to {}: {error:?}",
-                                            peer
-                                        )));
+                                    let pending = transfer_pending.remove(&request_id);
+                                    let req_desc = pending
+                                        .as_ref()
+                                        .map(|(_peer, d, _reply)| d.clone())
+                                        .unwrap_or_else(|| "<unknown>".to_string());
+
+                                    if let Some((pending_peer, _desc, reply)) = pending {
+                                        transfer_outbound_inflight_total =
+                                            transfer_outbound_inflight_total.saturating_sub(1);
+                                        let should_remove = match transfer_outbound_inflight_per_peer
+                                            .get_mut(&pending_peer)
+                                        {
+                                            Some(inflight) => {
+                                                *inflight = inflight.saturating_sub(1);
+                                                *inflight == 0
+                                            }
+                                            None => false,
+                                        };
+                                        if should_remove {
+                                            transfer_outbound_inflight_per_peer
+                                                .remove(&pending_peer);
+                                        }
+
+                                        if let Some(reply) = reply {
+                                            let _ = reply.send(Err(anyhow!(
+                                                "transfer outbound failure to {}: {error:?}",
+                                                peer
+                                            )));
+                                        }
                                     }
                                     match &error {
                                         libp2p::request_response::OutboundFailure::UnsupportedProtocols => {
@@ -1656,6 +1854,18 @@ impl NetworkService {
                                             transfer_ready.remove(&peer);
                                             transfer_blocked.insert(peer);
                                             transfer_buffer.remove(&peer);
+                                            transfer_queue.remove(&peer);
+                                        }
+                                        libp2p::request_response::OutboundFailure::Io(err)
+                                            if err.to_string().contains("max sub-streams reached") =>
+                                        {
+                                            tracing::debug!(
+                                                "transfer outbound backpressure to {}: {} ({:?}) req={}",
+                                                peer,
+                                                err,
+                                                request_id,
+                                                req_desc
+                                            );
                                         }
                                         _ => {
                                             tracing::warn!(
@@ -1665,6 +1875,17 @@ impl NetworkService {
                                             );
                                         }
                                     }
+                                    drain_transfer_queues(
+                                        &mut swarm,
+                                        &transfer_ready,
+                                        &transfer_blocked,
+                                        &mut transfer_queue,
+                                        &mut transfer_pending,
+                                        &mut transfer_outbound_inflight_total,
+                                        &mut transfer_outbound_inflight_per_peer,
+                                        max_outbound_transfer_streams_per_peer,
+                                        max_outbound_transfer_streams_total,
+                                    );
                                 }
                                 libp2p::request_response::Event::InboundFailure { peer, error, request_id } => {
                                     match &error {
@@ -1693,6 +1914,7 @@ impl NetworkService {
                                             transfer_ready.remove(&peer);
                                             transfer_blocked.insert(peer);
                                             transfer_buffer.remove(&peer);
+                                            transfer_queue.remove(&peer);
                                         }
                                         _ => {
                                             tracing::warn!(
@@ -1729,19 +1951,41 @@ impl NetworkService {
                         if !transfer_ready.contains(&job.peer) {
                             let queue = transfer_buffer.entry(job.peer).or_default();
                             if queue.len() >= 64 {
-                                queue.pop_front();
+                                if let Some(dropped) = queue.pop_front() {
+                                    if let Some(reply) = dropped.reply {
+                                        let _ = reply.send(Err(anyhow!(
+                                            "transfer buffer full (peer not ready)"
+                                        )));
+                                    }
+                                }
                             }
                             queue.push_back(job);
                             continue;
                         }
                         let peer = job.peer;
-                        let desc = describe_transfer_request(&job.req);
-                        let req_id = swarm
-                            .behaviour_mut()
-                            .transfer
-                            .send_request(&peer, job.req);
-                        tracing::debug!("sent transfer request {:?} to {}", req_id, peer);
-                        transfer_pending.insert(req_id, (peer, desc, job.reply));
+                        let queue = transfer_queue.entry(peer).or_default();
+                        if queue.len() >= MAX_OUTBOUND_TRANSFER_QUEUE_PER_PEER {
+                            tracing::debug!(
+                                "dropping transfer request to {} due to outbound queue full",
+                                peer
+                            );
+                            if let Some(reply) = job.reply {
+                                let _ = reply.send(Err(anyhow!("transfer queue full")));
+                            }
+                            continue;
+                        }
+                        queue.push_back(job);
+                        drain_transfer_queues(
+                            &mut swarm,
+                            &transfer_ready,
+                            &transfer_blocked,
+                            &mut transfer_queue,
+                            &mut transfer_pending,
+                            &mut transfer_outbound_inflight_total,
+                            &mut transfer_outbound_inflight_per_peer,
+                            max_outbound_transfer_streams_per_peer,
+                            max_outbound_transfer_streams_total,
+                        );
                     }
                     Some(resp) = transfer_resp_rx.recv() => {
                         let _ = swarm

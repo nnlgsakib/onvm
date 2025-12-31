@@ -279,6 +279,14 @@ pub enum Commands {
         allow_plaintext_identity: bool,
         #[arg(long, help = "Development mode: enable mDNS regardless of config")]
         dev: bool,
+        #[arg(long, help = "Enable blob gateway CDN on separate port")]
+        enable_gateway: bool,
+        #[arg(
+            long,
+            default_value = "127.0.0.1:8081",
+            help = "Blob gateway listen address"
+        )]
+        gateway_addr: String,
     },
     /// Submit a job to a running node
     SubmitJob {
@@ -592,6 +600,8 @@ pub async fn run() -> Result<()> {
             identity_passphrase,
             allow_plaintext_identity,
             dev,
+            enable_gateway,
+            gateway_addr,
         } => {
             let identity_path = data_dir.join("identity");
             let listen_addr: Multiaddr = listen
@@ -690,12 +700,36 @@ pub async fn run() -> Result<()> {
                 identity_passphrase.clone(),
             )
             .await?;
+
+            let gateway_handle = if enable_gateway {
+                let gateway_config = crate::blob_gateway::GatewayConfig {
+                    listen_addr: gateway_addr.clone(),
+                };
+                let node_clone = node.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(e) =
+                        crate::blob_gateway::start_gateway(node_clone, gateway_config).await
+                    {
+                        tracing::error!("Gateway error: {}", e);
+                    }
+                }))
+            } else {
+                None
+            };
+
             println!(
                 "Node started. Data dir: {}. RPC: {}.",
                 data_dir.display(),
                 rpc_server.bound
             );
+            if enable_gateway {
+                println!("Blob Gateway: http://{}", gateway_addr);
+            }
             signal::ctrl_c().await?;
+
+            if let Some(handle) = gateway_handle {
+                handle.abort();
+            }
         }
         Commands::GenerateProject {
             rpc,
@@ -783,13 +817,23 @@ pub async fn run() -> Result<()> {
             );
 
             let blob_data = std::fs::read(&file)?;
+
+            let detected_mime = if mime.is_none() {
+                let detector = crate::blob_gateway::content_detector::ContentDetector::new();
+                Some(detector.detect(&blob_data))
+            } else {
+                None
+            };
+
+            let final_mime = mime.or(detected_mime);
+
             let body_str = String::from_utf8_lossy(&blob_data).to_string();
 
             let client = reqwest::Client::new();
             let endpoint = normalize_rpc_endpoint(&rpc);
             let mut req = client.post(format!("{endpoint}/blobs"));
 
-            if let Some(m) = mime.clone() {
+            if let Some(m) = final_mime.clone() {
                 req = req.header("x-mime", m);
             }
 

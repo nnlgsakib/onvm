@@ -2,8 +2,8 @@ use crate::node::Node;
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
-    response::{Html, IntoResponse, Response},
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -15,7 +15,7 @@ use tracing::{error, info};
 
 use super::content_detector::ContentDetector;
 use super::fetcher::BlobFetcher;
-use super::ui;
+use super::ui_embed::UiAssets;
 
 const SIZE_THRESHOLD_BYTES: u64 = 50 * 1024 * 1024;
 
@@ -43,14 +43,12 @@ pub async fn start_gateway(node: Arc<Node>, config: GatewayConfig) -> Result<()>
     };
 
     let app = Router::new()
-        .route("/", get(explorer_ui))
-        .route("/explorer", get(explorer_ui))
-        .route("/cdn/:id", get(cdn_serve_handler))
-        .route("/cdn/:id/*path", get(cdn_serve_handler))
-        .route("/share/:id", get(share_page_handler))
         .route("/api/blob/:id", get(get_blob_handler))
         .route("/api/blob/:id/info", get(get_blob_info))
         .route("/api/health", get(health_check))
+        .route("/cdn/:id", get(cdn_serve_handler))
+        .route("/cdn/:id/*path", get(cdn_serve_handler))
+        .fallback(serve_ui)
         .layer(CorsLayer::permissive())
         .with_state(ctx);
 
@@ -61,9 +59,27 @@ pub async fn start_gateway(node: Arc<Node>, config: GatewayConfig) -> Result<()>
     Ok(())
 }
 
-async fn explorer_ui() -> Html<String> {
-    Html(ui::EXPLORER_HTML.to_string())
+async fn serve_ui(uri: Uri) -> Result<Response, (StatusCode, String)> {
+    let path = uri.path().trim_start_matches('/');
+
+    let path = if path.is_empty() || path.starts_with('#') {
+        "index.html"
+    } else if UiAssets::get(path).is_some() {
+        path
+    } else {
+        "index.html"
+    };
+
+    match UiAssets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            Ok(([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response())
+        }
+        None => Err((StatusCode::NOT_FOUND, "Not found".to_string())),
+    }
 }
+
+
 
 async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "Gateway healthy")
@@ -187,68 +203,7 @@ async fn cdn_serve_handler(
     }
 }
 
-async fn share_page_handler(
-    State(ctx): State<GatewayContext>,
-    Path(id_hex): Path<String>,
-) -> Result<Html<String>, (StatusCode, String)> {
-    let blob_id = parse_id(&id_hex)?;
 
-    if is_program_id(&blob_id, &ctx).await {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Cannot share program IDs. Gateway only serves blob data.".to_string(),
-        ));
-    }
-
-    let fetcher = BlobFetcher::new(ctx.node.clone());
-    let info = fetcher
-        .get_blob_info(&blob_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let cdn_url = format!("/cdn/{}", id_hex);
-    let mime_type = info
-        .detected_mime_type
-        .or(info.mime_type)
-        .unwrap_or_else(|| "application/octet-stream".to_string());
-
-    let preview_html = if mime_type.starts_with("image/") {
-        format!(
-            r#"<img src="{}" alt="Shared content" style="max-width: 100%; height: auto; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">"#,
-            cdn_url
-        )
-    } else if mime_type.starts_with("video/") {
-        format!(
-            r#"<video controls style="max-width: 100%; border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);"><source src="{}" type="{}">Your browser does not support video playback.</video>"#,
-            cdn_url, mime_type
-        )
-    } else if mime_type.starts_with("audio/") {
-        format!(
-            r#"<audio controls style="width: 100%;"><source src="{}" type="{}">Your browser does not support audio playback.</audio>"#,
-            cdn_url, mime_type
-        )
-    } else if mime_type == "application/pdf" {
-        format!(
-            r#"<embed src="{}" type="application/pdf" width="100%" height="600px" style="border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);">"#,
-            cdn_url
-        )
-    } else if mime_type.starts_with("text/") {
-        format!(
-            r#"<iframe src="{}" style="width: 100%; height: 600px; border: 1px solid #ddd; border-radius: 10px;"></iframe>"#,
-            cdn_url
-        )
-    } else {
-        format!(
-            r#"<div style="text-align: center; padding: 40px; background: #f8f9fa; border-radius: 10px;"><p style="font-size: 18px; margin-bottom: 20px;">Preview not available for this file type.</p><a href="{}" download style="display: inline-block; padding: 12px 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; text-decoration: none; border-radius: 8px; font-weight: 600;">Download File</a></div>"#,
-            cdn_url
-        )
-    };
-
-    let size_str = format_size(info.size);
-    let html = ui::generate_share_page(&id_hex, &mime_type, &size_str, &preview_html, &cdn_url);
-
-    Ok(Html(html))
-}
 
 fn parse_id(id_hex: &str) -> Result<crate::types::ObjectId, (StatusCode, String)> {
     let decoded = hex::decode(id_hex).map_err(|_| {
@@ -289,14 +244,3 @@ fn is_renderable(content_type: &str) -> bool {
         || content_type.starts_with("text/")
 }
 
-fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{} B", bytes)
-    } else if bytes < 1024 * 1024 {
-        format!("{:.2} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}

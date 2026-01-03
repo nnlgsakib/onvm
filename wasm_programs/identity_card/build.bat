@@ -29,8 +29,8 @@ if exist "%WASM_FILE%" (
     echo.
     echo Next steps:
     echo 1. Upload: onvm upload-blob --file %WASM_FILE% --rpc 127.0.0.1:8080
-    echo 2. Deploy: onvm deploy --blob-id ^<BLOB_ID^> --rpc 127.0.0.1:8080
-    echo 3. Execute: onvm execute --program-id ^<PROGRAM_ID^> --input register.json --rpc 127.0.0.1:8080
+    echo 2. Deploy: onvm deploy --blob-id blob^<64-hex^> --rpc 127.0.0.1:8080
+    echo 3. Execute: onvm execute --program-id prog^<64-hex^> --input register.json --rpc 127.0.0.1:8080
 ) else (
     echo.
     echo Build failed - WASM file not found

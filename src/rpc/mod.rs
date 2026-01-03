@@ -173,6 +173,7 @@ pub async fn start_rpc(
     rpc_auth: RpcAuthConfig,
     data_dir: PathBuf,
     identity_passphrase: Option<String>,
+    enable_gateway: bool,
 ) -> Result<RpcServer> {
     let auth_state =
         auth::AuthState::from_config(&rpc_auth, &data_dir, identity_passphrase.as_deref())?
@@ -282,6 +283,12 @@ pub async fn start_rpc(
         .layer(cors)
         .with_state(ctx);
 
+    let app = if enable_gateway {
+        app.nest("/explorer", crate::blob_gateway::gateway_router(node.clone()))
+    } else {
+        app
+    };
+
     let mut port = addr.port();
     let ip = addr.ip();
     let listener = loop {
@@ -338,7 +345,7 @@ async fn upload_blob(
         .await
         .map_err(internal_err)?;
     Ok(Json(UploadBlobResponse {
-        id: hex::encode(object.id.0),
+        id: BlobId(object.id.0).to_prefixed_string(),
         size: object.total_size,
     }))
 }
@@ -413,7 +420,7 @@ async fn deploy_program(
         .await
         .map_err(internal_err)?;
     Ok(Json(DeployProgramResponse {
-        id: hex::encode(object.id.0),
+        id: ProgramId(object.id.0).to_prefixed_string(),
     }))
 }
 
@@ -435,11 +442,14 @@ async fn program_info(
                 blob_refs,
                 ..
             } => Ok(Json(serde_json::json!({
-                "id": hex::encode(obj.id.0),
+                "id": ProgramId(obj.id.0).to_prefixed_string(),
                 "publisher": hex::encode(obj.publisher.0),
                 "size": obj.total_size,
                 "entrypoint": entrypoint,
-                "blob_refs": blob_refs.iter().map(|b| hex::encode(b.0)).collect::<Vec<_>>(),
+                "blob_refs": blob_refs
+                    .iter()
+                    .map(|b| BlobId(b.0).to_prefixed_string())
+                    .collect::<Vec<_>>(),
             }))),
             _ => Err((
                 axum::http::StatusCode::BAD_REQUEST,
@@ -461,7 +471,7 @@ async fn list_program_catalog(
     let entries = manifests
         .into_iter()
         .map(|m| CatalogEntryResponse {
-            program_id: hex::encode(m.program_id.0),
+            program_id: m.program_id.to_prefixed_string(),
             version: m.version,
             initial_state_root: hex::encode(m.initial_state_root),
             dag_parent: m.dag_parent.map(hex::encode),
@@ -486,7 +496,7 @@ async fn program_receipts(
     let mapped = receipts
         .into_iter()
         .map(|r| AggregatedReceiptResponse {
-            program_id: hex::encode(r.receipt.program_id.0),
+            program_id: r.receipt.program_id.to_prefixed_string(),
             state_root_in: hex::encode(r.receipt.state_root_in),
             state_root_out: hex::encode(r.receipt.state_root_out),
             write_digest: hex::encode(r.receipt.write_digest),
@@ -526,7 +536,7 @@ async fn program_committee(
     })?;
 
     let resp = CommitteeResponse {
-        program_id: hex::encode(committee.program_id.0),
+        program_id: committee.program_id.to_prefixed_string(),
         epoch: committee.epoch,
         aggregate_public_key: hex::encode(committee.aggregate_public_key.0),
         threshold: committee.threshold,
@@ -584,7 +594,7 @@ async fn program_state_root(
     };
 
     Ok(Json(StateRootResponse {
-        program_id: hex::encode(program_id.0),
+        program_id: program_id.to_prefixed_string(),
         root: hex::encode(root),
         proof,
         value_hex,
@@ -724,7 +734,7 @@ async fn get_fuel_profile(
         })?;
 
     Ok(Json(FuelProfileResponse {
-        program_id: program_id_hex,
+        program_id: program_id.to_prefixed_string(),
         samples: profile
             .samples
             .iter()
@@ -741,23 +751,11 @@ async fn get_fuel_profile(
 }
 
 fn parse_blob_id(hex_str: &str) -> Result<BlobId, String> {
-    let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
-    if bytes.len() != 32 {
-        return Err("invalid blob id length".into());
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(BlobId(arr))
+    crate::types::parse_blob_id_str(hex_str)
 }
 
 fn parse_program_id(hex_str: &str) -> Result<ProgramId, String> {
-    let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
-    if bytes.len() != 32 {
-        return Err("invalid program id length".into());
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(ProgramId(arr))
+    crate::types::parse_program_id_str(hex_str)
 }
 
 fn internal_err<E: std::fmt::Display>(err: E) -> (axum::http::StatusCode, String) {

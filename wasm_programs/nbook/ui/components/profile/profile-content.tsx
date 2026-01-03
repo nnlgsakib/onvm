@@ -334,7 +334,7 @@ export function ProfileContent() {
               />
             </div>
             <div className="space-y-1">
-              <label className="text-sm text-muted-foreground">Avatar (blob id, optional)</label>
+              <label className="text-sm text-muted-foreground">Avatar (blob&lt;hash&gt;, optional)</label>
               <input
                 className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm"
                 value={avatarBlobId || ""}
@@ -372,7 +372,7 @@ export function ProfileContent() {
               </Button>
             </div>
             <div className="space-y-1">
-              <label className="text-sm text-muted-foreground">Banner (blob id, optional)</label>
+              <label className="text-sm text-muted-foreground">Banner (blob&lt;hash&gt;, optional)</label>
               <input
                 className="w-full rounded-md border border-border/60 bg-background px-3 py-2 text-sm"
                 value={bannerBlobId || ""}

@@ -126,10 +126,16 @@ const client = new OnvmClient({
 });
 
 const result = await client.executeProgram({
-  program_id: 'program-id',
+  program_id: 'prog<64-hex>',
   input_base64: inputBase64,
 });
 ```
+
+### ID Format
+
+- Program IDs use `prog<64-hex>`.
+- Blob IDs use `blob<64-hex>`.
+- Legacy 64-hex IDs remain accepted for compatibility.
 
 ### WASM Program Integration (Your Use Case)
 ```typescript
@@ -145,7 +151,7 @@ export async function onvm_main(input: Uint8Array): Promise<Uint8Array> {
 
   // Use SDK to interact with other programs
   const result = await client.executeProgram({
-    program_id: 'another-program',
+    program_id: 'prog<64-hex>',
     input_base64: Buffer.from(input).toString('base64'),
   });
 

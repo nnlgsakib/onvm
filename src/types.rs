@@ -35,6 +35,15 @@ pub type StateDeltaRoot = [u8; 32];
 pub type WasmEnvHash = [u8; 32];
 pub type ReceiptId = [u8; 32];
 
+pub const BLOB_ID_PREFIX: &str = "blob";
+pub const PROGRAM_ID_PREFIX: &str = "prog";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdPrefix {
+    Blob,
+    Program,
+}
+
 /// Strongly-typed manifest for programs with network-wide availability data
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgramManifest {
@@ -330,6 +339,10 @@ impl ProgramId {
     pub fn to_object_id(&self) -> ObjectId {
         ObjectId(self.0)
     }
+
+    pub fn to_prefixed_string(&self) -> String {
+        format!("{}{}", PROGRAM_ID_PREFIX, hex::encode(self.0))
+    }
 }
 
 impl BlobId {
@@ -339,6 +352,10 @@ impl BlobId {
 
     pub fn to_object_id(&self) -> ObjectId {
         ObjectId(self.0)
+    }
+
+    pub fn to_prefixed_string(&self) -> String {
+        format!("{}{}", BLOB_ID_PREFIX, hex::encode(self.0))
     }
 }
 
@@ -410,7 +427,66 @@ macro_rules! display_hex {
 display_hex!(ObjectId);
 display_hex!(ChunkId);
 display_hex!(ManifestId);
-display_hex!(ProgramId);
-display_hex!(BlobId);
 display_hex!(BlockId);
 display_hex!(NodeId);
+
+impl Display for ProgramId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", PROGRAM_ID_PREFIX, hex::encode(self.0))
+    }
+}
+
+impl Display for BlobId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", BLOB_ID_PREFIX, hex::encode(self.0))
+    }
+}
+
+pub fn parse_blob_id_str(input: &str) -> Result<BlobId, String> {
+    let (prefix, bytes) = parse_prefixed_hex_id(input)?;
+    if matches!(prefix, Some(IdPrefix::Program)) {
+        return Err("expected blob id, got program id prefix".into());
+    }
+    Ok(BlobId(bytes))
+}
+
+pub fn parse_program_id_str(input: &str) -> Result<ProgramId, String> {
+    let (prefix, bytes) = parse_prefixed_hex_id(input)?;
+    if matches!(prefix, Some(IdPrefix::Blob)) {
+        return Err("expected program id, got blob id prefix".into());
+    }
+    Ok(ProgramId(bytes))
+}
+
+pub fn parse_object_id_str(input: &str) -> Result<ObjectId, String> {
+    let (_, bytes) = parse_prefixed_hex_id(input)?;
+    Ok(ObjectId(bytes))
+}
+
+fn parse_prefixed_hex_id(input: &str) -> Result<(Option<IdPrefix>, [u8; 32]), String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("id cannot be empty".into());
+    }
+
+    let (prefix, rest) = if let Some(candidate) = trimmed.get(0..4) {
+        if candidate.eq_ignore_ascii_case(BLOB_ID_PREFIX) {
+            (Some(IdPrefix::Blob), trimmed.get(4..).unwrap_or(""))
+        } else if candidate.eq_ignore_ascii_case(PROGRAM_ID_PREFIX) {
+            (Some(IdPrefix::Program), trimmed.get(4..).unwrap_or(""))
+        } else {
+            (None, trimmed)
+        }
+    } else {
+        (None, trimmed)
+    };
+
+    let hex_part = rest.trim();
+    let bytes = hex::decode(hex_part).map_err(|e| format!("invalid hex: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!("invalid id length: expected 32 bytes, got {}", bytes.len()));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok((prefix, arr))
+}

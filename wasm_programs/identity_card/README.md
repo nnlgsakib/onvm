@@ -106,32 +106,32 @@ onvm upload-blob --file target/wasm32-unknown-unknown/release/onvm_identity_card
 
 2. Deploy program:
 ```bash
-onvm deploy --blob-id <BLOB_ID> --rpc 127.0.0.1:8080
+onvm deploy --blob-id blob<64-hex> --rpc 127.0.0.1:8080
 ```
 
 3. Execute operations:
 ```bash
-onvm execute --program-id <PROGRAM_ID> --input register.json --rpc 127.0.0.1:8080
+onvm execute --program-id prog<64-hex> --input register.json --rpc 127.0.0.1:8080
 ```
 
 ## Example Workflow
 
 ```bash
 # 1. Register Alice
-onvm execute --program-id <PID> --input register.json --rpc 127.0.0.1:8080
+onvm execute --program-id prog<64-hex> --input register.json --rpc 127.0.0.1:8080
 
 # 2. Register Bob
-onvm execute --program-id <PID> --input register2.json --rpc 127.0.0.1:8080
+onvm execute --program-id prog<64-hex> --input register2.json --rpc 127.0.0.1:8080
 
 # 3. List all identities
-onvm execute --program-id <PID> --input list_all.json --rpc 127.0.0.1:8080
+onvm execute --program-id prog<64-hex> --input list_all.json --rpc 127.0.0.1:8080
 
 # 4. Get Alice's card (use ID from step 1)
 # Edit get_card.json with actual ID, then:
-onvm execute --program-id <PID> --input get_card.json --rpc 127.0.0.1:8080
+onvm execute --program-id prog<64-hex> --input get_card.json --rpc 127.0.0.1:8080
 
 # 5. Save SVG to file
-onvm execute --program-id <PID> --input get_card.json --rpc 127.0.0.1:8080 | jq -r '.card_svg' > alice_card.svg
+onvm execute --program-id prog<64-hex> --input get_card.json --rpc 127.0.0.1:8080 | jq -r '.card_svg' > alice_card.svg
 ```
 
 ## Data Model

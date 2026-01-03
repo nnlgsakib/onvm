@@ -3,7 +3,7 @@ import { Card } from "@/components/ui/card"
 import { Users, GraduationCap, BookOpen, TrendingUp } from "lucide-react"
 import { getSchoolClient } from "@/lib/onvm-client"
 
-const PROGRAM_ID = "918c95aa44b129ae2315698637afbb339b7cb43ed6115e433605ae172f617bc4"
+const PROGRAM_ID = "prog918c95aa44b129ae2315698637afbb339b7cb43ed6115e433605ae172f617bc4"
 
 export function DashboardView() {
   const [stats, setStats] = useState([

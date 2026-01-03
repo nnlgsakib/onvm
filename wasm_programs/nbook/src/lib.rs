@@ -129,9 +129,11 @@ struct Comment {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Attachment {
-    blob_id_hex: String,
+    #[serde(rename = "blob_id_hex", alias = "blob_id")]
+    blob_id: String,
     size: u64,
-    hash_hex: String,
+    #[serde(rename = "hash_hex", alias = "content_hash")]
+    content_hash: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -411,22 +413,8 @@ fn update_profile(
             return Err("bio too long".into());
         }
     }
-    let avatar = match avatar_blob_id {
-        Some(ref a) if a.trim().is_empty() => None,
-        Some(ref a) => {
-            validate_blob_id(a)?;
-            Some(a.clone())
-        }
-        None => None,
-    };
-    let banner = match banner_blob_id {
-        Some(ref b) if b.trim().is_empty() => None,
-        Some(ref b) => {
-            validate_blob_id(b)?;
-            Some(b.clone())
-        }
-        None => None,
-    };
+    let avatar = resolve_profile_blob_id(avatar_blob_id)?;
+    let banner = resolve_profile_blob_id(banner_blob_id)?;
 
     user.display_name = display_name;
     user.bio = bio;
@@ -581,12 +569,14 @@ fn feed_internal(session_token: &str, limit: usize, discover: bool) -> Result<Ve
 
 fn profile(username: &str) -> Result<ProfileView, String> {
     let user: User = load_json(&user_key(username))?.ok_or("user not found")?;
+    let avatar_blob_id = normalize_blob_id_opt(user.avatar_blob_id)?;
+    let banner_blob_id = normalize_blob_id_opt(user.banner_blob_id)?;
     Ok(ProfileView {
         username: user.username,
         display_name: user.display_name,
         bio: user.bio,
-        avatar_blob_id: user.avatar_blob_id,
-        banner_blob_id: user.banner_blob_id,
+        avatar_blob_id,
+        banner_blob_id,
         followers: user.followers.len(),
         following: user.following.len(),
         follower_list: user.followers,
@@ -598,12 +588,14 @@ fn profile(username: &str) -> Result<ProfileView, String> {
 
 fn load_user_summary(username: &str) -> Result<Option<UserSummary>, String> {
     if let Some(user) = load_json::<User>(&user_key(username))? {
+        let avatar_blob_id = normalize_blob_id_opt(user.avatar_blob_id)?;
+        let banner_blob_id = normalize_blob_id_opt(user.banner_blob_id)?;
         return Ok(Some(UserSummary {
             username: user.username,
             display_name: user.display_name,
             bio: user.bio,
-            avatar_blob_id: user.avatar_blob_id,
-            banner_blob_id: user.banner_blob_id,
+            avatar_blob_id,
+            banner_blob_id,
             followers: user.followers.len(),
         }));
     }
@@ -677,7 +669,8 @@ fn list_following(session_token: &str, username: &str, limit: usize) -> Result<V
 }
 
 fn load_post_view(post_id: &str) -> Result<PostView, String> {
-    let post: Post = load_json(&post_key(post_id))?.ok_or("post not found")?;
+    let mut post: Post = load_json(&post_key(post_id))?.ok_or("post not found")?;
+    normalize_attachments(&mut post.attachments)?;
     let comments: Vec<CommentView> = post
         .comments
         .iter()
@@ -862,44 +855,129 @@ fn random_u64() -> Result<u64, String> {
     Ok(u64::from_le_bytes(buf))
 }
 
-fn build_attachments(ids: Vec<String>) -> Result<Vec<Attachment>, String> {
-    let mut out = Vec::new();
-    for id in ids {
-        let blob = validate_blob_id(&id)?;
-        let len = unsafe { onvm_blob_len(blob.as_ptr() as i32, blob.len() as i32) };
-        if len < 0 {
-            return Err("failed to read blob length".into());
+#[derive(Debug, Clone)]
+struct BlobId {
+    raw: [u8; 32],
+}
+
+impl BlobId {
+    fn parse(id: &str) -> Result<Self, String> {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return Err("empty blob id".into());
         }
+        let mut raw = [0u8; 32];
+        let rc = unsafe {
+            onvm_blob_addr(
+                trimmed.as_ptr() as i32,
+                trimmed.len() as i32,
+                raw.as_mut_ptr() as i32,
+            )
+        };
+        if rc != 0 {
+            return Err(format!("invalid blob id: {rc}"));
+        }
+        Ok(Self { raw })
+    }
+
+    fn require_exists(id: &str) -> Result<Self, String> {
+        let trimmed = id.trim();
+        let blob = Self::parse(trimmed)?;
+        match blob.exists()? {
+            true => Ok(blob),
+            false => Err(format!("blob {trimmed} missing")),
+        }
+    }
+
+    fn canonical(&self) -> String {
+        format!("{}{}", BLOB_PREFIX, hex::encode(self.raw))
+    }
+
+    fn exists(&self) -> Result<bool, String> {
+        let rc = unsafe { onvm_blob_exists(self.raw.as_ptr() as i32, self.raw.len() as i32) };
+        match rc {
+            1 => Ok(true),
+            0 => Ok(false),
+            code => Err(format!("blob exists failed: {code}")),
+        }
+    }
+
+    fn len(&self) -> Result<u64, String> {
+        let len = unsafe { onvm_blob_len(self.raw.as_ptr() as i32, self.raw.len() as i32) };
+        if len < 0 {
+            return Err(format!("failed to read blob length: {len}"));
+        }
+        Ok(len as u64)
+    }
+
+    fn content_hash(&self) -> Result<[u8; 32], String> {
         let mut hash = [0u8; 32];
         let rc = unsafe {
             onvm_blob_hash(
-                blob.as_ptr() as i32,
-                blob.len() as i32,
+                self.raw.as_ptr() as i32,
+                self.raw.len() as i32,
                 hash.as_mut_ptr() as i32,
             )
         };
         if rc != 0 {
-            return Err("failed to read blob hash".into());
+            return Err(format!("failed to read blob hash: {rc}"));
         }
+        Ok(hash)
+    }
+}
+
+fn normalize_blob_id(id: &str) -> Result<String, String> {
+    Ok(BlobId::parse(id)?.canonical())
+}
+
+fn normalize_blob_id_opt(id: Option<String>) -> Result<Option<String>, String> {
+    match id {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(normalize_blob_id(trimmed)?))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn resolve_profile_blob_id(id: Option<String>) -> Result<Option<String>, String> {
+    match id {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(BlobId::require_exists(trimmed)?.canonical()))
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+fn normalize_attachments(attachments: &mut [Attachment]) -> Result<(), String> {
+    for attachment in attachments.iter_mut() {
+        attachment.blob_id = normalize_blob_id(&attachment.blob_id)?;
+    }
+    Ok(())
+}
+
+fn build_attachments(ids: Vec<String>) -> Result<Vec<Attachment>, String> {
+    let mut out = Vec::new();
+    for id in ids {
+        let blob = BlobId::require_exists(&id)?;
+        let size = blob.len()?;
+        let hash = blob.content_hash()?;
         out.push(Attachment {
-            blob_id_hex: id.clone(),
-            size: len as u64,
-            hash_hex: hex::encode(hash),
+            blob_id: blob.canonical(),
+            size,
+            content_hash: hex::encode(hash),
         });
     }
     Ok(out)
-}
-
-fn validate_blob_id(id: &str) -> Result<Vec<u8>, String> {
-    let bytes = hex::decode(id).map_err(|e| format!("invalid attachment id: {e}"))?;
-    if bytes.len() != 32 {
-        return Err("attachment id must be 32-byte hex".into());
-    }
-    let exists = unsafe { onvm_blob_exists(bytes.as_ptr() as i32, bytes.len() as i32) };
-    if exists != 1 {
-        return Err(format!("blob {id} missing",));
-    }
-    Ok(bytes)
 }
 
 // Host functions
@@ -908,10 +986,12 @@ extern "C" {
     fn onvm_state_get(key_ptr: i32, key_len: i32, out_ptr: i32, out_cap: i32) -> i32;
     fn onvm_random_bytes(out_ptr: i32, out_len: i32) -> i32;
     fn onvm_now_ms() -> i64;
+    fn onvm_blob_addr(id_ptr: i32, id_len: i32, out_ptr: i32) -> i32;
     fn onvm_blob_exists(id_ptr: i32, id_len: i32) -> i32;
     fn onvm_blob_len(id_ptr: i32, id_len: i32) -> i64;
     fn onvm_blob_hash(id_ptr: i32, id_len: i32, out_ptr: i32) -> i32;
 }
 
+const BLOB_PREFIX: &str = "blob";
 const POST_INDEX_KEY: &str = "__posts";
 const USER_INDEX_KEY: &str = "__users";

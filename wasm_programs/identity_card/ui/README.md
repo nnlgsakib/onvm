@@ -39,7 +39,7 @@ cp .env.example .env.local
 3. Edit `.env.local` and set your ONVM RPC endpoint:
 ```bash
 NEXT_PUBLIC_ONVM_RPC_URL=http://localhost:8080
-NEXT_PUBLIC_IDENTITY_CARD_PROGRAM_ID=your_program_id_here
+NEXT_PUBLIC_IDENTITY_CARD_PROGRAM_ID=prog<64-hex>
 ```
 
 ### Running the Development Server
@@ -84,7 +84,7 @@ The UI connects to ONVM through the RPC client in `lib/onvm-client.ts` which pro
 ## Environment Variables
 
 - `NEXT_PUBLIC_ONVM_RPC_URL` - The ONVM RPC endpoint URL
-- `NEXT_PUBLIC_IDENTITY_CARD_PROGRAM_ID` - The deployed WASM program ID
+- `NEXT_PUBLIC_IDENTITY_CARD_PROGRAM_ID` - The deployed WASM program ID (prog<64-hex>)
 
 ## Learn More
 

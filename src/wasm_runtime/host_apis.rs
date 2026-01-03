@@ -1,5 +1,5 @@
 use crate::storage::{StateStore, UnifiedStore};
-use crate::types::{ObjectId, ProgramId};
+use crate::types::{IdPrefix, ObjectId, ProgramId};
 use anyhow::Result;
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -22,13 +22,51 @@ pub struct ExecutionContext {
 pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext>) -> Result<()> {
     linker.func_wrap(
         "env",
+        "onvm_blob_addr",
+        |mut caller: wasmtime::Caller<'_, ExecutionContext>,
+         id_ptr: i32,
+         id_len: i32,
+         out_ptr: i32|
+         -> i32 {
+            let memory = match caller.get_export("memory") {
+                Some(wasmtime::Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let object_id = match read_object_id(
+                &memory,
+                &caller,
+                id_ptr,
+                id_len,
+                Some(IdPrefix::Blob),
+            ) {
+                Ok(oid) => oid,
+                Err(code) => return code,
+            };
+            if memory
+                .write(&mut caller, out_ptr as usize, &object_id.0)
+                .is_err()
+            {
+                return -2;
+            }
+            0
+        },
+    )?;
+
+    linker.func_wrap(
+        "env",
         "onvm_blob_exists",
         |mut caller: wasmtime::Caller<'_, ExecutionContext>, id_ptr: i32, id_len: i32| -> i32 {
             let memory = match caller.get_export("memory") {
                 Some(wasmtime::Extern::Memory(m)) => m,
                 _ => return -1,
             };
-            let object_id = match read_object_id(&memory, &caller, id_ptr, id_len) {
+            let object_id = match read_object_id(
+                &memory,
+                &caller,
+                id_ptr,
+                id_len,
+                Some(IdPrefix::Blob),
+            ) {
                 Ok(oid) => oid,
                 Err(code) => return code,
             };
@@ -53,7 +91,13 @@ pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext
                 Some(wasmtime::Extern::Memory(m)) => m,
                 _ => return -1,
             };
-            let object_id = match read_object_id(&memory, &caller, id_ptr, id_len) {
+            let object_id = match read_object_id(
+                &memory,
+                &caller,
+                id_ptr,
+                id_len,
+                Some(IdPrefix::Blob),
+            ) {
                 Ok(oid) => oid,
                 Err(code) => return code as i64,
             };
@@ -85,7 +129,13 @@ pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext
                 Some(wasmtime::Extern::Memory(m)) => m,
                 _ => return -1,
             };
-            let object_id = match read_object_id(&memory, &caller, id_ptr, id_len) {
+            let object_id = match read_object_id(
+                &memory,
+                &caller,
+                id_ptr,
+                id_len,
+                Some(IdPrefix::Blob),
+            ) {
                 Ok(oid) => oid,
                 Err(code) => return code,
             };
@@ -121,23 +171,16 @@ pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext
                 Some(wasmtime::Extern::Memory(m)) => m,
                 _ => return -1,
             };
-            let mut id_buf = vec![0u8; id_len as usize];
-            if memory.read(&caller, id_ptr as usize, &mut id_buf).is_err() {
-                return -2;
-            }
-            let id_hex = match String::from_utf8(id_buf) {
-                Ok(s) => s,
-                Err(_) => return -3,
+            let object_id = match read_object_id(
+                &memory,
+                &caller,
+                id_ptr,
+                id_len,
+                Some(IdPrefix::Blob),
+            ) {
+                Ok(oid) => oid,
+                Err(code) => return code,
             };
-            let Ok(id_bytes) = hex::decode(id_hex.trim()) else {
-                return -4;
-            };
-            if id_bytes.len() != 32 {
-                return -5;
-            }
-            let mut object_id_arr = [0u8; 32];
-            object_id_arr.copy_from_slice(&id_bytes);
-            let object_id = ObjectId(object_id_arr);
             let data = match caller.data().unified_store.get_object(&object_id) {
                 Ok(d) => d,
                 Err(_) => return -6,
@@ -659,34 +702,38 @@ fn read_object_id(
     caller: &wasmtime::Caller<'_, ExecutionContext>,
     id_ptr: i32,
     id_len: i32,
+    expected_prefix: Option<IdPrefix>,
 ) -> Result<ObjectId, i32> {
     let mut id_buf = vec![0u8; id_len as usize];
     if memory.read(caller, id_ptr as usize, &mut id_buf).is_err() {
         return Err(-2);
     }
 
-    // Accept either raw 32-byte object IDs or 64-char hex strings.
-    let id_bytes = if id_buf.len() == 32 {
-        id_buf
-    } else {
-        let id_hex = String::from_utf8(id_buf).map_err(|_| -3)?;
-        let decoded = hex::decode(id_hex.trim()).map_err(|_| -4)?;
-        decoded
-    };
-
-    if id_bytes.len() != 32 {
-        return Err(-5);
+    // Accept raw 32-byte object IDs or prefixed/legacy hex strings.
+    if id_buf.len() == 32 {
+        let mut object_id_arr = [0u8; 32];
+        object_id_arr.copy_from_slice(&id_buf);
+        return Ok(ObjectId(object_id_arr));
     }
-    let mut object_id_arr = [0u8; 32];
-    object_id_arr.copy_from_slice(&id_bytes);
-    Ok(ObjectId(object_id_arr))
+
+    let id_str = String::from_utf8(id_buf).map_err(|_| -3)?;
+    let object_id = match expected_prefix {
+        Some(IdPrefix::Blob) => crate::types::parse_blob_id_str(&id_str)
+            .map(|id| id.to_object_id())
+            .map_err(|_| -4)?,
+        Some(IdPrefix::Program) => crate::types::parse_program_id_str(&id_str)
+            .map(|id| id.to_object_id())
+            .map_err(|_| -4)?,
+        None => crate::types::parse_object_id_str(&id_str).map_err(|_| -4)?,
+    };
+    Ok(object_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::UnifiedStore;
-    use crate::types::{NodeId, ObjectType, ProgramId};
+    use crate::types::{BlobId, NodeId, ObjectType, ProgramId};
     use anyhow::Result;
     use sled::Config;
     use wasmtime::{Engine, Instance, Linker, Memory, Module, Store};
@@ -694,6 +741,7 @@ mod tests {
 
     const WASM: &str = r#"
     (module
+      (import "env" "onvm_blob_addr" (func $blob_addr (param i32 i32 i32) (result i32)))
       (import "env" "onvm_blob_exists" (func $blob_exists (param i32 i32) (result i32)))
       (import "env" "onvm_blob_len" (func $blob_len (param i32 i32) (result i64)))
       (import "env" "onvm_blob_hash" (func $blob_hash (param i32 i32 i32) (result i32)))
@@ -709,6 +757,7 @@ mod tests {
       (import "env" "onvm_crypto_secp256k1_verify" (func $crypto_verify (param i32 i32 i32) (result i32)))
       (import "env" "onvm_crypto_secp256k1_recover" (func $crypto_recover (param i32 i32 i32) (result i32)))
       (memory (export "memory") 4)
+      (func (export "blob_addr") (param i32 i32 i32) (result i32) (call $blob_addr (local.get 0) (local.get 1) (local.get 2)))
       (func (export "blob_exists") (param i32 i32) (result i32) (call $blob_exists (local.get 0) (local.get 1)))
       (func (export "blob_len") (param i32 i32) (result i64) (call $blob_len (local.get 0) (local.get 1)))
       (func (export "blob_hash") (param i32 i32 i32) (result i32) (call $blob_hash (local.get 0) (local.get 1) (local.get 2)))
@@ -765,22 +814,30 @@ mod tests {
         let publisher = NodeId::new(&[9u8; 32]);
         let object =
             unified.put_object(data, ObjectType::blob_with_random_salt(None), publisher)?;
-        let hex_id = hex::encode(object.id.0);
-        memory.write(&mut store, 0, hex_id.as_bytes())?;
+        let blob_id = BlobId(object.id.0).to_prefixed_string();
+        memory.write(&mut store, 0, blob_id.as_bytes())?;
 
         let exists = instance
             .get_typed_func::<(i32, i32), i32>(&mut store, "blob_exists")?
-            .call(&mut store, (0, hex_id.len() as i32))?;
+            .call(&mut store, (0, blob_id.len() as i32))?;
         assert_eq!(exists, 1);
+
+        let addr_status = instance
+            .get_typed_func::<(i32, i32, i32), i32>(&mut store, "blob_addr")?
+            .call(&mut store, (0, blob_id.len() as i32, 128))?;
+        assert_eq!(addr_status, 0);
+        let mut raw_id = [0u8; 32];
+        memory.read(&store, 128, &mut raw_id)?;
+        assert_eq!(raw_id, object.id.0);
 
         let len = instance
             .get_typed_func::<(i32, i32), i64>(&mut store, "blob_len")?
-            .call(&mut store, (0, hex_id.len() as i32))?;
+            .call(&mut store, (128, 32))?;
         assert_eq!(len as usize, data.len());
 
         let hash_status = instance
             .get_typed_func::<(i32, i32, i32), i32>(&mut store, "blob_hash")?
-            .call(&mut store, (0, hex_id.len() as i32, 256))?;
+            .call(&mut store, (128, 32, 256))?;
         assert_eq!(hash_status, 0);
         let mut hash_out = [0u8; 32];
         memory.read(&store, 256, &mut hash_out)?;
@@ -791,7 +848,7 @@ mod tests {
 
         let read_len = instance
             .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "blob_read")?
-            .call(&mut store, (0, hex_id.len() as i32, 512, 1024))?;
+            .call(&mut store, (128, 32, 512, 1024))?;
         assert_eq!(read_len as usize, data.len());
         let mut buf = vec![0u8; data.len()];
         memory.read(&store, 512, &mut buf)?;

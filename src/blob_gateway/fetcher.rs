@@ -64,7 +64,7 @@ impl BlobFetcher {
             let subchunk_count = crate::storage::subchunk_count_for_total_size(obj.total_size);
 
             Ok(BlobInfo {
-                id: hex::encode(id.0),
+                id: crate::types::BlobId(id.0).to_prefixed_string(),
                 size: obj.total_size,
                 chunk_count: obj.chunk_count,
                 subchunk_count,

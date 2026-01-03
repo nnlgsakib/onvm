@@ -18,7 +18,7 @@ import {
 import { getSchoolClient } from "@/lib/onvm-client"
 import { Course } from "@/types"
 
-const PROGRAM_ID = "918c95aa44b129ae2315698637afbb339b7cb43ed6115e433605ae172f617bc4"
+const PROGRAM_ID = "prog918c95aa44b129ae2315698637afbb339b7cb43ed6115e433605ae172f617bc4"
 
 export function CoursesView() {
   const [courses, setCourses] = useState<Course[]>([])

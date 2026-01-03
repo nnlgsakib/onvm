@@ -40,8 +40,8 @@ DEPLOY_RESULT=$(onvm deploy --rpc 127.0.0.1:8081 --file school_management.wasm -
 echo "$DEPLOY_RESULT"
 
 # Extract program ID if deployment was successful
-if echo "$DEPLOY_RESULT" | grep -q "id:"; then
-    PROGRAM_ID=$(echo "$DEPLOY_RESULT" | grep -oE 'id: [a-f0-9]+' | cut -d' ' -f2)
+if echo "$DEPLOY_RESULT" | grep -q "id"; then
+    PROGRAM_ID=$(echo "$DEPLOY_RESULT" | grep -oE 'prog[a-f0-9]{64}|[a-f0-9]{64}' | head -n1)
     echo "Program deployed with ID: $PROGRAM_ID"
     
     # Test a simple operation

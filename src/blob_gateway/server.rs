@@ -2,7 +2,7 @@ use crate::node::Node;
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode, Uri},
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -36,21 +36,26 @@ struct BlobQuery {
     download: bool,
 }
 
-pub async fn start_gateway(node: Arc<Node>, config: GatewayConfig) -> Result<()> {
+pub fn gateway_router(node: Arc<Node>) -> Router {
     let ctx = GatewayContext {
         node,
         detector: ContentDetector::new(),
     };
 
-    let app = Router::new()
+    Router::new()
         .route("/api/blob/:id", get(get_blob_handler))
         .route("/api/blob/:id/info", get(get_blob_info))
         .route("/api/health", get(health_check))
-        .route("/cdn/:id", get(cdn_serve_handler))
-        .route("/cdn/:id/*path", get(cdn_serve_handler))
-        .fallback(serve_ui)
+        .route("/api/cdn/:id", get(cdn_serve_handler))
+        .route("/api/cdn/:id/*path", get(cdn_serve_handler))
+        .route("/", get(serve_ui_root))
+        .route("/*path", get(serve_ui_path))
         .layer(CorsLayer::permissive())
-        .with_state(ctx);
+        .with_state(ctx)
+}
+
+pub async fn start_gateway(node: Arc<Node>, config: GatewayConfig) -> Result<()> {
+    let app = Router::new().nest("/explorer", gateway_router(node));
 
     let listener = TcpListener::bind(&config.listen_addr).await?;
     info!("Blob Gateway listening on {}", config.listen_addr);
@@ -59,20 +64,27 @@ pub async fn start_gateway(node: Arc<Node>, config: GatewayConfig) -> Result<()>
     Ok(())
 }
 
-async fn serve_ui(uri: Uri) -> Result<Response, (StatusCode, String)> {
-    let path = uri.path().trim_start_matches('/');
+async fn serve_ui_root() -> Result<Response, (StatusCode, String)> {
+    serve_ui_path_inner("")
+}
 
-    let path = if path.is_empty() || path.starts_with('#') {
+async fn serve_ui_path(Path(path): Path<String>) -> Result<Response, (StatusCode, String)> {
+    serve_ui_path_inner(&path)
+}
+
+fn serve_ui_path_inner(path: &str) -> Result<Response, (StatusCode, String)> {
+    let trimmed = path.trim_start_matches('/');
+    let asset = if trimmed.is_empty() || trimmed.starts_with('#') {
         "index.html"
-    } else if UiAssets::get(path).is_some() {
-        path
+    } else if UiAssets::get(trimmed).is_some() {
+        trimmed
     } else {
         "index.html"
     };
 
-    match UiAssets::get(path) {
+    match UiAssets::get(asset) {
         Some(content) => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            let mime = mime_guess::from_path(asset).first_or_octet_stream();
             Ok(([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response())
         }
         None => Err((StatusCode::NOT_FOUND, "Not found".to_string())),
@@ -205,24 +217,9 @@ async fn cdn_serve_handler(
 
 
 
-fn parse_id(id_hex: &str) -> Result<crate::types::ObjectId, (StatusCode, String)> {
-    let decoded = hex::decode(id_hex).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid ID: must be hex-encoded".to_string(),
-        )
-    })?;
-
-    if decoded.len() != 32 {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Invalid ID: must be 32 bytes".to_string(),
-        ));
-    }
-
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&decoded);
-    Ok(crate::types::ObjectId(arr))
+fn parse_id(id_str: &str) -> Result<crate::types::ObjectId, (StatusCode, String)> {
+    crate::types::parse_object_id_str(id_str)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid ID: {e}")))
 }
 
 async fn is_program_id(id: &crate::types::ObjectId, ctx: &GatewayContext) -> bool {

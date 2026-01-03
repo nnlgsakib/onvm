@@ -7,7 +7,7 @@ import type {
 } from '@/types'
 
 const RPC_ENDPOINT = process.env.NEXT_PUBLIC_RPC_URL || 'http://localhost:8081';
-const PROGRAM_ID = process.env.NEXT_PUBLIC_SCHOOL_PROGRAM_ID || "618df68d440c4f7ac9dae7f63a36ff8e10fb3bb970c7e7aa3d00b4195e06bbd7";
+const PROGRAM_ID = process.env.NEXT_PUBLIC_SCHOOL_PROGRAM_ID || "prog618df68d440c4f7ac9dae7f63a36ff8e10fb3bb970c7e7aa3d00b4195e06bbd7";
 const PROJECT_ID = process.env.NEXT_PUBLIC_PROJECT_ID;
 const PROJECT_SECRET = process.env.NEXT_PUBLIC_PROJECT_SECRET;
 

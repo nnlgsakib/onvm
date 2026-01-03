@@ -92,7 +92,7 @@ async function submitAndMonitorJob() {
   // Submit job
   const job = await client.submitJob({
     request_id: randomBytes(16).toString('hex'),
-    program_id: 'your-program-id-here',
+    program_id: 'prog<64-hex>',
     input_blob_id: blob.id,
     max_retries: 3,
     metadata: {
@@ -133,7 +133,7 @@ async function estimateExecutionCost() {
     mode: RpcMode.Dev,
   });
 
-  const programId = 'your-program-id';
+  const programId = 'prog<64-hex>';
   const input = Buffer.from('test input').toString('base64');
 
   // Estimate fuel cost before execution
@@ -171,7 +171,7 @@ async function robustExecute() {
 
   try {
     const result = await client.executeProgram({
-      program_id: 'some-program-id',
+      program_id: 'prog<64-hex>',
       input_base64: Buffer.from('input').toString('base64'),
     });
     console.log('Success:', result);
@@ -207,7 +207,7 @@ async function verifyStateProof() {
     mode: RpcMode.Dev,
   });
 
-  const programId = 'your-program-id';
+  const programId = 'prog<64-hex>';
   const stateKey = Buffer.from('some-key').toString('hex');
 
   // Get state root with Merkle proof

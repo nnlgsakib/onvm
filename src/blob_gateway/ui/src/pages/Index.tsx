@@ -29,13 +29,13 @@ interface BlobInfo {
   size: number;
   chunk_count: number;
   subchunk_count: number;
-  mime_type: string;
-  detected_mime_type: string;
+  mime_type: string | null;
+  detected_mime_type: string | null;
   available_locally: boolean;
 }
 
 const DEMO_BLOB: BlobInfo = {
-  id: "a1b2c3d4e5f67890abcdef1234567890",
+  id: "bloba1b2c3d4e5f67890abcdef1234567890a1b2c3d4e5f67890abcdef1234567890",
   size: 2516582,
   chunk_count: 4,
   subchunk_count: 16,
@@ -50,6 +50,12 @@ export default function Explorer() {
   const [loading, setLoading] = useState(false);
   const [blobInfo, setBlobInfo] = useState<BlobInfo | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const apiBase = "/explorer/api";
+  const cdnBase = "/explorer/api/cdn";
+  const previewType =
+    blobInfo?.detected_mime_type ||
+    blobInfo?.mime_type ||
+    "application/octet-stream";
 
   const fetchBlobInfo = async () => {
     if (!blobId.trim()) {
@@ -62,7 +68,7 @@ export default function Explorer() {
     setPreviewUrl(null);
 
     try {
-      const response = await fetch(`/api/blob/${blobId}/info`);
+      const response = await fetch(`${apiBase}/blob/${blobId}/info`);
       if (!response.ok) {
         throw new Error(await response.text());
       }
@@ -82,7 +88,7 @@ export default function Explorer() {
 
     setLoading(true);
     try {
-      const cdnUrl = `/cdn/${blobInfo.id}`;
+      const cdnUrl = `${cdnBase}/${blobInfo.id}`;
       setPreviewUrl(cdnUrl);
       toast.success("Blob loaded successfully");
     } catch (error) {
@@ -97,7 +103,7 @@ export default function Explorer() {
 
     setLoading(true);
     try {
-      const response = await fetch(`/api/blob/${blobInfo.id}?download=true`);
+      const response = await fetch(`${apiBase}/blob/${blobInfo.id}?download=true`);
       if (!response.ok) {
         throw new Error(await response.text());
       }
@@ -141,7 +147,7 @@ export default function Explorer() {
       toast.error("Please fetch blob info first");
       return;
     }
-    const cdnUrl = `${window.location.origin}/cdn/${blobInfo.id}`;
+    const cdnUrl = `${window.location.origin}${cdnBase}/${blobInfo.id}`;
     navigator.clipboard.writeText(cdnUrl);
     toast.success("CDN link copied to clipboard!");
   };
@@ -167,7 +173,7 @@ export default function Explorer() {
                 <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
                 <Input
                   type="text"
-                  placeholder="Enter Blob ID (hex)"
+                  placeholder="Enter Blob ID (blob<hash>)"
                   value={blobId}
                   onChange={(e) => setBlobId(e.target.value)}
                   onKeyDown={handleKeyDown}
@@ -274,7 +280,7 @@ export default function Explorer() {
                   {previewUrl && (
                     <PreviewSection
                       content={previewUrl}
-                      contentType={blobInfo.mime_type}
+                      contentType={previewType}
                     />
                   )}
                 </motion.div>

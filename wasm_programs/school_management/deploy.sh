@@ -27,8 +27,8 @@ if [ $DEPLOY_RESULT -eq 0 ]; then
     echo "Deployment successful!"
     echo "$DEPLOY_OUTPUT"
     
-    # Extract program ID from output (assuming it's in the format "id: <program_id>")
-    PROGRAM_ID=$(echo "$DEPLOY_OUTPUT" | grep -oE 'id: [a-f0-9]+' | cut -d' ' -f2)
+    # Extract program ID from output (prefers prog<64-hex>, falls back to legacy 64-hex)
+    PROGRAM_ID=$(echo "$DEPLOY_OUTPUT" | grep -oE 'prog[a-f0-9]{64}|[a-f0-9]{64}' | head -n1)
     
     if [ ! -z "$PROGRAM_ID" ]; then
         echo "Program ID: $PROGRAM_ID"

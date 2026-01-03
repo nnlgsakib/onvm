@@ -61,10 +61,16 @@ const client = new OnvmClient({
 // All requests are automatically signed with HMAC-SHA256
 // All responses are automatically decrypted using XChaCha20-Poly1305
 const result = await client.executeProgram({
-  program_id: 'program-id-hex',
+  program_id: 'prog<64-hex>',
   input_base64: inputBase64,
 });
 ```
+
+## ID Format
+
+- Program IDs are `prog<64-hex>`.
+- Blob IDs are `blob<64-hex>`.
+- The SDK accepts legacy 64-hex strings, but new responses always return the prefixed form.
 
 ## API Reference
 
@@ -247,7 +253,7 @@ export async function onvm_main(input: Uint8Array): Promise<Uint8Array> {
 
   // Use the SDK inside your program
   const result = await client.executeProgram({
-    program_id: 'some-program-id',
+    program_id: 'prog<64-hex>',
     input_base64: Buffer.from(input).toString('base64'),
   });
 

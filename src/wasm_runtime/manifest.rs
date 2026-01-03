@@ -76,6 +76,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             allowed_imports: AllowedImports::Restricted(vec![
+                "env.onvm_blob_addr".to_string(),
                 "env.onvm_blob_read".to_string(),
                 "env.onvm_state_put".to_string(),
                 "env.onvm_state_get".to_string(),

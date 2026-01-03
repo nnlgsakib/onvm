@@ -29,7 +29,7 @@ cargo run -- deploy \
   --entrypoint onvm_main
 
 # Save the returned program_id for later use
-# Example output: {"id":"abc123..."}
+# Example output: {"id":"prog..."}
 ```
 
 ## Submit Jobs
@@ -38,7 +38,7 @@ cargo run -- deploy \
 ```bash
 cargo run -- submit-job \
   --rpc 127.0.0.1:8080 \
-  --program-id <PROGRAM_ID> \
+  --program-id prog<64-hex> \
   --input wasm_programs/job-test/test_compute.json \
   --request-id compute-test-1 \
   --max-retries 3
@@ -50,7 +50,7 @@ cargo run -- submit-job \
 ```bash
 cargo run -- submit-job \
   --rpc 127.0.0.1:8080 \
-  --program-id <PROGRAM_ID> \
+  --program-id prog<64-hex> \
   --input wasm_programs/job-test/test_hash.json \
   --request-id hash-test-1 \
   --max-retries 2
@@ -60,7 +60,7 @@ cargo run -- submit-job \
 ```bash
 cargo run -- submit-job \
   --rpc 127.0.0.1:8080 \
-  --program-id <PROGRAM_ID> \
+  --program-id prog<64-hex> \
   --input wasm_programs/job-test/test_transform.json \
   --request-id transform-test-1
 ```
@@ -69,7 +69,7 @@ cargo run -- submit-job \
 ```bash
 cargo run -- submit-job \
   --rpc 127.0.0.1:8080 \
-  --program-id <PROGRAM_ID> \
+  --program-id prog<64-hex> \
   --input wasm_programs/job-test/test_stress.json \
   --request-id stress-test-1 \
   --max-retries 3
@@ -122,7 +122,7 @@ curl -X POST http://127.0.0.1:8080/jobs \
   -H "Content-Type: application/json" \
   -d '{
     "request_id": "curl-test-1",
-    "program_id": "<PROGRAM_ID>",
+    "program_id": "prog<64-hex>",
     "input_base64": "eyJ0YXNrIjoiY29tcHV0ZSIsIml0ZXJhdGlvbnMiOjEwMCwiZGF0YSI6IjQyIn0=",
     "max_retries": 3
   }'
@@ -175,10 +175,10 @@ curl http://127.0.0.1:8080/health/metrics
 ### Test Idempotency (Same request_id)
 ```bash
 # Submit same request_id twice
-cargo run -- submit-job --rpc 127.0.0.1:8080 --program-id <PROGRAM_ID> --input wasm_programs/job-test/test_compute.json --request-id idempotent-test-1
+cargo run -- submit-job --rpc 127.0.0.1:8080 --program-id prog<64-hex> --input wasm_programs/job-test/test_compute.json --request-id idempotent-test-1
 
 # Second submission with same request_id should return the same job
-cargo run -- submit-job --rpc 127.0.0.1:8080 --program-id <PROGRAM_ID> --input wasm_programs/job-test/test_compute.json --request-id idempotent-test-1
+cargo run -- submit-job --rpc 127.0.0.1:8080 --program-id prog<64-hex> --input wasm_programs/job-test/test_compute.json --request-id idempotent-test-1
 ```
 
 ### Test Retry Logic (Submit invalid program)
@@ -186,7 +186,7 @@ cargo run -- submit-job --rpc 127.0.0.1:8080 --program-id <PROGRAM_ID> --input w
 # This will fail and retry
 cargo run -- submit-job \
   --rpc 127.0.0.1:8080 \
-  --program-id 0000000000000000000000000000000000000000000000000000000000000000 \
+  --program-id prog0000000000000000000000000000000000000000000000000000000000000000 \
   --input wasm_programs/job-test/test_compute.json \
   --request-id retry-test-1 \
   --max-retries 3
@@ -201,7 +201,7 @@ cargo run -- job-logs --rpc 127.0.0.1:8080 --job-id <JOB_ID>
 for i in {1..5}; do
   cargo run -- submit-job \
     --rpc 127.0.0.1:8080 \
-    --program-id <PROGRAM_ID> \
+    --program-id prog<64-hex> \
     --input wasm_programs/job-test/test_compute.json \
     --request-id parallel-test-$i &
 done

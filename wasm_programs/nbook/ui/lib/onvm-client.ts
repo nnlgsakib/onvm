@@ -259,7 +259,7 @@ type Response = OkResponse | LoginOkResponse | PostResponse | FeedResponse | Pro
 type AnyResponse = Partial<Response> & { status?: string; message?: string }
 
 const API_ENDPOINT = "/api/onvm"
-const PROGRAM_ID = process.env.NEXT_PUBLIC_ONVM_PROGRAM_ID || "38ec7cf6280521e004e2d6148abbec866c15d797f66f4e80520d0cb21dcb935c"
+const PROGRAM_ID = process.env.NEXT_PUBLIC_ONVM_PROGRAM_ID || "prog38ec7cf6280521e004e2d6148abbec866c15d797f66f4e80520d0cb21dcb935c"
 export class NbookONVMClient {
   private apiEndpoint: string
   private programId: string

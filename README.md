@@ -91,7 +91,7 @@ flowchart TD
 ### Verifiable Execution & Receipts
 - **Deterministic execution**: Wasm runs with a fixed host ABI and fuel metering. Executions produce `ExecutionReceipt` (inputs hash, gas, state_root_in/out, write digest).
 - **Aggregate verification**: A committee re-executes, signs the receipt hash with BLS, and publishes an `AggregatedReceipt` (aggregate sig + signer bitmap). Other nodes verify without re-executing.
-- **Catalog storage**: Receipts are stored per program; query with `GET /programs/:id/receipts` or `cargo run -- program-receipts --id <program-id>`.
+- **Catalog storage**: Receipts are stored per program; query with `GET /programs/:id/receipts` or `cargo run -- program-receipts --id prog<64-hex>`.
 
 ---
 
@@ -151,7 +151,7 @@ cargo run -- upload-blob \
   --file input.bin \
   --mime application/octet-stream
 ```
-Returns a 64-char hex **BlobId**.
+Returns a `blob<64-hex>` **BlobId**.
 
 ### Deploy a WASM Program
 ```bash
@@ -164,16 +164,16 @@ cargo run -- deploy \
   --rpc :8080 \
   --file wasm_programs/echo/target/wasm32-unknown-unknown/release/echo.wasm \
   --entrypoint onvm_main \
-  --blob-refs <blob-id-1> <blob-id-2> \
+  --blob-refs blob<64-hex> blob<64-hex> \
   --salt <base64-salt>
 ```
-Returns a hex **ProgramId** (deterministic hash of wasm + salt).
+Returns a `prog<64-hex>` **ProgramId** (deterministic hash of wasm + salt).
 
 ### Execute a Program
 ```bash
 cargo run -- execute \
   --rpc :8080 \
-  --program-id <program-id> \
+  --program-id prog<64-hex> \
   --input input.bin
 ```
 Prints base64-decoded output to stdout; use `--json` for structured response.
@@ -182,7 +182,7 @@ Prints base64-decoded output to stdout; use `--json` for structured response.
 ```bash
 cargo run -- get-blob \
   --rpc :8080 \
-  --id <blob-id> \
+  --id blob<64-hex> \
   --out downloaded.bin
 ```
 
@@ -190,7 +190,7 @@ cargo run -- get-blob \
 ```bash
 cargo run -- program-info \
   --rpc :8080 \
-  --id <program-id>
+  --id prog<64-hex>
 ```
 Returns JSON metadata (publisher, entrypoint, blob_refs, size).
 
@@ -201,7 +201,7 @@ cargo run -- program-catalog --rpc :8080
 ```
 - Fetch aggregated execution receipts for a program:
 ```bash
-cargo run -- program-receipts --rpc :8080 --id <program-id>
+cargo run -- program-receipts --rpc :8080 --id prog<64-hex>
 ```
 The catalog tracks program manifests, initial state roots, and aggregate BLS-verified execution receipts.
 
@@ -215,7 +215,7 @@ ONVM provides an asynchronous job scheduling system with automatic retry logic, 
 ```bash
 cargo run -- submit-job \
   --rpc :8080 \
-  --program-id <program-id> \
+  --program-id prog<64-hex> \
   --input input.json \
   --request-id my-job-1 \
   --max-retries 3
@@ -237,7 +237,7 @@ cargo run -- deploy \
 # Submit compute task
 cargo run -- submit-job \
   --rpc :8080 \
-  --program-id <program-id> \
+  --program-id prog<64-hex> \
   --input wasm_programs/job-test/test_compute.json \
   --request-id compute-1
 ```

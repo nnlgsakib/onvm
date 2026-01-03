@@ -28,9 +28,9 @@ for /f "delims=" %%i in ('onvm deploy --rpc 127.0.0.1:8081 --file school_managem
 )
 
 REM Check if deployment was successful
-echo %DEPLOY_RESULT% | findstr /c "id:" >nul
+echo %DEPLOY_RESULT% | findstr /c "\"id\"" >nul
 if %errorlevel% equ 0 (
-    for /f "tokens=2" %%a in ('echo %DEPLOY_RESULT% ^| findstr "id:"') do set PROGRAM_ID=%%a
+    for /f "tokens=4 delims=\"" %%a in ("%DEPLOY_RESULT%") do set PROGRAM_ID=%%a
     echo Program deployed with ID: %PROGRAM_ID%
     
     REM Test a simple operation

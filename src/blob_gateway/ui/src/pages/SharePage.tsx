@@ -26,8 +26,8 @@ interface BlobInfo {
   size: number;
   chunk_count: number;
   subchunk_count: number;
-  mime_type: string;
-  detected_mime_type: string;
+  mime_type: string | null;
+  detected_mime_type: string | null;
   available_locally: boolean;
 }
 
@@ -36,13 +36,15 @@ export default function SharePage() {
   const [loading, setLoading] = useState(true);
   const [blobInfo, setBlobInfo] = useState<BlobInfo | null>(null);
   const contentId = id || "";
+  const apiBase = "/explorer/api";
+  const cdnBase = "/explorer/api/cdn";
 
   useEffect(() => {
     const fetchBlobInfo = async () => {
       if (!contentId) return;
 
       try {
-        const response = await fetch(`/api/blob/${contentId}/info`);
+        const response = await fetch(`${apiBase}/blob/${contentId}/info`);
         if (!response.ok) {
           throw new Error(await response.text());
         }
@@ -59,7 +61,7 @@ export default function SharePage() {
     fetchBlobInfo();
   }, [contentId]);
 
-  const directLink = `${window.location.origin}/cdn/${contentId}`;
+  const directLink = `${window.location.origin}${cdnBase}/${contentId}`;
   const embedCode = `<img src="${directLink}" alt="ONVM Content">`;
 
   const handleCopyDirectLink = () => {

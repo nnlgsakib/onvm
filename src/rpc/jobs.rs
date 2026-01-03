@@ -307,24 +307,12 @@ fn parse_job_id(hex_str: &str) -> Result<JobId, String> {
     Ok(JobId::from_bytes(arr))
 }
 
-fn parse_program_id(hex_str: &str) -> Result<ProgramId, String> {
-    let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
-    if bytes.len() != 32 {
-        return Err("invalid program id length".into());
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(ProgramId(arr))
+fn parse_program_id(input: &str) -> Result<ProgramId, String> {
+    crate::types::parse_program_id_str(input)
 }
 
-fn parse_blob_id(hex_str: &str) -> Result<BlobId, String> {
-    let bytes = hex::decode(hex_str).map_err(|e| e.to_string())?;
-    if bytes.len() != 32 {
-        return Err("invalid blob id length".into());
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    Ok(BlobId(arr))
+fn parse_blob_id(input: &str) -> Result<BlobId, String> {
+    crate::types::parse_blob_id_str(input)
 }
 
 fn job_status_to_string(status: &JobStatus) -> String {

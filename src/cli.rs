@@ -279,12 +279,12 @@ pub enum Commands {
         allow_plaintext_identity: bool,
         #[arg(long, help = "Development mode: enable mDNS regardless of config")]
         dev: bool,
-        #[arg(long, help = "Enable blob gateway CDN on separate port")]
+        #[arg(long, help = "Enable blob gateway UI/API at /explorer on the RPC port")]
         enable_gateway: bool,
         #[arg(
             long,
             default_value = "127.0.0.1:8081",
-            help = "Blob gateway listen address"
+            help = "Deprecated: blob gateway now served on RPC port; value ignored"
         )]
         gateway_addr: String,
     },
@@ -601,7 +601,7 @@ pub async fn run() -> Result<()> {
             allow_plaintext_identity,
             dev,
             enable_gateway,
-            gateway_addr,
+            gateway_addr: _gateway_addr,
         } => {
             let identity_path = data_dir.join("identity");
             let listen_addr: Multiaddr = listen
@@ -698,24 +698,9 @@ pub async fn run() -> Result<()> {
                 onvm_cfg.rpc_auth.clone(),
                 data_dir.clone(),
                 identity_passphrase.clone(),
+                enable_gateway,
             )
             .await?;
-
-            let gateway_handle = if enable_gateway {
-                let gateway_config = crate::blob_gateway::GatewayConfig {
-                    listen_addr: gateway_addr.clone(),
-                };
-                let node_clone = node.clone();
-                Some(tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::blob_gateway::start_gateway(node_clone, gateway_config).await
-                    {
-                        tracing::error!("Gateway error: {}", e);
-                    }
-                }))
-            } else {
-                None
-            };
 
             println!(
                 "Node started. Data dir: {}. RPC: {}.",
@@ -723,13 +708,9 @@ pub async fn run() -> Result<()> {
                 rpc_server.bound
             );
             if enable_gateway {
-                println!("Blob Gateway: http://{}", gateway_addr);
+                println!("Blob Gateway: http://{}/explorer", rpc_server.bound);
             }
             signal::ctrl_c().await?;
-
-            if let Some(handle) = gateway_handle {
-                handle.abort();
-            }
         }
         Commands::GenerateProject {
             rpc,

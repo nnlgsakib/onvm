@@ -32,16 +32,11 @@ pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext
                 Some(wasmtime::Extern::Memory(m)) => m,
                 _ => return -1,
             };
-            let object_id = match read_object_id(
-                &memory,
-                &caller,
-                id_ptr,
-                id_len,
-                Some(IdPrefix::Blob),
-            ) {
-                Ok(oid) => oid,
-                Err(code) => return code,
-            };
+            let object_id =
+                match read_object_id(&memory, &caller, id_ptr, id_len, Some(IdPrefix::Blob)) {
+                    Ok(oid) => oid,
+                    Err(code) => return code,
+                };
             if memory
                 .write(&mut caller, out_ptr as usize, &object_id.0)
                 .is_err()
@@ -60,16 +55,11 @@ pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext
                 Some(wasmtime::Extern::Memory(m)) => m,
                 _ => return -1,
             };
-            let object_id = match read_object_id(
-                &memory,
-                &caller,
-                id_ptr,
-                id_len,
-                Some(IdPrefix::Blob),
-            ) {
-                Ok(oid) => oid,
-                Err(code) => return code,
-            };
+            let object_id =
+                match read_object_id(&memory, &caller, id_ptr, id_len, Some(IdPrefix::Blob)) {
+                    Ok(oid) => oid,
+                    Err(code) => return code,
+                };
             // Treat a blob as existing if we have a manifest; completeness may depend on sync.
             match caller
                 .data()
@@ -91,16 +81,11 @@ pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext
                 Some(wasmtime::Extern::Memory(m)) => m,
                 _ => return -1,
             };
-            let object_id = match read_object_id(
-                &memory,
-                &caller,
-                id_ptr,
-                id_len,
-                Some(IdPrefix::Blob),
-            ) {
-                Ok(oid) => oid,
-                Err(code) => return code as i64,
-            };
+            let object_id =
+                match read_object_id(&memory, &caller, id_ptr, id_len, Some(IdPrefix::Blob)) {
+                    Ok(oid) => oid,
+                    Err(code) => return code as i64,
+                };
             if let Ok(Some(meta)) = caller.data().unified_store.get_object_metadata(&object_id) {
                 return meta.total_size as i64;
             }
@@ -129,16 +114,11 @@ pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext
                 Some(wasmtime::Extern::Memory(m)) => m,
                 _ => return -1,
             };
-            let object_id = match read_object_id(
-                &memory,
-                &caller,
-                id_ptr,
-                id_len,
-                Some(IdPrefix::Blob),
-            ) {
-                Ok(oid) => oid,
-                Err(code) => return code,
-            };
+            let object_id =
+                match read_object_id(&memory, &caller, id_ptr, id_len, Some(IdPrefix::Blob)) {
+                    Ok(oid) => oid,
+                    Err(code) => return code,
+                };
             let manifest = match caller
                 .data()
                 .unified_store
@@ -171,16 +151,11 @@ pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext
                 Some(wasmtime::Extern::Memory(m)) => m,
                 _ => return -1,
             };
-            let object_id = match read_object_id(
-                &memory,
-                &caller,
-                id_ptr,
-                id_len,
-                Some(IdPrefix::Blob),
-            ) {
-                Ok(oid) => oid,
-                Err(code) => return code,
-            };
+            let object_id =
+                match read_object_id(&memory, &caller, id_ptr, id_len, Some(IdPrefix::Blob)) {
+                    Ok(oid) => oid,
+                    Err(code) => return code,
+                };
             let data = match caller.data().unified_store.get_object(&object_id) {
                 Ok(d) => d,
                 Err(_) => return -6,

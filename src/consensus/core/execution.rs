@@ -14,12 +14,27 @@ use tokio::sync::oneshot;
 use tokio::sync::RwLock;
 use tokio::time::{Duration, Instant};
 
+const MAX_STATE_WRITES: usize = 1000;
+const MAX_CALDATA_SIZE: usize = 1024 * 1024;
+const MAX_PROGRAM_SIZE: usize = 100 * 1024 * 1024;
+const LEADER_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+const CONSENSUS_TIMEOUT: Duration = Duration::from_secs(30);
+const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl DagEngine {
     pub async fn submit_execution(
         &self,
         program_id: &crate::types::ProgramId,
         input: &[u8],
     ) -> Result<crate::wasm_runtime::ExecutionOutcome> {
+        if input.len() > MAX_CALDATA_SIZE {
+            return Err(anyhow!(
+                "calldata too large: {} bytes (max {})",
+                input.len(),
+                MAX_CALDATA_SIZE
+            ));
+        }
+
         let committee = match self
             .program_catalog
             .get_manifest(program_id)?
@@ -27,15 +42,24 @@ impl DagEngine {
         {
             Some(committee) => committee,
             None => {
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + Duration::from_secs(30);
                 let mut last_request_at: Option<Instant> = None;
+                let mut attempts = 0usize;
                 loop {
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "timeout waiting for committee for program {}",
+                            program_id
+                        ));
+                    }
+
                     let should_request = last_request_at
-                        .map(|at| at.elapsed() >= Duration::from_secs(1))
+                        .map(|at| at.elapsed() >= Duration::from_secs(2))
                         .unwrap_or(true);
-                    if should_request {
+                    if should_request && attempts < 10 {
                         let _ = self.request_program_manifest(program_id).await;
                         last_request_at = Some(Instant::now());
+                        attempts = attempts.saturating_add(1);
                     }
 
                     if let Some(committee) = self
@@ -46,10 +70,7 @@ impl DagEngine {
                         break committee;
                     }
 
-                    if Instant::now() >= deadline {
-                        return Err(anyhow!("missing committee for program {}", program_id));
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
         };
@@ -100,6 +121,16 @@ impl DagEngine {
         }
 
         let object_id = program_id.to_object_id();
+
+        if let Some(metadata) = self.unified_store.get_object_metadata(&object_id)? {
+            if metadata.total_size > MAX_PROGRAM_SIZE as u64 {
+                return Err(anyhow!(
+                    "program too large: {} bytes (max {})",
+                    metadata.total_size,
+                    MAX_PROGRAM_SIZE
+                ));
+            }
+        }
 
         if !self.unified_store.is_complete(&object_id)? {
             tracing::info!(
@@ -165,15 +196,18 @@ impl DagEngine {
                 let pid = program_id.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) = Self::background_state_sync_static(
-                        &state_store,
-                        &network,
-                        &peers,
-                        &versions,
-                        &pid,
+                    let sync_result = tokio::time::timeout(
+                        STATE_SYNC_TIMEOUT,
+                        Self::background_state_sync_static(
+                            &state_store,
+                            &network,
+                            &peers,
+                            &versions,
+                            &pid,
+                        ),
                     )
-                    .await
-                    {
+                    .await;
+                    if let Err(e) = sync_result {
                         tracing::debug!("background state sync failed for {}: {}", pid, e);
                     }
                     in_progress.write().await.remove(&pid);
@@ -185,7 +219,14 @@ impl DagEngine {
 
         let outcome = self.scheduler.execute(program_id, input).await?;
 
-        // Build execution receipt and propose it to the committee.
+        if outcome.state_writes.len() > MAX_STATE_WRITES {
+            return Err(anyhow!(
+                "too many state writes: {} (max {})",
+                outcome.state_writes.len(),
+                MAX_STATE_WRITES
+            ));
+        }
+
         let request_id = hash_bytes(input);
         let inputs_hash = hash_bytes(input);
         let write_digest = hash_bytes(&bincode::serde::encode_to_vec(
@@ -256,7 +297,9 @@ impl DagEngine {
             committee_epoch: committee.epoch,
             state_writes: outcome.state_writes.clone(),
         };
-        let msg = crate::network::UnifiedProtocolMessage::StateTransitionProposal(proposal);
+        let msg = crate::network::unified_protocol::UnifiedProtocolMessage::StateTransitionProposal(
+            proposal,
+        );
         let net_msg = crate::network::NetworkMessage::UnifiedProtocol(msg);
         let _ = self.network.publisher.send(net_msg);
 
@@ -279,19 +322,24 @@ impl DagEngine {
             signer: self.identity.node_id.clone(),
             signature: sig,
         };
-        let msg = crate::network::UnifiedProtocolMessage::StateTransitionVote(vote);
+        let msg =
+            crate::network::unified_protocol::UnifiedProtocolMessage::StateTransitionVote(vote);
         let net_msg = crate::network::NetworkMessage::UnifiedProtocol(msg);
         let _ = self.network.publisher.send(net_msg);
 
         let _ = self.maybe_finalize_pending_transition(receipt_id).await;
 
-        match tokio::time::timeout(Duration::from_secs(20), done_rx).await {
+        match tokio::time::timeout(CONSENSUS_TIMEOUT, done_rx).await {
             Ok(Ok(Ok(()))) => Ok(outcome),
             Ok(Ok(Err(err))) => Err(err),
             Ok(Err(_)) => Err(anyhow!("consensus completion dropped for {}", program_id)),
             Err(_) => {
                 self.pending_transitions.write().await.remove(&receipt_id);
-                Err(anyhow!("consensus timed out for program {}", program_id))
+                Err(anyhow!(
+                    "consensus timed out for program {} (timeout: {}s)",
+                    program_id,
+                    CONSENSUS_TIMEOUT.as_secs()
+                ))
             }
         }
     }
@@ -315,13 +363,14 @@ impl DagEngine {
         let mut attempted: std::collections::HashSet<crate::types::NodeId> =
             std::collections::HashSet::new();
         let mut attempts = 0usize;
+        let max_attempts = committee.members.len().saturating_add(8);
 
         while let Some(target) = queue.pop_front() {
             if !attempted.insert(target.clone()) {
                 continue;
             }
             attempts = attempts.saturating_add(1);
-            if attempts > committee.members.len().saturating_add(4) {
+            if attempts > max_attempts {
                 break;
             }
 
@@ -389,12 +438,15 @@ impl DagEngine {
             crate::network::TransferRequest::Unified(unified_req),
         );
 
-        match tokio::time::timeout(Duration::from_secs(15), rx).await {
+        match tokio::time::timeout(LEADER_FORWARD_TIMEOUT, rx).await {
             Ok(Ok(resp)) => Ok(resp),
             Ok(Err(_)) => Err(anyhow!("leader execution response dropped")),
             Err(_) => {
                 self.pending_leader_execs.write().await.remove(&request_id);
-                Err(anyhow!("leader execution request timed out"))
+                Err(anyhow!(
+                    "leader execution request timed out after {}s",
+                    LEADER_FORWARD_TIMEOUT.as_secs()
+                ))
             }
         }
     }
@@ -425,7 +477,7 @@ impl DagEngine {
         let peer_list: Vec<_> = peers.read().await.iter().copied().collect();
 
         if peer_list.is_empty() {
-            return Err(anyhow!("no peers available"));
+            return Err(anyhow!("no peers available for state sync"));
         }
 
         for peer in peer_list.iter().take(3) {

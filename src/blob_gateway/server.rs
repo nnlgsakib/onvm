@@ -91,8 +91,6 @@ fn serve_ui_path_inner(path: &str) -> Result<Response, (StatusCode, String)> {
     }
 }
 
-
-
 async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "Gateway healthy")
 }
@@ -215,8 +213,6 @@ async fn cdn_serve_handler(
     }
 }
 
-
-
 fn parse_id(id_str: &str) -> Result<crate::types::ObjectId, (StatusCode, String)> {
     crate::types::parse_object_id_str(id_str)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid ID: {e}")))
@@ -240,4 +236,3 @@ fn is_renderable(content_type: &str) -> bool {
         || content_type == "application/pdf"
         || content_type.starts_with("text/")
 }
-

@@ -284,7 +284,10 @@ pub async fn start_rpc(
         .with_state(ctx);
 
     let app = if enable_gateway {
-        app.nest("/explorer", crate::blob_gateway::gateway_router(node.clone()))
+        app.nest(
+            "/explorer",
+            crate::blob_gateway::gateway_router(node.clone()),
+        )
     } else {
         app
     };

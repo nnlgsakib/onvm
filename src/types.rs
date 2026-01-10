@@ -484,7 +484,10 @@ fn parse_prefixed_hex_id(input: &str) -> Result<(Option<IdPrefix>, [u8; 32]), St
     let hex_part = rest.trim();
     let bytes = hex::decode(hex_part).map_err(|e| format!("invalid hex: {e}"))?;
     if bytes.len() != 32 {
-        return Err(format!("invalid id length: expected 32 bytes, got {}", bytes.len()));
+        return Err(format!(
+            "invalid id length: expected 32 bytes, got {}",
+            bytes.len()
+        ));
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);

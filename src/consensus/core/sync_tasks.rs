@@ -15,6 +15,19 @@ impl DagEngine {
         Ok(())
     }
 
+    pub async fn periodic_dht_announce(&self) -> Result<()> {
+        if self.peer_count().await == 0 {
+            return Ok(());
+        }
+
+        let manifests = self.program_catalog.list_manifests()?;
+        for manifest in manifests {
+            let object_id = manifest.program_id.to_object_id();
+            self.network.provide(&object_id.0);
+        }
+        Ok(())
+    }
+
     async fn broadcast_program_heads(&self) -> Result<()> {
         let manifests = self.program_catalog.list_manifests()?;
         let mut cache = self.last_broadcast_heads.write().await;

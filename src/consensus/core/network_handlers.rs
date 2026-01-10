@@ -3,12 +3,18 @@
 use super::DagEngine;
 use crate::crypto::bls::{sign, verify, DST_RECEIPT};
 use crate::crypto::hashing::hash_bytes;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use ed25519_dalek;
 use libp2p::PeerId;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
+
+const RATE_LIMIT_MAX_REQUESTS_PER_SECOND: usize = 100;
+const MAX_PENDING_TRANSITIONS: usize = 10000;
+const MAX_INVENTORY_SIZE: usize = 10000;
 
 impl DagEngine {
     pub async fn run(
@@ -17,6 +23,17 @@ impl DagEngine {
     ) {
         let mut tick = interval(Duration::from_secs(5));
         let mut dht_announce_tick = interval(crate::network::dht::ANNOUNCE_INTERVAL);
+        let mut rate_limit_reset = interval(Duration::from_secs(1));
+        let mut request_counts: Arc<RwLock<usize>> = Arc::new(RwLock::new(0));
+
+        let engine = self.clone();
+        let counter = request_counts.clone();
+        tokio::spawn(async move {
+            loop {
+                rate_limit_reset.tick().await;
+                *counter.write().await = 0;
+            }
+        });
 
         loop {
             tokio::select! {
@@ -31,7 +48,7 @@ impl DagEngine {
                     }
                 }
                 Some(event) = events.recv() => {
-                    if let Err(e) = self.clone().handle_event(event).await {
+                    if let Err(e) = self.clone().handle_event(event, &request_counts).await {
                         tracing::warn!("event handling error: {e:?}");
                     }
                 }
@@ -39,23 +56,11 @@ impl DagEngine {
         }
     }
 
-    async fn periodic_dht_announce(&self) -> Result<()> {
-        let objects = self.unified_store.list_objects()?;
-
-        let mut announced = 0usize;
-
-        for object in objects {
-            if self.unified_store.is_complete(&object.id).unwrap_or(false) {
-                self.network.provide(&object.id.0);
-                announced += 1;
-            }
-        }
-
-        tracing::debug!("announced {} objects to DHT", announced);
-        Ok(())
-    }
-
-    async fn handle_event(self: Arc<Self>, event: crate::network::NetworkEvent) -> Result<()> {
+    async fn handle_event(
+        self: Arc<Self>,
+        event: crate::network::NetworkEvent,
+        request_counts: &Arc<RwLock<usize>>,
+    ) -> Result<()> {
         match event {
             crate::network::NetworkEvent::PeerConnected(peer_id) => {
                 self.peers.write().await.insert(peer_id);
@@ -585,6 +590,28 @@ impl DagEngine {
                     announce.manifest.program_id,
                     announce.manifest.version
                 );
+
+                if announce.manifest.signature.is_empty() {
+                    tracing::warn!(
+                        "program {} manifest has no signature, rejecting",
+                        announce.manifest.program_id
+                    );
+                    return Ok(());
+                }
+
+                let manifest_digest = announce.manifest.digest();
+                let deployer_key = announce.manifest.deployer.0;
+                let mut deployer_pk_array = [0u8; 32];
+                deployer_pk_array.copy_from_slice(&deployer_key[..32]);
+
+                let pk = ed25519_dalek::PublicKey::from_bytes(&deployer_pk_array)
+                    .map_err(|e| anyhow!("invalid deployer public key: {e}"))?;
+                let sig = ed25519_dalek::Signature::from_bytes(&announce.manifest.signature)
+                    .map_err(|e| anyhow!("invalid manifest signature: {e}"))?;
+
+                pk.verify_strict(&manifest_digest, &sig)
+                    .map_err(|e| anyhow!("manifest signature verification failed: {e}"))?;
+
                 if let Err(e) = self.program_catalog.verify_initial_sync(&announce.manifest) {
                     tracing::warn!(
                         "manifest conflict for program {}: {}",
@@ -705,20 +732,43 @@ impl DagEngine {
 
         let current_root = self.state_store.sparse_root_scoped(&program_id.0)?;
         if proposal.receipt.state_root_in != current_root {
+            tracing::debug!(
+                "ignoring proposal for program {} height {}: state root mismatch (expected {}, got {})",
+                program_id,
+                proposal.receipt.height,
+                hex::encode(&current_root[..8]),
+                hex::encode(&proposal.receipt.state_root_in[..8])
+            );
             return Ok(());
         }
 
         let receipt_id = proposal.receipt.id();
         if let Some((height, voted_receipt)) = self.load_last_voted(&program_id).await? {
             if height == proposal.receipt.height && voted_receipt != receipt_id {
+                tracing::debug!(
+                    "ignoring proposal for program {} height {}: conflicting receipt (already voted for different receipt)",
+                    program_id,
+                    proposal.receipt.height
+                );
                 return Ok(());
             }
             if height > proposal.receipt.height {
+                tracing::debug!(
+                    "ignoring proposal for program {} height {}: stale proposal (local height {})",
+                    program_id,
+                    proposal.receipt.height,
+                    height
+                );
                 return Ok(());
             }
         }
 
         if hash_bytes(&proposal.receipt.call.calldata) != proposal.receipt.inputs_hash {
+            tracing::debug!(
+                "ignoring proposal for program {} height {}: inputs hash mismatch",
+                program_id,
+                proposal.receipt.height
+            );
             return Ok(());
         }
 
@@ -831,6 +881,11 @@ impl DagEngine {
             };
 
             if entry.signatures.contains_key(&vote.signer) {
+                tracing::warn!(
+                    "rejected duplicate signature from {} for receipt {}",
+                    hex::encode(&vote.signer.0[..8]),
+                    hex::encode(&receipt_id[..8])
+                );
                 pending.insert(receipt_id, entry);
                 return Ok(());
             }
@@ -1044,7 +1099,50 @@ impl DagEngine {
         Ok(())
     }
 
+    const MAX_STATE_ENTRIES: usize = 10000;
+    const MAX_STATE_VALUE_SIZE: usize = 1024 * 1024; // 1MB per value
+    const MAX_TOTAL_STATE_SIZE: usize = 100 * 1024 * 1024; // 100MB total
+
     async fn handle_state_response(&self, state_resp: crate::network::StateResponse) -> Result<()> {
+        if state_resp.state_entries.len() > Self::MAX_STATE_ENTRIES {
+            tracing::warn!(
+                "ignoring state response for program {}: too many entries ({} > {})",
+                state_resp.program_id,
+                state_resp.state_entries.len(),
+                Self::MAX_STATE_ENTRIES
+            );
+            return Ok(());
+        }
+
+        let mut total_size = 0usize;
+        for (key, value) in &state_resp.state_entries {
+            if key.len() > 1024 {
+                tracing::warn!(
+                    "ignoring state response for program {}: key too large ({} bytes)",
+                    state_resp.program_id,
+                    key.len()
+                );
+                return Ok(());
+            }
+            total_size += key.len() + value.len();
+            if total_size > Self::MAX_TOTAL_STATE_SIZE {
+                tracing::warn!(
+                    "ignoring state response for program {}: total size exceeds limit ({} bytes)",
+                    state_resp.program_id,
+                    total_size
+                );
+                return Ok(());
+            }
+            if value.len() > Self::MAX_STATE_VALUE_SIZE {
+                tracing::warn!(
+                    "ignoring state response for program {}: value too large ({} bytes)",
+                    state_resp.program_id,
+                    value.len()
+                );
+                return Ok(());
+            }
+        }
+
         let expected_root = if let Some(commitment) = self
             .program_catalog
             .latest_state_commitment(&state_resp.program_id)?

@@ -12,10 +12,6 @@ use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
-const RATE_LIMIT_MAX_REQUESTS_PER_SECOND: usize = 100;
-const MAX_PENDING_TRANSITIONS: usize = 10000;
-const MAX_INVENTORY_SIZE: usize = 10000;
-
 impl DagEngine {
     pub async fn run(
         self: std::sync::Arc<Self>,
@@ -24,9 +20,8 @@ impl DagEngine {
         let mut tick = interval(Duration::from_secs(5));
         let mut dht_announce_tick = interval(crate::network::dht::ANNOUNCE_INTERVAL);
         let mut rate_limit_reset = interval(Duration::from_secs(1));
-        let mut request_counts: Arc<RwLock<usize>> = Arc::new(RwLock::new(0));
+        let request_counts: Arc<RwLock<usize>> = Arc::new(RwLock::new(0));
 
-        let engine = self.clone();
         let counter = request_counts.clone();
         tokio::spawn(async move {
             loop {
@@ -59,7 +54,7 @@ impl DagEngine {
     async fn handle_event(
         self: Arc<Self>,
         event: crate::network::NetworkEvent,
-        request_counts: &Arc<RwLock<usize>>,
+        _request_counts: &Arc<RwLock<usize>>,
     ) -> Result<()> {
         match event {
             crate::network::NetworkEvent::PeerConnected(peer_id) => {

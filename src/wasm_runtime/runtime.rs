@@ -112,6 +112,7 @@ impl ExecutionEngine {
             program_id: program_id.clone(),
             pending_writes: HashMap::new(),
             wasi,
+            message_queue: None,
         };
         let mut store = Store::new(&self.engine, ctx);
         store.set_fuel(self.max_fuel)?;

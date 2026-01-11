@@ -1,9 +1,15 @@
 use crate::crypto::bls::{BlsPublicKey, BlsSignature};
 use crate::crypto::hashing::hash_bytes;
+use crate::crypto::threshold_ecdsa::{DkgTranscript, ThresholdPublicKey, ThresholdSignature};
+use anyhow::{anyhow, Result};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
+
+/// Subnet identifier: identifies a collection of nodes forming a execution shard
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SubnetId(pub [u8; 32]);
 
 /// Object identifier: BLAKE3 hash of complete assembled content
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -48,6 +54,7 @@ pub enum IdPrefix {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgramManifest {
     pub program_id: ProgramId,
+    pub subnet_id: SubnetId,
     pub version: u64,
     pub deployer: NodeId,
     pub wasm_env_hash: WasmEnvHash,
@@ -59,6 +66,8 @@ pub struct ProgramManifest {
     pub timestamp_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub committee: Option<CommitteeCertificate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subnet_membership: Option<SubnetId>,
     pub signature: Vec<u8>,
 }
 
@@ -129,6 +138,201 @@ pub struct CommitteeCertificate {
     pub threshold: u32,
     pub aggregate_public_key: BlsPublicKey,
     pub signature: Option<BlsSignature>,
+}
+
+impl SubnetId {
+    pub fn new(data: &[u8]) -> Self {
+        Self(hash_bytes(data))
+    }
+
+    pub fn to_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl Display for SubnetId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "subnet_{}", hex::encode(&self.0[..8]))
+    }
+}
+
+/// Subnet membership certificate - local BFT for subnet consensus
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubnetCertificate {
+    pub subnet_id: SubnetId,
+    pub epoch: u64,
+    pub members: Vec<SubnetMember>,
+    pub threshold: u32,
+    pub aggregate_public_key: BlsPublicKey,
+    pub signature: Option<BlsSignature>,
+}
+
+/// Member of a subnet with BLS key for local consensus
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubnetMember {
+    pub node: NodeId,
+    pub weight: u64,
+    pub bls_public_key: BlsPublicKey,
+}
+
+/// Subnet using threshold ECDSA (Chain Key) for signatures
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThresholdSubnetCertificate {
+    pub subnet_id: SubnetId,
+    pub epoch: u64,
+    pub threshold: u32,
+    pub num_members: u32,
+    pub dkg_transcript: DkgTranscript,
+    pub threshold_public_key: ThresholdPublicKey,
+    pub members: Vec<ThresholdSubnetMember>,
+    pub signature: Option<BlsSignature>,
+}
+
+/// Member of a threshold subnet with index for threshold signing
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThresholdSubnetMember {
+    pub node: NodeId,
+    pub index: u32,
+    pub weight: u64,
+}
+
+/// Signed commitment for threshold key resharing
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThresholdKeyCommitment {
+    pub subnet_id: SubnetId,
+    pub epoch: u64,
+    pub from_index: u32,
+    pub to_index: u32,
+    pub commitment: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+/// Response containing a key share during DKG
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThresholdKeyShareResponse {
+    pub subnet_id: SubnetId,
+    pub epoch: u64,
+    pub receiver_index: u32,
+    pub share_index: u32,
+    pub encrypted_share: Vec<u8>,
+    pub commitment: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+impl ThresholdSubnetCertificate {
+    pub fn get_threshold_public_key(&self) -> &ThresholdPublicKey {
+        &self.threshold_public_key
+    }
+
+    pub fn verify_threshold_signature(
+        &self,
+        signature: &ThresholdSignature,
+        message_hash: &[u8; 32],
+    ) -> Result<()> {
+        if signature.threshold != self.threshold {
+            return Err(anyhow!("signature threshold mismatch"));
+        }
+        if signature.signers.len() < self.threshold as usize {
+            return Err(anyhow!("not enough signers"));
+        }
+        crate::crypto::threshold_ecdsa::ThresholdSigner::verify_threshold_signature(
+            signature,
+            &self.threshold_public_key,
+            message_hash,
+        )
+    }
+}
+
+impl Display for ThresholdSubnetCertificate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ThresholdSubnet {} epoch {} (t={}/n={}, key={})",
+            self.subnet_id,
+            self.epoch,
+            self.threshold,
+            self.num_members,
+            hex::encode(&self.threshold_public_key.key[..8])
+        )
+    }
+}
+
+/// Cross-program async message for inter-canister calls
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CrossProgramMessage {
+    pub id: [u8; 32],
+    pub source_program: ProgramId,
+    pub source_subnet: SubnetId,
+    pub target_program: ProgramId,
+    pub target_subnet: SubnetId,
+    pub method: String,
+    pub payload: Vec<u8>,
+    pub nonce: u64,
+    pub timestamp_ms: u64,
+    pub expires_at: Option<u64>,
+    pub response_for: Option<[u8; 32]>,
+}
+
+/// Queue entry for pending async messages
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageQueueEntry {
+    pub message: CrossProgramMessage,
+    pub retry_count: u32,
+    pub next_retry_at: u64,
+    pub status: MessageStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MessageStatus {
+    Pending,
+    InFlight,
+    Delivered,
+    Failed,
+    Expired,
+    ResponseReceived,
+}
+
+/// Response to a cross-program message
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageResponse {
+    pub message_id: [u8; 32],
+    pub result: MessageResult,
+    pub payload: Vec<u8>,
+    pub error_code: Option<u32>,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MessageResult {
+    Success,
+    MethodNotFound,
+    InvalidPayload,
+    Trap,
+    Timeout,
+    DestinationUnavailable,
+    Forbidden,
+}
+
+/// Program now includes subnet_id for ICP-style isolation
+impl ProgramManifest {
+    pub fn get_state_namespace(&self) -> Vec<u8> {
+        let mut ns = Vec::with_capacity(64);
+        ns.extend_from_slice(&self.program_id.0);
+        ns
+    }
+}
+
+impl Display for SubnetCertificate {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Subnet {} epoch {} ({} members, threshold {})",
+            self.subnet_id,
+            self.epoch,
+            self.members.len(),
+            self.threshold
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

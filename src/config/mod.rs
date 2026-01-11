@@ -329,8 +329,8 @@ impl Default for OnvmConfig {
             network: NetworkConfig {
                 min_peers: 1,
                 bootnodes: vec![
-                    "/ip4/185.209.223.6/tcp/37000/p2p/12D3KooWAEtt36Ezxtnv1kA6ZKvbAT96mXc7mkkjz3Gw2eMAoZW1"
-                        .to_string(),
+                    // "/ip4/185.209.223.6/tcp/37000/p2p/12D3KooWAEtt36Ezxtnv1kA6ZKvbAT96mXc7mkkjz3Gw2eMAoZW1"
+                    //     .to_string(),
                 ],
                 enable_mdns: false,
                 require_encryption: true,

@@ -2,6 +2,10 @@ use futures::future::BoxFuture;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 
+pub mod message_queue;
+
+pub use message_queue::{create_cross_program_message, new_message_id, MessageQueue};
+
 /// Simple bounded-concurrency async task queue.
 pub struct AsyncQueue<T> {
     tx: mpsc::UnboundedSender<T>,

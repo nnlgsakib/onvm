@@ -50,6 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 toml = "0.8"
 secp256k1 = { version = "0.28", features = ["recovery"] }
+k256 = { version = "0.13", features = ["serde"] }
 indicatif = "0.17"
 tokio-util = { version = "0.7", features = ["io"] }
 num_cpus = "1.16"

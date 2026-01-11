@@ -1,3 +1,4 @@
+use crate::qeue_manager::MessageQueue;
 use crate::storage::{StateStore, UnifiedStore};
 use crate::types::{IdPrefix, ObjectId, ProgramId};
 use anyhow::Result;
@@ -17,6 +18,7 @@ pub struct ExecutionContext {
     pub program_id: ProgramId,
     pub pending_writes: HashMap<Vec<u8>, Option<Vec<u8>>>,
     pub wasi: wasmtime_wasi::WasiCtx,
+    pub message_queue: Option<Arc<MessageQueue>>,
 }
 
 pub fn attach_blob_host_functions(linker: &mut wasmtime::Linker<ExecutionContext>) -> Result<()> {
@@ -505,6 +507,136 @@ pub fn attach_state_host_functions(linker: &mut wasmtime::Linker<ExecutionContex
         },
     )?;
 
+    linker.func_wrap(
+        "env",
+        "onvm_call",
+        |mut caller: wasmtime::Caller<'_, ExecutionContext>,
+         target_id_ptr: i32,
+         target_id_len: i32,
+         method_ptr: i32,
+         method_len: i32,
+         payload_ptr: i32,
+         payload_len: i32,
+         out_msg_id_ptr: i32|
+         -> i32 {
+            let memory = match caller.get_export("memory") {
+                Some(wasmtime::Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut target_id = vec![0u8; target_id_len as usize];
+            if memory
+                .read(&caller, target_id_ptr as usize, &mut target_id)
+                .is_err()
+            {
+                return -2;
+            }
+            let mut method = vec![0u8; method_len as usize];
+            if memory
+                .read(&caller, method_ptr as usize, &mut method)
+                .is_err()
+            {
+                return -3;
+            }
+            let mut payload = vec![0u8; payload_len as usize];
+            if memory
+                .read(&caller, payload_ptr as usize, &mut payload)
+                .is_err()
+            {
+                return -4;
+            }
+            let program_id = match target_id.try_into() {
+                Ok(id) => ProgramId(id),
+                Err(_) => return -5,
+            };
+            let method_str = match String::from_utf8(method) {
+                Ok(s) => s,
+                Err(_) => return -6,
+            };
+
+            if let Some(ref msg_queue) = caller.data().message_queue {
+                let message_id = msg_queue.enqueue_async_call(
+                    caller.data().program_id.clone(),
+                    program_id,
+                    method_str,
+                    payload,
+                );
+                if let Ok(message_id) = message_id {
+                    if memory
+                        .write(&mut caller, out_msg_id_ptr as usize, &message_id)
+                        .is_err()
+                    {
+                        return -8;
+                    }
+                    0
+                } else {
+                    -7
+                }
+            } else {
+                -9
+            }
+        },
+    )?;
+
+    linker.func_wrap(
+        "env",
+        "onvm_call_result",
+        |mut caller: wasmtime::Caller<'_, ExecutionContext>,
+         msg_id_ptr: i32,
+         out_ptr: i32,
+         out_cap: i32|
+         -> i32 {
+            let memory = match caller.get_export("memory") {
+                Some(wasmtime::Extern::Memory(m)) => m,
+                _ => return -1,
+            };
+            let mut msg_id = [0u8; 32];
+            if memory
+                .read(&caller, msg_id_ptr as usize, &mut msg_id)
+                .is_err()
+            {
+                return -2;
+            }
+            if let Some(ref msg_queue) = caller.data().message_queue {
+                let response = match msg_queue.poll_response(&msg_id) {
+                    Ok(opt) => opt,
+                    Err(_) => return -3,
+                };
+                match response {
+                    Some(response) => {
+                        let len = response.payload.len() as i32;
+                        if len > out_cap {
+                            return -len;
+                        }
+                        if memory
+                            .write(&mut caller, out_ptr as usize, &response.payload)
+                            .is_err()
+                        {
+                            return -4;
+                        }
+                        match response.result {
+                            crate::types::MessageResult::Success => 0,
+                            crate::types::MessageResult::MethodNotFound => -10,
+                            crate::types::MessageResult::InvalidPayload => -11,
+                            crate::types::MessageResult::Trap => -12,
+                            crate::types::MessageResult::Timeout => -13,
+                            crate::types::MessageResult::DestinationUnavailable => -14,
+                            crate::types::MessageResult::Forbidden => -15,
+                        }
+                    }
+                    None => -1,
+                }
+            } else {
+                -9
+            }
+        },
+    )?;
+
+    linker.func_wrap(
+        "env",
+        "onvm_msg_cycles_available",
+        |mut _caller: wasmtime::Caller<'_, ExecutionContext>| -> i64 { 0 },
+    )?;
+
     Ok(())
 }
 
@@ -773,6 +905,7 @@ mod tests {
             program_id: ProgramId([1u8; 32]),
             pending_writes: HashMap::new(),
             wasi: WasiCtxBuilder::new().build(),
+            message_queue: None,
         };
         let mut store = Store::new(&engine, ctx);
         let instance = linker.instantiate(&mut store, &module)?;

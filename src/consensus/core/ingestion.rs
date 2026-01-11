@@ -119,6 +119,7 @@ impl DagEngine {
         };
 
         let program_id = ProgramId(object.id.0);
+        let subnet_id = crate::types::SubnetId(object.id.0);
         let initial_state_root = self
             .state_store
             .sparse_root_scoped(&program_id.0)
@@ -139,6 +140,7 @@ impl DagEngine {
 
         let mut manifest = ProgramManifest {
             program_id,
+            subnet_id,
             version: 1,
             deployer: self.identity.node_id.clone(),
             wasm_env_hash,
@@ -160,6 +162,7 @@ impl DagEngine {
                 aggregate_public_key: self.bls_public.clone(),
                 signature: None,
             }),
+            subnet_membership: Some(subnet_id),
             signature: Vec::new(),
         };
 
